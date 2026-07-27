@@ -99,7 +99,7 @@ The `advisor` agent is a senior Opus model that provides strategic guidance when
 
 **Default behavior**: When the user gives you a task, you ARE the orchestrator — follow the flow above automatically. No special command needed.
 
-Available slash commands: `/commit`, `/pr`, `/docs`, `/onboard`, `/rollback`, `/verify-security`, `/verify-skill`.
+Available slash commands: `/commit`, `/docs`, `/linear`, `/pr`, `/review-pr`, `/rollback`, `/setup`, `/skills-scan`.
 
 Shared conventions in `~/.claude/skills/_shared/`:
 - `return-envelope.md` — standard return format for all sub-agents

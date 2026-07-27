@@ -1,6 +1,7 @@
 package preflight
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -137,16 +138,55 @@ func PrintIssues(issues []*models.ValidationIssue) {
 }
 
 func ensureWritable(dir string) error {
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		return os.MkdirAll(dir, 0o755)
+	cleaned := filepath.Clean(dir)
+	if cleaned != dir {
+		return fmt.Errorf("writable directory %q is not a clean path", dir)
 	}
-	// Try to create a temp file to check writability
-	tmp := filepath.Join(dir, ".skynex-preflight-check")
-	f, err := os.Create(tmp)
+
+	if err := validateAncestors(cleaned); err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(cleaned, 0o755); err != nil {
+		return err
+	}
+	if err := validateAncestors(cleaned); err != nil {
+		return err
+	}
+
+	// Use a unique name so a user's existing file is never truncated or removed.
+	f, err := os.CreateTemp(cleaned, ".skynex-preflight-check-*")
 	if err != nil {
 		return err
 	}
-	f.Close()
-	os.Remove(tmp)
+	tmp := f.Name()
+	closeErr := f.Close()
+	removeErr := os.Remove(tmp)
+	if closeErr != nil || removeErr != nil {
+		return errors.Join(closeErr, removeErr)
+	}
 	return nil
+}
+
+// validateAncestors rejects symlinks in every existing component of path.
+// Missing components are allowed so callers can create a new directory tree.
+func validateAncestors(path string) error {
+	for current := filepath.Clean(path); ; current = filepath.Dir(current) {
+		info, err := os.Lstat(current)
+		switch {
+		case err == nil:
+			if info.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("path component is a symlink: %s", current)
+			}
+		case os.IsNotExist(err):
+			// The missing suffix is permitted; continue checking its ancestors.
+		default:
+			return err
+		}
+
+		parent := filepath.Dir(current)
+		if parent == current {
+			return nil
+		}
+	}
 }

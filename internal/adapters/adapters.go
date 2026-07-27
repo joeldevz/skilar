@@ -130,7 +130,6 @@ func installSkillsRepo(pkg *models.PackageDefinition, req *models.InstallRequest
 	}, nil
 }
 
-
 func checkoutPackage(pkg *models.PackageDefinition, version string) (string, string, error) {
 	if version == "workspace" {
 		// Use current directory
@@ -218,7 +217,5 @@ func injectAdvisorModel(model string) {
 	if err != nil {
 		return
 	}
-	os.WriteFile(configPath, append(out, '\n'), 0o644)
+	_ = writeFile(configPath, string(append(out, '\n')))
 }
-
-

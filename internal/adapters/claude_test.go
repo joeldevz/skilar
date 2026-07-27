@@ -24,6 +24,51 @@ func TestParseFrontmatter_WithFrontmatter(t *testing.T) {
 	}
 }
 
+func TestRenderAgentsRejectsTraversalName(t *testing.T) {
+	source := t.TempDir()
+	opencodeDir := filepath.Join(source, "opencode")
+	if err := os.MkdirAll(opencodeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	config := `{"agent":{"../escape":{"prompt":"prompt","description":"description"}}}`
+	if err := os.WriteFile(filepath.Join(opencodeDir, "opencode.json"), []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	target := t.TempDir()
+	if err := renderAgents(source, target); err == nil {
+		t.Fatal("expected traversal agent name to be rejected")
+	}
+	if _, err := os.Stat(filepath.Join(target, "escape.md")); !os.IsNotExist(err) {
+		t.Fatalf("traversal created file outside agents directory: stat error %v", err)
+	}
+}
+
+func TestRenderAgentsAllowsSafeName(t *testing.T) {
+	source := t.TempDir()
+	opencodeDir := filepath.Join(source, "opencode")
+	if err := os.MkdirAll(opencodeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	config := `{"agent":{"safe-agent":{"prompt":"safe prompt","description":"safe description"}}}`
+	if err := os.WriteFile(filepath.Join(opencodeDir, "opencode.json"), []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	target := t.TempDir()
+	if err := renderAgents(source, target); err != nil {
+		t.Fatalf("renderAgents failed for safe name: %v", err)
+	}
+	path := filepath.Join(target, "agents", "safe-agent.md")
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("safe agent file was not created: %v", err)
+	}
+	if !contains(string(content), "safe prompt") {
+		t.Fatalf("safe agent content = %q, want prompt", content)
+	}
+}
+
 func TestParseFrontmatter_WithoutFrontmatter(t *testing.T) {
 	input := "Just plain text without frontmatter.\n"
 	meta, body := parseFrontmatter(input)

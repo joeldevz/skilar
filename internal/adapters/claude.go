@@ -21,19 +21,6 @@ Esta skill DEBE usar Neurox para memoria persistente:
 - Si no tienes acceso a Neurox tools, documenta en tu output qué información guardar.
 `
 
-var obsoleteCommands = map[string]bool{
-	"plan":           true,
-	"execute":        true,
-	"test":           true,
-	"review":         true,
-	"status":         true,
-	"apply-feedback": true,
-	"context":        true,
-	"diff":           true,
-	"estimate":       true,
-	"plan-rewrite":   true,
-}
-
 var skillMap = map[string][]string{
 	"orchestrator":    {"security"},
 	"advisor":         {},
@@ -52,6 +39,9 @@ var skillMap = map[string][]string{
 // req contains cleanup preference from CLI flags.
 func InstallClaude(srcDir string, req *models.InstallRequest) error {
 	target := claudeDir()
+	if err := validateInstallDestinationTree(target); err != nil {
+		return fmt.Errorf("validate Claude install destination: %w", err)
+	}
 	if err := os.MkdirAll(target, 0o755); err != nil {
 		return fmt.Errorf("create claude dir: %w", err)
 	}
@@ -92,28 +82,36 @@ func InstallClaude(srcDir string, req *models.InstallRequest) error {
 	}
 
 	fmt.Println("    Configuring Neurox MCP...")
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("get home directory: %w", err)
+	}
+	if err := validateInstallDestination(filepath.Join(home, ".claude.json")); err != nil {
+		return fmt.Errorf("validate Claude config destination: %w", err)
+	}
 	if err := configureClaudeNeuroxMCP(); err != nil {
 		return fmt.Errorf("configure neurox mcp: %w", err)
 	}
 
-	// Handle deprecated file cleanup (adapter-local)
-	deprecated := FindDeprecatedFiles()
+	// Handle deprecated file cleanup only with explicit consent.
+	deprecated, err := FindDeprecatedFiles()
+	if err != nil {
+		return fmt.Errorf("discover deprecated Claude files: %w", err)
+	}
 	if len(deprecated) > 0 && deprecated["claude"] != nil {
-		doCleanup := req.CleanupDeprecated
-		if !doCleanup && req.Interactive {
-			// Interactive mode: prompt user only for this adapter's files
-			if PromptCleanupDeprecated(map[string][]DeprecatedFile{
-				"claude": deprecated["claude"],
-			}) {
-				doCleanup = true
-			}
+		files := deprecated["claude"]
+		shouldRemove := req != nil && req.CleanupDeprecated
+		if req != nil && req.Interactive {
+			shouldRemove = PromptCleanupDeprecated(map[string][]DeprecatedFile{"claude": files})
+		} else if !shouldRemove {
+			fmt.Println("    Deprecated files retained; rerun with --cleanup-deprecated to remove them.")
 		}
-
-		if doCleanup {
-			if removed, err := RemoveDeprecatedFiles(deprecated["claude"]); err != nil {
-				fmt.Fprintf(os.Stderr, "    Warning: cleanup failed: %v\n", err)
-			} else if removed > 0 {
-				fmt.Printf("    Removed %d deprecated files from Claude.\n", removed)
+		if shouldRemove {
+			if req == nil || !req.Interactive {
+				NotifyDeprecatedFiles("claude", files)
+			}
+			if _, err := RemoveDeprecatedFiles(files); err != nil {
+				return fmt.Errorf("cleanup deprecated Claude files: %w", err)
 			}
 		}
 	}
@@ -139,8 +137,16 @@ func renderAgents(srcDir, target string) error {
 	if err := json.Unmarshal(config["agent"], &agents); err != nil {
 		return err
 	}
+	for name := range agents {
+		if err := validateAgentName(name); err != nil {
+			return fmt.Errorf("reject agent %q: %w", name, err)
+		}
+	}
 
 	agentsDir := filepath.Join(target, "agents")
+	if err := validateInstallDestinationTree(agentsDir); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
 		return err
 	}
@@ -172,8 +178,27 @@ func renderAgents(srcDir, target string) error {
 		sb.WriteString("\n")
 
 		outPath := filepath.Join(agentsDir, name+".md")
+		rel, err := filepath.Rel(agentsDir, outPath)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+			return fmt.Errorf("reject agent %q: output path escapes agents directory", name)
+		}
 		if err := writeFile(outPath, sb.String()); err != nil {
 			return fmt.Errorf("write agent %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func validateAgentName(name string) error {
+	if name == "" || name == "." || name == ".." {
+		return fmt.Errorf("name must be a non-empty managed segment")
+	}
+	if filepath.IsAbs(name) || strings.ContainsAny(name, `/\\`) || filepath.Base(name) != name {
+		return fmt.Errorf("name must be a single relative managed segment")
+	}
+	for _, char := range name {
+		if (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '-' {
+			return fmt.Errorf("name must use lowercase letters, digits, and hyphens")
 		}
 	}
 	return nil
@@ -183,14 +208,6 @@ func renderAgents(srcDir, target string) error {
 func renderCommandSkills(srcDir, target string) error {
 	commandsDir := filepath.Join(srcDir, "opencode", "commands")
 	commandRoot := filepath.Join(target, "skills")
-
-	// Remove obsolete commands
-	for cmd := range obsoleteCommands {
-		obsoletePath := filepath.Join(commandRoot, cmd)
-		if _, err := os.Stat(obsoletePath); err == nil {
-			os.RemoveAll(obsoletePath)
-		}
-	}
 
 	entries, err := os.ReadDir(commandsDir)
 	if err != nil {

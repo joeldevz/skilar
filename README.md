@@ -208,8 +208,7 @@ skynex completion fish > ~/.config/fish/completions/skynex.fish
 
 | Command | Que hace |
 |---------|----------|
-| `/verify-skill [scope]` | Valida skills, convenciones y cobertura con agentes en paralelo |
-| `/verify-security [scope]` | Valida seguridad con dos jueces adversariales en paralelo |
+| `/review-pr [scope]` | Revisa en profundidad un PR o diff actual con jueces en paralelo |
 | `/rollback [step]` | Deshace el ultimo paso (pide confirmacion) |
 
 ### Git
@@ -223,24 +222,10 @@ skynex completion fish > ~/.config/fish/completions/skynex.fish
 
 Los siguientes commands están en el roadmap (`docs/IMPROVEMENT-PLAN.md`) pero **no existen aún**: `/grill`, `/skills:scan`, `/afk-run`. Hasta que se implementen, los flujos equivalentes se hacen invocando skills directamente o via el orchestrator.
 
-## Modos de trabajo
-
-|  | Supervisado | Vibe Coding |
-|---|---|---|
-| **Agentes** | planner + manager + coder | 1 solo (`vibe`) |
-| **PLAN.md** | Obligatorio | Opcional |
-| **Review humano** | Despues de cada paso | No existe |
-| **Commands** | 12 | 4 (`/do`, `/fix`, `/commit`, `/done`) |
-| **Velocidad** | Controlada | Maxima |
-| **Cuando usarlo** | Features grandes, decisiones de arquitectura, equipos | Exploraciones rapidas, bugfixes, features chicos |
-
-> El modo vibe coding esta en `vibe-coding/`. Para usarlo: `./scripts/setup.sh --opencode` con la config de vibe.
-
 ## Flujo recomendado
 
 ```text
-/verify-skill                   # validar skills y convenciones en paralelo
-/verify-security                # validar seguridad en paralelo
+/review-pr                      # revisar el PR o diff actual en profundidad
 /apply-feedback <correcciones>  # aplicar feedback si hay issues
 /commit                         # commit con Conventional Commits
 /pr                             # abrir pull request
@@ -274,14 +259,11 @@ skills/
 │   └── CLAUDE.md              # overlay para el orquestador en Claude Code
 ├── opencode/
 │   ├── opencode.json          # configuracion base de agentes y MCPs
-│   ├── commands/              # 7 slash commands reales
+│   ├── commands/              # 8 slash commands reales
 │   ├── skills/                # grill-me, prd, security, write-a-skill, diagnose, triage + _shared
 │   ├── templates/             # convenciones, commits, 5 tipos de plan
 │   ├── evals/                 # 9 golden tests de regresion
 │   └── plugins/
-├── vibe-coding/
-│   ├── opencode.json          # config del modo autonomo
-│   └── commands/              # 4 commands minimos
 ├── skills/
 │   └── prd/                   # skill compartida de PRD
 └── scripts/
@@ -294,14 +276,14 @@ skills/
 ### Claude Code
 
 - **3 agentes** en `~/.claude/agents`: `planner`, `manager`, `coder`
-- **12 slash skills** en `~/.claude/skills` con los mismos nombres operativos
+- **8 slash skills** en `~/.claude/skills` con los mismos nombres operativos
 - **Overlay de `CLAUDE.md`** para mantener el mismo workflow
 - **Neurox MCP** configurado en `~/.claude.json`
 
 ### OpenCode
 
 - **3 agentes** con roles claros en `opencode.json`
-- **12 commands** para todo el ciclo
+- **8 commands** para todo el ciclo
 - **Neurox + Context7 MCP** como sistemas externos
 - **Templates** para convenciones, commits/PRs, y 5 tipos de plan
 - **Skills** de PRD, TypeScript avanzado, y patrones NestJS DDD+CQRS
@@ -335,7 +317,6 @@ skills/
 | [Instalacion](docs/installation.md) | Guia completa: requisitos, setup automatico/manual, verificacion, troubleshooting |
 | [OpenCode setup](opencode/README.md) | Configuracion detallada de OpenCode |
 | [Claude Code setup](claude-code/CLAUDE.md) | Overlay y reglas para Claude Code |
-| [Vibe Coding](vibe-coding/README.md) | Modo autonomo con un solo agente |
 
 ## Claude Code: nota importante
 

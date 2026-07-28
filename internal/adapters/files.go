@@ -1,6 +1,7 @@
 package adapters
 
 import (
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -15,6 +16,9 @@ func copyDir(src, dst string) error {
 
 // copyDirExcluding copies src → dst, skipping entries in exclude list.
 func copyDirExcluding(src, dst string, exclude []string) error {
+	if err := validateInstallDestinationTree(dst); err != nil {
+		return fmt.Errorf("validate copy destination tree: %w", err)
+	}
 	excludeSet := make(map[string]bool)
 	for _, e := range exclude {
 		excludeSet[e] = true
@@ -47,6 +51,9 @@ func copyDirExcluding(src, dst string, exclude []string) error {
 		dstPath := filepath.Join(dst, rel)
 
 		if d.IsDir() {
+			if err := validateInstallDestination(dstPath); err != nil {
+				return fmt.Errorf("validate copy directory %q: %w", dstPath, err)
+			}
 			return os.MkdirAll(dstPath, 0o755)
 		}
 
@@ -57,12 +64,18 @@ func copyDirExcluding(src, dst string, exclude []string) error {
 // copyFile copies a single file from src to dst.
 // If dst already exists with restrictive permissions, chmod it first.
 func copyFile(src, dst string) error {
+	if err := validateInstallDestination(dst); err != nil {
+		return fmt.Errorf("validate copy destination %q: %w", dst, err)
+	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
+	if err := validateInstallDestination(dst); err != nil {
+		return fmt.Errorf("validate copy destination %q: %w", dst, err)
+	}
 
 	// If destination exists with restrictive perms, make it writable first
-	if _, err := os.Stat(dst); err == nil {
+	if _, err := os.Lstat(dst); err == nil {
 		_ = os.Chmod(dst, 0o644)
 	}
 
@@ -77,6 +90,9 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	defer out.Close()
+	if err := out.Chmod(0o644); err != nil {
+		return err
+	}
 
 	_, err = io.Copy(out, in)
 	return err
@@ -84,8 +100,14 @@ func copyFile(src, dst string) error {
 
 // writeFile writes content to path, creating parent dirs.
 func writeFile(path, content string) error {
+	if err := validateInstallDestination(path); err != nil {
+		return fmt.Errorf("validate write destination %q: %w", path, err)
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
+	}
+	if err := validateInstallDestination(path); err != nil {
+		return fmt.Errorf("validate write destination %q: %w", path, err)
 	}
 	return os.WriteFile(path, []byte(content), 0o644)
 }

@@ -124,7 +124,7 @@ func main() {
 
 	// update
 	if args.Update {
-		handleUpdate(args.UpdatePkg, args.StateDir)
+		handleUpdate(args.UpdatePkg, args.StateDir, args.CleanupDeprecated)
 		os.Exit(0)
 	}
 
@@ -203,35 +203,35 @@ func main() {
 }
 
 type cliArgs struct {
-	Packages           []string
-	Targets            []string
-	Versions           map[string]string
-	NonInteractive     bool
-	Yes                bool
-	TrustScripts       bool
-	StateDir           string
-	Help               bool
-	ListPackages       bool
-	ListVersions       string
-	AdvisorModel       string
-	ShowVersion        bool
-	Doctor             bool
-	Install            bool
-	ProfileHelp        bool
-	ProfileList        bool
-	ProfileCreate      bool
-	ProfileEdit        string
-	ProfileDelete      string
-	ProfileDefault     string
-	UpProfile          string
-	UpWeb              bool
-	UpPort             int
-	RunUp              bool
-	Update             bool
-	UpdatePkg          string
-	Completion         string // bash, zsh, or fish
-	Status             bool
-	CleanupDeprecated  bool
+	Packages          []string
+	Targets           []string
+	Versions          map[string]string
+	NonInteractive    bool
+	Yes               bool
+	TrustScripts      bool
+	StateDir          string
+	Help              bool
+	ListPackages      bool
+	ListVersions      string
+	AdvisorModel      string
+	ShowVersion       bool
+	Doctor            bool
+	Install           bool
+	ProfileHelp       bool
+	ProfileList       bool
+	ProfileCreate     bool
+	ProfileEdit       string
+	ProfileDelete     string
+	ProfileDefault    string
+	UpProfile         string
+	UpWeb             bool
+	UpPort            int
+	RunUp             bool
+	Update            bool
+	UpdatePkg         string
+	Completion        string // bash, zsh, or fish
+	Status            bool
+	CleanupDeprecated bool
 }
 
 func parseArgs() *cliArgs {
@@ -590,7 +590,7 @@ func handleCompletion(shell string) {
 	}
 }
 
-func handleUpdate(pkg string, stateDir string) {
+func handleUpdate(pkg string, stateDir string, cleanupDeprecated bool) {
 	if stateDir == "" {
 		stateDir = paths.StateDir()
 	}
@@ -656,14 +656,7 @@ func handleUpdate(pkg string, stateDir string) {
 		versions[p] = "latest"
 	}
 
-	request := &models.InstallRequest{
-		Packages:          packagesToUpdate,
-		Targets:           targets,
-		Versions:          versions,
-		Interactive:       false,
-		StateDir:          stateDir,
-		CleanupDeprecated: false, // update: default to false unless explicitly set
-	}
+	request := newUpdateInstallRequest(packagesToUpdate, targets, versions, stateDir, cleanupDeprecated)
 
 	// Preflight
 	issues := preflight.Run(request, cat)
@@ -683,15 +676,21 @@ func handleUpdate(pkg string, stateDir string) {
 
 	// Handle deprecated file cleanup (update: only if --cleanup-deprecated is set)
 	if request.CleanupDeprecated {
-		deprecated := adapters.FindDeprecatedFiles()
+		deprecated, err := adapters.FindDeprecatedFiles()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: deprecated file discovery failed: %v\n", err)
+			os.Exit(1)
+		}
 		if len(deprecated) > 0 {
 			var allFiles []adapters.DeprecatedFile
 			for _, files := range deprecated {
 				allFiles = append(allFiles, files...)
 			}
+			adapters.NotifyDeprecatedFiles("", allFiles)
 			removed, err := adapters.RemoveDeprecatedFiles(allFiles)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: cleanup failed: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Error: cleanup failed: %v\n", err)
+				os.Exit(1)
 			} else if removed > 0 {
 				fmt.Printf("  Removed %d deprecated files.\n", removed)
 			}
@@ -711,6 +710,17 @@ func handleUpdate(pkg string, stateDir string) {
 		}
 	}
 	fmt.Println()
+}
+
+func newUpdateInstallRequest(packages, targets []string, versions map[string]string, stateDir string, cleanupDeprecated bool) *models.InstallRequest {
+	return &models.InstallRequest{
+		Packages:          packages,
+		Targets:           targets,
+		Versions:          versions,
+		Interactive:       false,
+		StateDir:          stateDir,
+		CleanupDeprecated: cleanupDeprecated,
+	}
 }
 
 func installedPkgNames(pkgs map[string]interface{}) string {

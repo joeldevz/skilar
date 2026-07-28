@@ -15,6 +15,9 @@ import (
 func InstallOpencode(srcDir string, req *models.InstallRequest) error {
 	sourceDir := filepath.Join(srcDir, "opencode")
 	target := opencodeDir()
+	if err := validateInstallDestinationTree(target); err != nil {
+		return fmt.Errorf("validate opencode install destination: %w", err)
+	}
 
 	if _, err := os.Stat(sourceDir); err != nil {
 		return fmt.Errorf("opencode source not found: %w", err)
@@ -57,29 +60,33 @@ func InstallOpencode(srcDir string, req *models.InstallRequest) error {
 
 	// Install JS dependencies (bun or npm)
 	fmt.Println("    Installing OpenCode dependencies...")
+	if err := validateInstallDestinationTree(target); err != nil {
+		return fmt.Errorf("revalidate opencode install destination before dependencies: %w", err)
+	}
 	if err := installJSDeps(target); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: dependency install failed: %v\n", err)
 		fmt.Fprintf(os.Stderr, "Run manually: cd %s && bun install\n", target)
 	}
 
-	// Handle deprecated file cleanup (adapter-local)
-	deprecated := FindDeprecatedFiles()
+	// Handle deprecated file cleanup only with explicit consent.
+	deprecated, err := FindDeprecatedFiles()
+	if err != nil {
+		return fmt.Errorf("discover deprecated opencode files: %w", err)
+	}
 	if len(deprecated) > 0 && deprecated["opencode"] != nil {
-		doCleanup := req.CleanupDeprecated
-		if !doCleanup && req.Interactive {
-			// Interactive mode: prompt user only for this adapter's files
-			if PromptCleanupDeprecated(map[string][]DeprecatedFile{
-				"opencode": deprecated["opencode"],
-			}) {
-				doCleanup = true
-			}
+		files := deprecated["opencode"]
+		shouldRemove := req != nil && req.CleanupDeprecated
+		if req != nil && req.Interactive {
+			shouldRemove = PromptCleanupDeprecated(map[string][]DeprecatedFile{"opencode": files})
+		} else if !shouldRemove {
+			fmt.Println("    Deprecated files retained; rerun with --cleanup-deprecated to remove them.")
 		}
-
-		if doCleanup {
-			if removed, err := RemoveDeprecatedFiles(deprecated["opencode"]); err != nil {
-				fmt.Fprintf(os.Stderr, "    Warning: cleanup failed: %v\n", err)
-			} else if removed > 0 {
-				fmt.Printf("    Removed %d deprecated files from OpenCode.\n", removed)
+		if shouldRemove {
+			if req == nil || !req.Interactive {
+				NotifyDeprecatedFiles("opencode", files)
+			}
+			if _, err := RemoveDeprecatedFiles(files); err != nil {
+				return fmt.Errorf("cleanup deprecated opencode files: %w", err)
 			}
 		}
 	}
@@ -163,7 +170,7 @@ func backupDirIfExists(dir string) {
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		return
 	}
-	
+
 	// Save opencode.json as backup before overwrite
 	configPath := filepath.Join(dir, "opencode.json")
 	if data, err := os.ReadFile(configPath); err == nil {

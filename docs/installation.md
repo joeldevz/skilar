@@ -85,18 +85,18 @@ skynex install --non-interactive --package skills --package neurox --target both
 2. Copia todo el contenido de `opencode/` a `~/.config/opencode/`
 3. Restaura tu API key de Context7 del backup si la tenias configurada
 4. Ejecuta `bun install` (o `npm install` como fallback) para dependencias de plugins
-5. Resultado: 10 agentes, 7 commands, skills, templates, evals, y MCPs configurados
+5. Resultado: 10 agentes, 8 commands, skills, templates, evals, y MCPs configurados
 
 #### Para Claude Code (`--claude`)
 
 1. Hace backup de `~/.claude/` si ya existe
 2. Renderiza los 10 agentes (`orchestrator`, `advisor`, `coder`, `manager`, `tech-planner`, `product-planner`, `verifier`, `test-reviewer`, `security`, `skill-validator`) en `~/.claude/agents/`
-3. Convierte los 7 commands de OpenCode en skills de Claude Code en `~/.claude/skills/`
+3. Convierte los 8 commands de OpenCode en skills de Claude Code en `~/.claude/skills/`
 4. Copia skills compartidas (`grill-me`, `prd`, `security`, `write-a-skill`, `diagnose`, `triage`) a `~/.claude/skills/`
 5. Copia templates a `~/.claude/templates/`
 6. Agrega el bloque del workflow a `~/.claude/CLAUDE.md` (sin borrar contenido existente)
 7. Registra Neurox como MCP server en `~/.claude.json`
-8. Resultado: 10 agentes, 7 skills de comando, skills core (grill-me, prd, security, write-a-skill, diagnose, triage), overlay de CLAUDE.md, y Neurox MCP listo
+8. Resultado: 10 agentes, 8 skills de comando, skills core (grill-me, prd, security, write-a-skill, diagnose, triage), overlay de CLAUDE.md, y Neurox MCP listo
 
 ## Instalacion manual
 
@@ -171,7 +171,7 @@ ls ~/.claude/agents/
 
 # Verificar skills
 ls ~/.claude/skills/
-# Deberia mostrar: commit/  pr/  docs/  onboard/  rollback/  verify-security/  verify-skill/  grill-me/  prd/  security/  write-a-skill/  diagnose/  triage/
+# Deberia mostrar: commit/  docs/  linear/  pr/  review-pr/  rollback/  setup/  skills-scan/  grill-me/  prd/  security/  write-a-skill/  diagnose/  triage/
 
 # Verificar templates
 ls ~/.claude/templates/

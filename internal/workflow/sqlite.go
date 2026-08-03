@@ -57,10 +57,10 @@ func (s *SQLiteStore) migrate() error {
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		return err
 	}
-	if version > 3 {
-		return fmt.Errorf("workflow database schema %d is newer than supported schema 3", version)
+	if version > 4 {
+		return fmt.Errorf("workflow database schema %d is newer than supported schema 4", version)
 	}
-	if version == 3 {
+	if version == 4 {
 		return nil
 	}
 	if version == 0 {
@@ -112,11 +112,23 @@ COMMIT;`
 			return err
 		}
 	}
-	const schemaV3 = `BEGIN IMMEDIATE;
+	if version < 3 {
+		const schemaV3 = `BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS recovery_bases (workflow_id TEXT PRIMARY KEY REFERENCES workflows(id), basis BLOB NOT NULL);
 PRAGMA user_version=3;
 COMMIT;`
-	_, err := s.db.Exec(schemaV3)
+		if _, err := s.db.Exec(schemaV3); err != nil {
+			return err
+		}
+	}
+	const schemaV4 = `BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS orchestration_routes (workflow_id TEXT PRIMARY KEY REFERENCES workflows(id), decision BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS wayfinder_graphs (workflow_id TEXT NOT NULL REFERENCES workflows(id), version INTEGER NOT NULL, graph BLOB NOT NULL, PRIMARY KEY(workflow_id,version));
+CREATE TABLE IF NOT EXISTS execution_contracts (workflow_id TEXT PRIMARY KEY REFERENCES workflows(id), contract BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS execution_graphs (workflow_id TEXT NOT NULL REFERENCES workflows(id), version INTEGER NOT NULL, graph BLOB NOT NULL, PRIMARY KEY(workflow_id,version));
+PRAGMA user_version=4;
+COMMIT;`
+	_, err := s.db.Exec(schemaV4)
 	return err
 }
 

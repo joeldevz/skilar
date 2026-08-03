@@ -202,7 +202,7 @@ func TestOpenSQLiteRejectsSymlinkAndHardlink(t *testing.T) {
 	}
 }
 
-func TestSQLiteMigratesExistingV1SchemaToV2(t *testing.T) {
+func TestSQLiteMigratesExistingV1SchemaToCurrent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state", "workflows.db")
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatal(err)
@@ -226,7 +226,7 @@ func TestSQLiteMigratesExistingV1SchemaToV2(t *testing.T) {
 	}
 	defer store.Close()
 	var version int
-	if err = store.Database().QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 3 {
+	if err = store.Database().QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 4 {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 	var table string

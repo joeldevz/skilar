@@ -96,3 +96,10 @@ type ResultEnvelope struct {
 	ArtifactIDs      []string
 	EvidenceIDs      []string
 }
+
+type Lease struct {
+	Resource     string
+	Owner        string
+	FencingToken string
+	ExpiresAt    time.Time
+}

@@ -14,6 +14,7 @@ var (
 	ErrCASConflict       = errors.New("workflow: compare-and-swap conflict")
 	ErrIdempotencyReuse  = errors.New("workflow: idempotency key reused with different input")
 	ErrStaleResult       = errors.New("workflow: stale result")
+	ErrLeaseConflict     = errors.New("workflow: lease conflict")
 )
 
 // Store captures the persistence boundary needed by the engine. A SQLite store
@@ -26,6 +27,8 @@ type Store interface {
 	RegisterAttempt(Attempt) error
 	SupersedeAttempt(string) error
 	AcceptResult(ResultEnvelope) error
+	AcquireLease(resource, owner, token string, now, expiresAt time.Time) (Lease, error)
+	HeartbeatLease(resource, owner, token string, now, expiresAt time.Time) (Lease, error)
 }
 
 type transitionRecord struct {
@@ -42,6 +45,7 @@ type MemoryStore struct {
 	results     map[string]ResultEnvelope
 	now         func() time.Time
 	sequence    uint64
+	leases      map[string]Lease
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -49,7 +53,34 @@ func NewMemoryStore() *MemoryStore {
 		workflows: make(map[string]Workflow), events: make(map[string][]Event),
 		idempotency: make(map[string]transitionRecord), attempts: make(map[string]Attempt),
 		results: make(map[string]ResultEnvelope), now: time.Now,
+		leases: make(map[string]Lease),
 	}
+}
+
+func (s *MemoryStore) AcquireLease(resource, owner, token string, now, expiresAt time.Time) (Lease, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if resource == "" || owner == "" || token == "" || !expiresAt.After(now) {
+		return Lease{}, ErrLeaseConflict
+	}
+	if current, ok := s.leases[resource]; ok && current.ExpiresAt.After(now) {
+		return Lease{}, ErrLeaseConflict
+	}
+	lease := Lease{Resource: resource, Owner: owner, FencingToken: token, ExpiresAt: expiresAt.UTC()}
+	s.leases[resource] = lease
+	return lease, nil
+}
+
+func (s *MemoryStore) HeartbeatLease(resource, owner, token string, now, expiresAt time.Time) (Lease, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, ok := s.leases[resource]
+	if !ok || current.Owner != owner || current.FencingToken != token || !current.ExpiresAt.After(now) || !expiresAt.After(now) {
+		return Lease{}, ErrLeaseConflict
+	}
+	current.ExpiresAt = expiresAt.UTC()
+	s.leases[resource] = current
+	return current, nil
 }
 
 func (s *MemoryStore) Create(w Workflow) (Workflow, error) {

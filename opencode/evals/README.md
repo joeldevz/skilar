@@ -1,6 +1,6 @@
 # Agent Evaluation Framework
 
-Tests mínimos para validar que los 3 agentes se comportan como esperamos.
+Tests mínimos para validar que los agentes principales se comportan como esperamos.
 
 ## Golden Tests (6 tests)
 

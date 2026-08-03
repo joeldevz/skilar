@@ -71,7 +71,7 @@ PHASE 3 - REPORT TO HUMAN
 - Then request review with a clear handoff:
   "Human review required.
    - If approved, reply with `approved` or run `/execute` again for the next step.
-   - If changes are needed, use `/apply-feedback ...` or describe the fixes."
+   - If changes are needed, describe the fixes and delegate them to `coder`."
 - Stop there. Do not continue to another step.
 
 PHASE 4 - HANDLE FEEDBACK

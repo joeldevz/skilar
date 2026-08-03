@@ -66,7 +66,7 @@ Las menciones a Matt Pocock, obra/Superpowers o Gentleman/gentle-ai son **refere
 | GA1 | `.github/` ISSUE_TEMPLATE + PR template + workflows | ✅ DONE |
 | GA2 | Skill `adversarial-review` (109L) generalizado | ✅ DONE |
 | GA3 | Pre-commit AI gate en TypeScript | ⏳ pendiente (no hay `scripts/precommit-ai-gate.ts`) |
-| GA4 | `/skills:scan` físico | ✅ DONE (`opencode/commands/skills-scan.md`) |
+| GA4 | `/skills-scan` físico | ✅ DONE (`opencode/commands/skills-scan.md`) |
 
 ### 🟢 Fortalezas propias activas
 
@@ -163,7 +163,7 @@ Las menciones a Matt Pocock, obra/Superpowers o Gentleman/gentle-ai son **refere
 | 11 | Strict TDD | ✅ `tdd-discipline` + Iron Law en coder |
 | 12 | Verify | ✅ verifier agent + `verification-before-completion` |
 | 13 | TaskList Continuity | ⚠️ PLAN.md con states (parcial) |
-| 14 | Skill Registry | ✅ `_shared/skill-resolver.md` + GA4 `/skills:scan` |
+| 14 | Skill Registry | ✅ `_shared/skill-resolver.md` + GA4 `/skills-scan` |
 | 15 | Skill Digestion (Compact Rules) | ✅ skill-resolver inyecta Project Standards |
 | 16 | Skill Resolution Feedback | ✅ campo `skill_resolution` en envelope |
 | 17 | Subagent Isolation | ✅ `mode: subagent` + IL6 SUBAGENT-STOP |
@@ -209,7 +209,7 @@ Las menciones a Matt Pocock, obra/Superpowers o Gentleman/gentle-ai son **refere
 - ✅ NO copiar `strict-tdd.md` literal — destilar en `tdd-discipline`
 - ✅ NO copiar `judgment-day` literal — generalizar `security` con `domain`
 - ✅ Pre-commit AI gate en TypeScript reusando `advisor_consult`
-- ✅ Skill-registry físico generado por `/skills:scan`
+- ✅ Skill-registry físico generado por `/skills-scan`
 
 ### Harnesses Gentle (mayo 2026)
 - ✅ SÍ añadir: review-workload, chain strategy, compaction recovery, banner visual, `/calibrate`

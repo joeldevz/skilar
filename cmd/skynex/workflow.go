@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -50,7 +51,7 @@ func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
 	case "abort":
 		return workflowAbort(store, args[1:], out)
 	case "resume":
-		return workflowResume(store, args[1:])
+		return workflowResume(store, cwd, args[1:], out)
 	case "export":
 		return workflowExport(store, reviews, args[1:], out)
 	default:
@@ -160,19 +161,25 @@ func workflowAbort(store *workflow.SQLiteStore, args []string, out io.Writer) er
 	return nil
 }
 
-func workflowResume(store *workflow.SQLiteStore, args []string) error {
+func workflowResume(store *workflow.SQLiteStore, repo string, args []string, out io.Writer) error {
 	id, err := requiredWorkflowID(args)
 	if err != nil {
 		return err
 	}
-	w, err := store.Get(id)
+	blocker, ok := flagValue(args, "--blocker-id")
+	if !ok || blocker == "" {
+		return errors.New("resume requires --blocker-id")
+	}
+	key, ok := flagValue(args, "--idempotency-key")
+	if !ok || key == "" {
+		return errors.New("resume requires --idempotency-key")
+	}
+	updated, err := store.Resume(context.Background(), repo, workflow.ResumeRequest{WorkflowID: id, BlockerID: blocker, IdempotencyKey: key})
 	if err != nil {
 		return err
 	}
-	if w.State != workflow.StateBlocked {
-		return fmt.Errorf("workflow %s is %s; only blocked workflows can resume", id, w.State)
-	}
-	return fmt.Errorf("workflow %s remains blocked: safe resume requires drift reconciliation and lock reacquisition, which are not implemented", id)
+	fmt.Fprintf(out, "%s\t%s\t%d\n", updated.ID, updated.State, updated.StateVersion)
+	return nil
 }
 
 func workflowExport(store *workflow.SQLiteStore, reviews *review.SQLiteStore, args []string, out io.Writer) error {
@@ -256,7 +263,7 @@ func writeAtomic0600(path string, data []byte) error {
 func requiredWorkflowID(args []string) (string, error) {
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
-		if arg == "--id" || arg == "--out" || arg == "--idempotency-key" {
+		if arg == "--id" || arg == "--out" || arg == "--idempotency-key" || arg == "--blocker-id" {
 			i++
 			continue
 		}

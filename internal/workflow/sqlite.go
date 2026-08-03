@@ -57,10 +57,10 @@ func (s *SQLiteStore) migrate() error {
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		return err
 	}
-	if version > 2 {
-		return fmt.Errorf("workflow database schema %d is newer than supported schema 2", version)
+	if version > 3 {
+		return fmt.Errorf("workflow database schema %d is newer than supported schema 3", version)
 	}
-	if version == 2 {
+	if version == 3 {
 		return nil
 	}
 	if version == 0 {
@@ -97,7 +97,8 @@ PRAGMA user_version=1;`
 			return err
 		}
 	}
-	const schemaV2 = `BEGIN IMMEDIATE;
+	if version < 2 {
+		const schemaV2 = `BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS review_candidates (id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, tree_oid TEXT NOT NULL, policy_hash TEXT NOT NULL, record BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS semantic_assessments (candidate_record_id TEXT PRIMARY KEY REFERENCES review_candidates(id), assessment BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS review_evidence (id TEXT PRIMARY KEY, candidate_record_id TEXT NOT NULL REFERENCES review_candidates(id), evidence BLOB NOT NULL);
@@ -107,7 +108,15 @@ CREATE TABLE IF NOT EXISTS receipt_invalidations (sequence INTEGER PRIMARY KEY A
 CREATE TABLE IF NOT EXISTS delivery_intents (workflow_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, intent BLOB NOT NULL, PRIMARY KEY(workflow_id,idempotency_key));
 PRAGMA user_version=2;
 COMMIT;`
-	_, err := s.db.Exec(schemaV2)
+		if _, err := s.db.Exec(schemaV2); err != nil {
+			return err
+		}
+	}
+	const schemaV3 = `BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS recovery_bases (workflow_id TEXT PRIMARY KEY REFERENCES workflows(id), basis BLOB NOT NULL);
+PRAGMA user_version=3;
+COMMIT;`
+	_, err := s.db.Exec(schemaV3)
 	return err
 }
 

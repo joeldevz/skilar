@@ -87,12 +87,12 @@ func TestWorkflowCLIStatusInspectAndAbortIdempotently(t *testing.T) {
 func TestWorkflowCLIResumeFailsClosed(t *testing.T) {
 	repo := workflowRepo(t)
 	createCLIWorkflow(t, repo, "wf-blocked", workflow.StateBlocked)
-	err := runWorkflowCLI([]string{"resume", "wf-blocked"}, repo, &bytes.Buffer{})
-	if err == nil || !strings.Contains(err.Error(), "drift reconciliation and lock reacquisition") {
+	err := runWorkflowCLI([]string{"resume", "wf-blocked", "--blocker-id", "blocker", "--idempotency-key", "resume"}, repo, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "blocker ID") {
 		t.Fatalf("error=%v", err)
 	}
 	createCLIWorkflow(t, repo, "wf-ready", workflow.StateDiscovering)
-	err = runWorkflowCLI([]string{"resume", "wf-ready"}, repo, &bytes.Buffer{})
+	err = runWorkflowCLI([]string{"resume", "wf-ready", "--blocker-id", "blocker", "--idempotency-key", "resume"}, repo, &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), "only blocked") {
 		t.Fatalf("error=%v", err)
 	}

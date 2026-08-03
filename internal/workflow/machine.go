@@ -54,5 +54,8 @@ func CanTransition(from, to State, resumeTarget State) bool {
 		_, valid := blockableStates[to]
 		return valid && to != StateBlocked
 	}
+	if from == StateBlocked && to == StateIntegrationConflict {
+		return true
+	}
 	return false
 }

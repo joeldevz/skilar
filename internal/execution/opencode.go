@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/joeldevz/skynex/internal/artifact"
 	"github.com/joeldevz/skynex/internal/gitcandidate"
 	"github.com/joeldevz/skynex/internal/processregistry"
 	"github.com/joeldevz/skynex/internal/workflow"
@@ -192,7 +193,18 @@ func (a *OpenCodeAdapter) persistInvocation(r OpenCodeRequest, args []string, ex
 	evidenceJSON, _ := json.Marshal(evidence)
 	outDigest := digestRedacted(stdout)
 	errDigest := digestRedacted(stderr)
-	_, err := a.Store.Database().Exec(`INSERT OR REPLACE INTO opencode_invocations(invocation_id,workflow_id,attempt_id,model,command,exit_code,stdout_digest,stderr_digest,evidence_ids,status,started_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, r.InvocationID, r.Attempt.WorkflowID, r.Attempt.ID, a.Options.Model, command, exit, outDigest, errDigest, evidenceJSON, status, start.Format(time.RFC3339Nano), end.Format(time.RFC3339Nano))
+	artifacts := artifact.Store{DB: a.Store.Database(), Root: filepath.Join(r.Seal.GitCommonDir, "skynex", "artifacts")}
+	command = artifacts.Redact(command)
+	stdoutID, stderrID := "", ""
+	if records, e := artifacts.PutLog(r.Attempt.WorkflowID, "log", stdout); e == nil && len(records) > 0 {
+		stdoutID = records[0].ID
+		_ = artifacts.Ref(stdoutID, "opencode_invocation", r.InvocationID)
+	}
+	if records, e := artifacts.PutLog(r.Attempt.WorkflowID, "log", stderr); e == nil && len(records) > 0 {
+		stderrID = records[0].ID
+		_ = artifacts.Ref(stderrID, "opencode_invocation", r.InvocationID)
+	}
+	_, err := a.Store.Database().Exec(`INSERT OR REPLACE INTO opencode_invocations(invocation_id,workflow_id,attempt_id,model,command,exit_code,stdout_digest,stderr_digest,evidence_ids,status,started_at,finished_at,stdout_artifact_id,stderr_artifact_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, r.InvocationID, r.Attempt.WorkflowID, r.Attempt.ID, a.Options.Model, command, exit, outDigest, errDigest, evidenceJSON, status, start.Format(time.RFC3339Nano), end.Format(time.RFC3339Nano), stdoutID, stderrID)
 	return err
 }
 

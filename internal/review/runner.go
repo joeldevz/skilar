@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/joeldevz/skynex/internal/approval"
+	artifactstore "github.com/joeldevz/skynex/internal/artifact"
 	"github.com/joeldevz/skynex/internal/gitcandidate"
 	"github.com/joeldevz/skynex/internal/processregistry"
 	"github.com/joeldevz/skynex/internal/workflow"
@@ -157,6 +158,19 @@ func (r *OpenCodeReviewRunner) Run(ctx context.Context, workflowID string) (Rece
 	if err != nil {
 		return Receipt{}, err
 	}
+	artifacts := artifactstore.Store{DB: r.Store.Database(), Root: filepath.Join(verified.Record.Seal.GitCommonDir, "skynex", "artifacts")}
+	rows, _ := r.Store.Database().Query(`SELECT evidence FROM verification_evidence WHERE workflow_id=?`, workflowID)
+	if rows != nil {
+		defer rows.Close()
+		for rows.Next() {
+			var raw []byte
+			_ = rows.Scan(&raw)
+			var item struct{ OutputArtifactID string }
+			if json.Unmarshal(raw, &item) == nil && item.OutputArtifactID != "" {
+				_ = artifacts.Ref(item.OutputArtifactID, "receipt_authority", workflowID)
+			}
+		}
+	}
 	w, _ = r.Store.Get(workflowID)
 	_, err = r.Store.Transition(workflow.Transition{WorkflowID: workflowID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateReceipted, IdempotencyKey: "review:receipted:v1", ArtifactIDs: []string{receipt.ID}})
 	return receipt, err
@@ -276,7 +290,8 @@ func (r *OpenCodeReviewRunner) invoke(parent context.Context, workflowID string,
 	if readErr != nil {
 		return nil, ErrMalformedReview
 	}
-	return raw, nil
+	redactor := artifactstore.Store{}
+	return redactor.Redact(raw), nil
 }
 func gitAt(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)

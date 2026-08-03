@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/joeldevz/skynex/internal/artifact"
 	"github.com/joeldevz/skynex/internal/gitcandidate"
 	"github.com/joeldevz/skynex/internal/review"
 	"github.com/joeldevz/skynex/internal/workflow"
@@ -34,6 +35,8 @@ type Evidence struct {
 	OutputDigest                     string
 	StartedAt, FinishedAt            time.Time
 	Truncated                        bool
+	OutputArtifactID                 string
+	output                           []byte
 }
 type Result struct {
 	Candidate gitcandidate.Candidate
@@ -103,6 +106,14 @@ func (r *Runner) Run(ctx context.Context, workflowID string, seal gitcandidate.C
 	}{{"check", plan.Checks}, {"acceptance", plan.Acceptance}} {
 		for _, command := range group.commands {
 			item, runErr := runCommand(ctx, seal.RepositoryRoot, candidate.TreeOID, group.kind, command, timeout, limit)
+			artifacts := artifact.Store{DB: r.Store.Database(), Root: filepath.Join(seal.GitCommonDir, "skynex", "artifacts")}
+			if records, artifactErr := artifacts.PutLog(workflowID, "log", item.output); artifactErr != nil {
+				return Result{}, artifactErr
+			} else if len(records) > 0 {
+				item.OutputArtifactID = records[0].ID
+				_ = artifacts.Ref(records[0].ID, "verification_evidence", item.ID)
+			}
+			item.output = nil
 			evidence = append(evidence, item)
 			if runErr != nil {
 				passed = false
@@ -228,6 +239,7 @@ func runCommand(parent context.Context, dir, tree, kind string, c Command, timeo
 	basis := fmt.Sprintf("%s\x00%s\x00%s\x00%d\x00%s", tree, kind, c.Name, exit, hex.EncodeToString(sum[:]))
 	idSum := sha256.Sum256([]byte(basis))
 	item := Evidence{ID: "ve_" + hex.EncodeToString(idSum[:]), Kind: kind, CandidateTree: tree, Command: c.Name, Args: append([]string(nil), c.Args...), ExitCode: exit, OutputDigest: hex.EncodeToString(sum[:]), StartedAt: started, FinishedAt: time.Now().UTC(), Truncated: buffer.truncated}
+	item.output = append([]byte(nil), buffer.Bytes()...)
 	return item, err
 }
 func candidateChanges(repo, base, candidate string) ([]review.Change, error) {

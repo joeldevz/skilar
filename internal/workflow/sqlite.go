@@ -57,10 +57,10 @@ func (s *SQLiteStore) migrate() error {
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		return err
 	}
-	if version > 10 {
-		return fmt.Errorf("workflow database schema %d is newer than supported schema 7", version)
+	if version > 11 {
+		return fmt.Errorf("workflow database schema %d is newer than supported schema 11", version)
 	}
-	if version == 7 {
+	if version == 11 {
 		return nil
 	}
 	if version == 0 {
@@ -188,7 +188,32 @@ CREATE TABLE IF NOT EXISTS prototype_validations (id TEXT PRIMARY KEY, workflow_
 PRAGMA user_version=10;
 COMMIT;`
 	_, err = s.db.Exec(schemaV10)
-	return err
+	if err != nil {
+		return err
+	}
+	if version < 11 {
+		const schemaV11 = `BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS artifacts (id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, kind TEXT NOT NULL, digest TEXT NOT NULL, size INTEGER NOT NULL, path TEXT NOT NULL, authoritative INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, retain_until TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS artifact_refs (artifact_id TEXT NOT NULL REFERENCES artifacts(id), owner_kind TEXT NOT NULL, owner_id TEXT NOT NULL, PRIMARY KEY(artifact_id,owner_kind,owner_id));
+COMMIT;`
+		if _, err = s.db.Exec(schemaV11); err != nil {
+			return err
+		}
+		for _, column := range []string{"stdout_artifact_id", "stderr_artifact_id"} {
+			var count int
+			if err = s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('opencode_invocations') WHERE name=?`, column).Scan(&count); err != nil {
+				return err
+			}
+			if count == 0 {
+				if _, err = s.db.Exec(`ALTER TABLE opencode_invocations ADD COLUMN ` + column + ` TEXT NOT NULL DEFAULT ''`); err != nil {
+					return err
+				}
+			}
+		}
+		_, err = s.db.Exec(`PRAGMA user_version=11`)
+		return err
+	}
+	return nil
 }
 
 func (s *SQLiteStore) tightenFiles() error {

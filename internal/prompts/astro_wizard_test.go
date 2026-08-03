@@ -54,6 +54,22 @@ func TestAccessibleWizardCustomSessionCanCancelOrFinish(t *testing.T) {
 	}
 }
 
+func TestBackupCapacityDefaultsToManageAndContinue(t *testing.T) {
+	t.Setenv("ACCESSIBLE", "1")
+	t.Setenv("NO_COLOR", "1")
+	var output bytes.Buffer
+
+	choice := ChooseBackupCapacity(newAccessibleLineReader("1\n"), &output, "5 recovery snapshots retained", false)
+	if choice != BackupManage {
+		t.Fatalf("choice = %q, want %q", choice, BackupManage)
+	}
+	for _, label := range []string{"Manage backups: keep 3 and continue (recommended)", "Cancel"} {
+		if !strings.Contains(output.String(), label) {
+			t.Fatalf("prompt output missing %q: %s", label, output.String())
+		}
+	}
+}
+
 func TestWizardShowsCompactEnvironmentStatusBeforeSetup(t *testing.T) {
 	status := environmentStatus()
 	if status != "✓ OpenCode\n  Claude Code  Coming soon" {

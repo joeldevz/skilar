@@ -28,6 +28,7 @@ type Snapshot struct {
 const (
 	snapshotStatusCommitted = "committed"
 	snapshotStatusRecovery  = "recovery-needed"
+	snapshotStatusLegacy    = "legacy"
 	snapshotStatusUnknown   = "unknown"
 	maxInventoryEntries     = 10000
 )
@@ -79,13 +80,20 @@ func ListSnapshots(stateDir string) ([]Snapshot, error) {
 		}
 		if readErr == nil {
 			item.Status = meta.Status
-			if item.Status == "" {
-				item.Status = snapshotStatusUnknown
-			}
 			if parsed, parseErr := time.Parse(time.RFC3339Nano, meta.CreatedAt); parseErr == nil {
 				item.CreatedAt = parsed
 			}
 			item.Restorable = meta.Version == 1 && len(meta.Entries) <= maxSnapshotEntries
+			if item.Status == "" {
+				// Version-1 manifests created before transaction status was
+				// introduced are complete retained backups, not corrupt entries.
+				// Keep them visibly distinct while allowing an explicit prune.
+				if item.Restorable {
+					item.Status = snapshotStatusLegacy
+				} else {
+					item.Status = snapshotStatusUnknown
+				}
+			}
 		}
 		item.Size, item.FileCount = snapshotSize(root)
 		if item.CreatedAt.IsZero() {
@@ -93,7 +101,7 @@ func ListSnapshots(stateDir string) ([]Snapshot, error) {
 				item.CreatedAt = info.ModTime()
 			}
 		}
-		item.EligibleToPrune = readErr == nil && item.Restorable && item.Status == snapshotStatusCommitted
+		item.EligibleToPrune = readErr == nil && item.Restorable && (item.Status == snapshotStatusCommitted || item.Status == snapshotStatusLegacy)
 		_ = root.Close()
 		result = append(result, item)
 	}

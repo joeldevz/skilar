@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/joeldevz/skynex/internal/installer"
 	"github.com/joeldevz/skynex/internal/models"
@@ -38,6 +39,37 @@ func installTestDeps(events *[]string) installDependencies {
 			return callback()
 		},
 		output: &strings.Builder{}, errorOutput: &strings.Builder{},
+	}
+}
+
+func TestRunInstallManageBackupsPrunesToThreeAndContinues(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	events := []string{}
+	deps := installTestDeps(&events)
+	deps.listSnapshots = func(string) ([]installer.Snapshot, error) {
+		snapshots := make([]installer.Snapshot, 5)
+		for i := range snapshots {
+			snapshots[i] = installer.Snapshot{ID: "retained", CreatedAt: time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)}
+		}
+		return snapshots, nil
+	}
+	deps.chooseBackupCapacity = func(string, bool) prompts.BackupCapacityChoice {
+		return prompts.BackupManage
+	}
+	pruned := 0
+	deps.pruneSnapshots = func(_ string, count int) (int, error) {
+		pruned = count
+		return count, nil
+	}
+
+	if err := runInstall(&cliArgs{StateDir: t.TempDir()}, deps); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(events, []string{"catalog", "config", "wizard", "preflight", "apply", "apply-callback"}) {
+		t.Fatalf("events = %v", events)
+	}
+	if pruned != 2 {
+		t.Fatalf("pruned = %d, want 2 (keep 3)", pruned)
 	}
 }
 

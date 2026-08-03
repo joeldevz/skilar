@@ -25,11 +25,11 @@ const (
 func ChooseBackupCapacity(input io.Reader, output io.Writer, summary string, canPrune bool) BackupCapacityChoice {
 	choice := BackupCapacityChoice(BackupCancel)
 	options := []huh.Option[string]{
-		huh.NewOption("Manage backups", string(BackupManage)),
+		huh.NewOption("Manage backups: keep 3 and continue (recommended)", string(BackupManage)).Selected(true),
 		huh.NewOption("Cancel", string(BackupCancel)),
 	}
 	if canPrune {
-		options = append([]huh.Option[string]{huh.NewOption("Remove oldest backup and continue", string(BackupRemoveOldest)).Selected(true)}, options...)
+		options = append(options[:1], append([]huh.Option[string]{huh.NewOption("Remove oldest backup and continue", string(BackupRemoveOldest))}, options[1:]...)...)
 	}
 	field := huh.NewSelect[string]().Title(summary).Options(options...).Value((*string)(&choice))
 	form := huh.NewForm(huh.NewGroup(field)).WithAccessible(accessibleMode()).WithTheme(wizardTheme(noColor())).WithInput(input).WithOutput(output)

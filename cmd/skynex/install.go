@@ -22,20 +22,21 @@ import (
 )
 
 type installDependencies struct {
-	loadCatalog    func() (*models.Catalog, error)
-	loadConfig     func(string) (map[string]interface{}, error)
-	loadConfigHash func(string) (string, error)
-	wizard         func(prompts.WizardOptions) (*models.InstallRequest, error)
-	preflight      func(*models.InstallRequest, *models.Catalog, preflight.Options) []*models.ValidationIssue
-	apply          func(*installer.Plan, func() error) error
-	output         io.Writer
-	input          io.Reader
-	errorOutput    io.Writer
-	claudeDir      func() string
-	opencodeDir    func() string
-	listSnapshots  func(string) ([]installer.Snapshot, error)
-	pruneSnapshots func(string, int) (int, error)
-	exactCurrent   func(string, string) bool
+	loadCatalog          func() (*models.Catalog, error)
+	loadConfig           func(string) (map[string]interface{}, error)
+	loadConfigHash       func(string) (string, error)
+	wizard               func(prompts.WizardOptions) (*models.InstallRequest, error)
+	preflight            func(*models.InstallRequest, *models.Catalog, preflight.Options) []*models.ValidationIssue
+	apply                func(*installer.Plan, func() error) error
+	output               io.Writer
+	input                io.Reader
+	errorOutput          io.Writer
+	claudeDir            func() string
+	opencodeDir          func() string
+	listSnapshots        func(string) ([]installer.Snapshot, error)
+	pruneSnapshots       func(string, int) (int, error)
+	chooseBackupCapacity func(string, bool) prompts.BackupCapacityChoice
+	exactCurrent         func(string, string) bool
 }
 
 func formatSnapshotSize(size int64) string {
@@ -66,7 +67,10 @@ func productionInstallDependencies() installDependencies {
 		opencodeDir:    paths.OpencodeDir,
 		listSnapshots:  installer.ListSnapshots,
 		pruneSnapshots: installer.PruneSnapshots,
-		exactCurrent:   isExactEmbeddedInstall,
+		chooseBackupCapacity: func(summary string, canPrune bool) prompts.BackupCapacityChoice {
+			return prompts.ChooseBackupCapacity(os.Stdin, os.Stderr, summary, canPrune)
+		},
+		exactCurrent: isExactEmbeddedInstall,
 	}
 }
 
@@ -112,6 +116,11 @@ func runInstall(args *cliArgs, deps installDependencies) error {
 	}
 	if deps.pruneSnapshots == nil {
 		deps.pruneSnapshots = installer.PruneSnapshots
+	}
+	if deps.chooseBackupCapacity == nil {
+		deps.chooseBackupCapacity = func(summary string, canPrune bool) prompts.BackupCapacityChoice {
+			return prompts.ChooseBackupCapacity(deps.input, deps.errorOutput, summary, canPrune)
+		}
 	}
 	if deps.exactCurrent == nil {
 		deps.exactCurrent = isExactEmbeddedInstall
@@ -192,13 +201,29 @@ func runInstall(args *cliArgs, deps installDependencies) error {
 			return fmt.Errorf("snapshot capacity reached: %d snapshots retained; run `skynex backup prune --yes --keep 3`", len(snapshots))
 		}
 		oldest := snapshots[0]
-		choice := prompts.ChooseBackupCapacity(deps.input, deps.errorOutput, fmt.Sprintf("%d recovery snapshots retained (oldest %s, %s)", len(snapshots), oldest.CreatedAt.Format("2006-01-02"), formatSnapshotSize(oldest.Size)), eligible > 0)
-		if choice != prompts.BackupRemoveOldest || eligible == 0 {
+		choice := deps.chooseBackupCapacity(fmt.Sprintf("%d recovery snapshots retained (oldest %s, %s)", len(snapshots), oldest.CreatedAt.Format("2006-01-02"), formatSnapshotSize(oldest.Size)), eligible > 0)
+		switch choice {
+		case prompts.BackupCancel:
 			fmt.Fprintln(deps.output, "Backups retained. Manage them with: skynex backup list")
 			return nil
-		}
-		if _, pruneErr := deps.pruneSnapshots(stateDir, 1); pruneErr != nil {
-			return fmt.Errorf("prune oldest backup: %w", pruneErr)
+		case prompts.BackupManage:
+			remove := len(snapshots) - 3
+			removed, pruneErr := deps.pruneSnapshots(stateDir, remove)
+			if pruneErr != nil {
+				return fmt.Errorf("manage retained backups: %w", pruneErr)
+			}
+			if removed < remove {
+				return fmt.Errorf("snapshot capacity remains blocked: removed %d of %d required backups; run `skynex backup list` to inspect non-prunable recovery data", removed, remove)
+			}
+		case prompts.BackupRemoveOldest:
+			if eligible == 0 {
+				return errors.New("cannot remove oldest backup: no retained backup is eligible for pruning")
+			}
+			if _, pruneErr := deps.pruneSnapshots(stateDir, 1); pruneErr != nil {
+				return fmt.Errorf("prune oldest backup: %w", pruneErr)
+			}
+		default:
+			return fmt.Errorf("unsupported backup capacity choice %q", choice)
 		}
 	}
 	var results []*models.InstallResult

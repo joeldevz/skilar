@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/joeldevz/skynex/internal/approval"
 	"github.com/joeldevz/skynex/internal/delivery"
 	"github.com/joeldevz/skynex/internal/execution"
 	"github.com/joeldevz/skynex/internal/gitcandidate"
@@ -232,6 +233,71 @@ func workflowReview(store *workflow.SQLiteStore, args []string, out io.Writer) e
 	return nil
 }
 
+func workflowApprove(store *workflow.SQLiteStore, args []string, out io.Writer) error {
+	id, ok := flagValue(args, "--id")
+	if !ok || id == "" {
+		return errors.New("approve requires --id")
+	}
+	action, ok := flagValue(args, "--action")
+	if !ok || action == "" {
+		return errors.New("approve requires --action")
+	}
+	actor, ok := flagValue(args, "--actor")
+	if !ok || actor == "" {
+		return errors.New("approve requires --actor")
+	}
+	reason, ok := flagValue(args, "--reason")
+	if !ok || reason == "" {
+		return errors.New("approve requires --reason")
+	}
+	var raw []byte
+	if err := store.Database().QueryRow(`SELECT result FROM verification_runs WHERE workflow_id=?`, id).Scan(&raw); err != nil {
+		return err
+	}
+	var verified struct{ Record review.CandidateRecord }
+	if err := json.Unmarshal(raw, &verified); err != nil {
+		return err
+	}
+	expires := time.Now().Add(time.Hour)
+	if value, exists := flagValue(args, "--expires"); exists {
+		duration, err := time.ParseDuration(value)
+		if err != nil {
+			return err
+		}
+		expires = time.Now().Add(duration)
+	}
+	artifact, err := approval.Issue(store.Database(), approval.Artifact{Actor: actor, AuthSource: "cli", WorkflowID: id, Action: action, BasisGraphOrCandidate: verified.Record.TreeOID, PolicyHash: verified.Record.PolicyHash, Rationale: reason, IssuedAt: time.Now(), ExpiresAt: expires})
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "%s\t%s\t%s\n", id, action, artifact.ID)
+	return nil
+}
+
+func workflowRevokeApproval(store *workflow.SQLiteStore, args []string, out io.Writer) error {
+	id, ok := flagValue(args, "--id")
+	if !ok {
+		return errors.New("revoke-approval requires --id")
+	}
+	action, ok := flagValue(args, "--action")
+	if !ok {
+		return errors.New("revoke-approval requires --action")
+	}
+	actor, ok := flagValue(args, "--actor")
+	if !ok {
+		return errors.New("revoke-approval requires --actor")
+	}
+	reason, ok := flagValue(args, "--reason")
+	if !ok {
+		return errors.New("revoke-approval requires --reason")
+	}
+	if err := approval.Revoke(store.Database(), id, action, actor, reason, time.Now()); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "%s\t%s\trevoked\n", id, action)
+	return nil
+}
+
 func workflowDeliver(store *workflow.SQLiteStore, args []string, out io.Writer, afterCommit func() error) error {
 	id, ok := flagValue(args, "--id")
 	if !ok || id == "" {
@@ -261,6 +327,11 @@ func workflowDeliver(store *workflow.SQLiteStore, args []string, out io.Writer, 
 	authority, err := reviews.Authority(id)
 	if err != nil {
 		return err
+	}
+	if authority.EffectiveRisk == review.RiskHigh {
+		if _, err = approval.Require(store.Database(), id, "delivery", authority.CandidateTreeOID, authority.PolicyHash, time.Now()); err != nil {
+			return err
+		}
 	}
 	var raw []byte
 	if err = store.Database().QueryRow(`SELECT result FROM verification_runs WHERE workflow_id=?`, id).Scan(&raw); err != nil {

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/joeldevz/skynex/internal/gitcandidate"
+	"github.com/joeldevz/skynex/internal/processregistry"
 	"github.com/joeldevz/skynex/internal/workflow"
 	"os"
 	"os/exec"
@@ -119,6 +120,8 @@ func (a *OpenCodeAdapter) Run(ctx context.Context, request OpenCodeRequest) (Wor
 	args = append(args, prompt)
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	unregister := processregistry.Register(request.Attempt.WorkflowID, request.InvocationID, cancel)
+	defer unregister()
 	stdout := &boundedBuffer{limit: limit}
 	stderr := &boundedBuffer{limit: limit}
 	cmd := exec.CommandContext(runCtx, executable, args...)

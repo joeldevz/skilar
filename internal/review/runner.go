@@ -14,7 +14,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/joeldevz/skynex/internal/approval"
 	"github.com/joeldevz/skynex/internal/gitcandidate"
+	"github.com/joeldevz/skynex/internal/processregistry"
 	"github.com/joeldevz/skynex/internal/workflow"
 )
 
@@ -99,6 +101,11 @@ func (r *OpenCodeReviewRunner) Run(ctx context.Context, workflowID string) (Rece
 	assessment, err := AssessSemantic(verified.Record, verified.Floor, SemanticInput{RequestedRisk: semantic.RequestedRisk, SelectedLens: semantic.SelectedLens, Justification: semantic.Justification, ModelProvider: "opencode", ModelID: r.Options.Model, PromptTemplateID: "semantic:v1", RenderedRedactedPrompt: "semantic review"}, time.Now())
 	if err != nil {
 		return Receipt{}, err
+	}
+	if assessment.EffectiveRisk == RiskHigh {
+		if _, err = approval.Require(r.Store.Database(), workflowID, "review", verified.Record.TreeOID, verified.Record.PolicyHash, time.Now()); err != nil {
+			return Receipt{}, err
+		}
 	}
 	evidence, err := r.verificationEvidence(verified.Record)
 	if err != nil {
@@ -228,6 +235,8 @@ func (r *OpenCodeReviewRunner) invoke(parent context.Context, workflowID string,
 	args = append(args, prompt+" Write JSON to $SKYNEX_RESULT_FILE")
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
+	unregister := processregistry.Register(workflowID, "review:"+workflowID+":"+lens, cancel)
+	defer unregister()
 	var output bytes.Buffer
 	cmd := exec.CommandContext(ctx, exe, args...)
 	cmd.Dir = wt

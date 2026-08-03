@@ -9,16 +9,20 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/joeldevz/skynex/internal/approval"
+	"github.com/joeldevz/skynex/internal/processregistry"
 	"github.com/joeldevz/skynex/internal/review"
 	"github.com/joeldevz/skynex/internal/workflow"
 )
 
 type workflowInspection struct {
-	Workflow workflow.Workflow `json:"workflow"`
-	Events   []workflow.Event  `json:"events"`
-	Receipt  *review.Receipt   `json:"authoritative_receipt,omitempty"`
-	RunInput json.RawMessage   `json:"run_input,omitempty"`
+	Workflow  workflow.Workflow `json:"workflow"`
+	Events    []workflow.Event  `json:"events"`
+	Receipt   *review.Receipt   `json:"authoritative_receipt,omitempty"`
+	RunInput  json.RawMessage   `json:"run_input,omitempty"`
+	Approvals []string          `json:"current_approvals,omitempty"`
 }
 
 func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
@@ -47,6 +51,10 @@ func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
 		return workflowReview(store, args[1:], out)
 	case "deliver":
 		return workflowDeliver(store, args[1:], out, nil)
+	case "approve":
+		return workflowApprove(store, args[1:], out)
+	case "revoke-approval":
+		return workflowRevokeApproval(store, args[1:], out)
 	case "status":
 		return workflowStatus(store, args[1:], out)
 	case "inspect":
@@ -107,6 +115,16 @@ func workflowInspect(store *workflow.SQLiteStore, reviews *review.SQLiteStore, i
 	if e := store.Database().QueryRow(`SELECT input FROM workflow_run_inputs WHERE workflow_id=?`, id).Scan(&input); e == nil {
 		inspection.RunInput = input
 	}
+	rows, e := store.Database().Query(`SELECT action||':'||approval_id FROM current_approvals WHERE workflow_id=? ORDER BY action`, id)
+	if e == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var value string
+			if rows.Scan(&value) == nil {
+				inspection.Approvals = append(inspection.Approvals, value)
+			}
+		}
+	}
 	if receipt, e := reviews.Authority(id); e == nil {
 		inspection.Receipt = &receipt
 	} else if !errors.Is(e, review.ErrNoAuthority) {
@@ -148,6 +166,7 @@ func workflowAbort(store *workflow.SQLiteStore, args []string, out io.Writer) er
 		return err
 	}
 	if w.State == workflow.StateAborted {
+		_ = cleanupAbortedWorkflow(store, id)
 		events, eventErr := store.Events(id)
 		if eventErr != nil {
 			return eventErr
@@ -170,8 +189,21 @@ func workflowAbort(store *workflow.SQLiteStore, args []string, out io.Writer) er
 	if err != nil {
 		return err
 	}
+	if err = cleanupAbortedWorkflow(store, id); err != nil {
+		return err
+	}
 	fmt.Fprintf(out, "%s\t%s\t%d\n", updated.ID, updated.State, updated.StateVersion)
 	return nil
+}
+
+func cleanupAbortedWorkflow(store *workflow.SQLiteStore, id string) error {
+	cancelled := processregistry.CancelWorkflow(id)
+	_, _ = store.Database().Exec(`UPDATE mutation_attempts SET live=0 WHERE workflow_id=?`, id)
+	_, _ = store.Database().Exec(`DELETE FROM leases WHERE resource IN (SELECT 'worktree:'||worktree_id FROM mutation_attempts WHERE workflow_id=?)`, id)
+	_ = approval.RevokeAll(store.Database(), id, "workflow-abort", "kill switch", time.Now())
+	plan, _ := json.Marshal(map[string]any{"workflow_id": id, "processes_cancelled": cancelled, "attempts_revoked": true, "leases_revoked": true, "approvals_revoked": true})
+	_, err := store.Database().Exec(`INSERT INTO abort_cleanup_plans(workflow_id,plan) VALUES(?,?) ON CONFLICT(workflow_id) DO UPDATE SET plan=excluded.plan`, id, plan)
+	return err
 }
 
 func workflowResume(store *workflow.SQLiteStore, repo string, args []string, out io.Writer) error {

@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -182,6 +184,11 @@ printf '{"envelope":{"WorkflowID":"wf","NodeID":"slice_main","AttemptID":"wf:sli
 			if err := workflowRun(store, repo, []string{"wf"}, &bytes.Buffer{}); err != nil {
 				t.Fatal(err)
 			}
+			if tc.risk == "high" {
+				if err := workflowApprove(store, []string{"--id", "wf", "--action", "review", "--actor", "tester", "--reason", "high review"}, &bytes.Buffer{}); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if err := workflowReview(store, []string{"--id", "wf"}, &bytes.Buffer{}); err != nil {
 				t.Fatal(err)
 			}
@@ -223,6 +230,11 @@ func TestWorkflowOpenCodeReviewRejectsBadResultsAndDrift(t *testing.T) {
 			}
 			if tc.drift {
 				_ = os.WriteFile(filepath.Join(repo, "a.txt"), []byte("drift\n"), 0o600)
+			}
+			if tc.name == "severe" {
+				if err := workflowApprove(store, []string{"--id", "wf", "--action", "review", "--actor", "tester", "--reason", "severe review"}, &bytes.Buffer{}); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if err := os.WriteFile(fake, []byte("#!/bin/sh\nset -eu\n"+tc.reviewScript+"\n"), 0o700); err != nil {
 				t.Fatal(err)
@@ -338,4 +350,64 @@ func TestWorkflowDeliverRejectsInvalidAuthorityAndDrift(t *testing.T) {
 			t.Fatal("moved base ref accepted")
 		}
 	})
+}
+
+func TestWorkflowAbortCancelsOpenCodeAndRejectsLateResult(t *testing.T) {
+	repo, store := cliWorkflowRepo(t)
+	defer store.Close()
+	marker := filepath.Join(t.TempDir(), "running")
+	fake := filepath.Join(t.TempDir(), "opencode")
+	script := "#!/bin/sh\ntouch '" + marker + "'\nsleep 10\n"
+	if err := os.WriteFile(fake, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"--id", "wf", "--request", "change", "--accept", "true", "--check", "true", "--path", "a.txt", "--opencode", fake, "--timeout", "20s"}
+	if err := workflowStart(store, repo, args, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- workflowRun(store, repo, []string{"wf"}, &bytes.Buffer{}) }()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("worker did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	abortArgs := []string{"wf", "--idempotency-key", "abort-1"}
+	if err := workflowAbort(store, abortArgs, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("run succeeded after abort")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker was not cancelled")
+	}
+	if err := workflowAbort(store, abortArgs, &bytes.Buffer{}); err != nil {
+		t.Fatalf("idempotent abort=%v", err)
+	}
+	var attemptID, owner, token, basis string
+	if err := store.Database().QueryRow(`SELECT attempt_id,owner,fencing_token,basis_tree FROM mutation_attempts WHERE workflow_id='wf'`).Scan(&attemptID, &owner, &token, &basis); err != nil {
+		t.Fatal(err)
+	}
+	var inputRaw []byte
+	_ = store.Database().QueryRow(`SELECT input FROM workflow_run_inputs WHERE workflow_id='wf'`).Scan(&inputRaw)
+	var input workflowRunInput
+	_ = json.Unmarshal(inputRaw, &input)
+	env := workflow.ResultEnvelope{WorkflowID: "wf", NodeID: "slice_main", AttemptID: attemptID, BaseCandidateOID: basis, Status: workflow.AttemptCompleted}
+	_, err := (&execution.Broker{Store: store, Seal: input.Seal}).Apply(context.Background(), execution.WorkerResult{Envelope: env, Owner: owner, FencingToken: token})
+	if err == nil {
+		t.Fatal("late result accepted")
+	}
+	var audits int
+	_ = store.Database().QueryRow(`SELECT COUNT(*) FROM stale_result_audit WHERE attempt_id=?`, attemptID).Scan(&audits)
+	if audits == 0 {
+		t.Fatal("late result was not audited")
+	}
 }

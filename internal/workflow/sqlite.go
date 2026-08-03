@@ -57,7 +57,7 @@ func (s *SQLiteStore) migrate() error {
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		return err
 	}
-	if version > 9 {
+	if version > 10 {
 		return fmt.Errorf("workflow database schema %d is newer than supported schema 7", version)
 	}
 	if version == 7 {
@@ -176,6 +176,18 @@ CREATE TABLE IF NOT EXISTS review_findings (id TEXT PRIMARY KEY, workflow_id TEX
 PRAGMA user_version=9;
 COMMIT;`
 	_, err := s.db.Exec(schemaV9)
+	if err != nil {
+		return err
+	}
+	const schemaV10 = `BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, action TEXT NOT NULL, digest TEXT NOT NULL, artifact BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS current_approvals (workflow_id TEXT NOT NULL, action TEXT NOT NULL, approval_id TEXT NOT NULL REFERENCES approvals(id), PRIMARY KEY(workflow_id,action));
+CREATE TABLE IF NOT EXISTS approval_revocations (sequence INTEGER PRIMARY KEY AUTOINCREMENT, workflow_id TEXT NOT NULL, action TEXT NOT NULL, approval_id TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL, occurred_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS abort_cleanup_plans (workflow_id TEXT PRIMARY KEY, plan BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS prototype_validations (id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, artifact BLOB NOT NULL);
+PRAGMA user_version=10;
+COMMIT;`
+	_, err = s.db.Exec(schemaV10)
 	return err
 }
 

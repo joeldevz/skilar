@@ -136,7 +136,7 @@ func TestReceiptRejectsCandidatePolicyAndEvidenceMismatch(t *testing.T) {
 func testCandidate(t *testing.T, workflowID, tree string) (CandidateRecord, RiskPolicy) {
 	t.Helper()
 	p := DefaultRiskPolicy()
-	gc := gitcandidate.Candidate{TreeOID: tree, Seal: gitcandidate.ContextSeal{RepositoryRoot: "/repo", BaseCommitOID: "base", BaseTreeOID: "base-tree", ObjectFormat: "sha1"}, Manifest: []gitcandidate.ManifestEntry{{Path: "file.go", Mode: "100644", Kind: "blob", OID: "blob"}}}
+	gc := gitcandidate.Candidate{TreeOID: tree, PolicyHash: gitcandidate.Policy{}.Hash(), Seal: gitcandidate.ContextSeal{RepositoryRoot: "/repo", BaseCommitOID: "base", BaseTreeOID: "base-tree", ObjectFormat: "sha1"}, Manifest: []gitcandidate.ManifestEntry{{Path: "file.go", Mode: "100644", Kind: "blob", OID: "blob"}}}
 	c, err := NewCandidateRecord(workflowID, gc, p.Hash(), "engine-v1", time.Now())
 	if err != nil {
 		t.Fatal(err)

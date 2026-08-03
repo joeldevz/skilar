@@ -220,14 +220,15 @@ func validLens(l Lens) bool {
 }
 
 type CandidateRecord struct {
-	ID            string
-	WorkflowID    string
-	TreeOID       string
-	Manifest      []gitcandidate.ManifestEntry
-	Seal          gitcandidate.ContextSeal
-	PolicyHash    string
-	EngineVersion string
-	FrozenAt      time.Time
+	ID                  string
+	WorkflowID          string
+	TreeOID             string
+	Manifest            []gitcandidate.ManifestEntry
+	Seal                gitcandidate.ContextSeal
+	PolicyHash          string
+	CandidatePolicyHash string
+	EngineVersion       string
+	FrozenAt            time.Time
 }
 
 func NewCandidateRecord(workflowID string, c gitcandidate.Candidate, policyHash, engineVersion string, now time.Time) (CandidateRecord, error) {
@@ -236,27 +237,27 @@ func NewCandidateRecord(workflowID string, c gitcandidate.Candidate, policyHash,
 	}
 	manifest := append([]gitcandidate.ManifestEntry(nil), c.Manifest...)
 	sort.Slice(manifest, func(i, j int) bool { return manifest[i].Path < manifest[j].Path })
-	id := candidateRecordID(workflowID, c.TreeOID, policyHash, engineVersion, c.Seal, manifest)
-	return CandidateRecord{ID: id, WorkflowID: workflowID, TreeOID: c.TreeOID, Manifest: manifest, Seal: c.Seal, PolicyHash: policyHash, EngineVersion: engineVersion, FrozenAt: now.UTC()}, nil
+	id := candidateRecordID(workflowID, c.TreeOID, policyHash, c.PolicyHash, engineVersion, c.Seal, manifest)
+	return CandidateRecord{ID: id, WorkflowID: workflowID, TreeOID: c.TreeOID, Manifest: manifest, Seal: c.Seal, PolicyHash: policyHash, CandidatePolicyHash: c.PolicyHash, EngineVersion: engineVersion, FrozenAt: now.UTC()}, nil
 }
 
-func candidateRecordID(workflowID, treeOID, policyHash, engineVersion string, seal gitcandidate.ContextSeal, manifest []gitcandidate.ManifestEntry) string {
+func candidateRecordID(workflowID, treeOID, policyHash, candidatePolicyHash, engineVersion string, seal gitcandidate.ContextSeal, manifest []gitcandidate.ManifestEntry) string {
 	basis := struct {
-		WorkflowID, TreeOID, PolicyHash, EngineVersion string
-		Seal                                           gitcandidate.ContextSeal
-		Manifest                                       []gitcandidate.ManifestEntry
-	}{workflowID, treeOID, policyHash, engineVersion, seal, manifest}
+		WorkflowID, TreeOID, PolicyHash, CandidatePolicyHash, EngineVersion string
+		Seal                                                                gitcandidate.ContextSeal
+		Manifest                                                            []gitcandidate.ManifestEntry
+	}{workflowID, treeOID, policyHash, candidatePolicyHash, engineVersion, seal, manifest}
 	raw, _ := json.Marshal(basis)
 	return "cand_" + digest(raw)
 }
 
 func ValidateCandidateRecord(c CandidateRecord) error {
-	if c.ID == "" || c.WorkflowID == "" || c.TreeOID == "" || c.PolicyHash == "" || c.EngineVersion == "" {
+	if c.ID == "" || c.WorkflowID == "" || c.TreeOID == "" || c.PolicyHash == "" || c.CandidatePolicyHash == "" || c.EngineVersion == "" {
 		return ErrCandidateMismatch
 	}
 	manifest := append([]gitcandidate.ManifestEntry(nil), c.Manifest...)
 	sort.Slice(manifest, func(i, j int) bool { return manifest[i].Path < manifest[j].Path })
-	if candidateRecordID(c.WorkflowID, c.TreeOID, c.PolicyHash, c.EngineVersion, c.Seal, manifest) != c.ID {
+	if candidateRecordID(c.WorkflowID, c.TreeOID, c.PolicyHash, c.CandidatePolicyHash, c.EngineVersion, c.Seal, manifest) != c.ID {
 		return ErrCandidateMismatch
 	}
 	return nil

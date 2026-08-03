@@ -65,7 +65,7 @@ var simpleGroups = []simpleGroup{
 	{
 		key:    "Orchestrator",
 		desc:   "Plans, coordinates and delegates all work",
-		agents: []string{"orchestrator", "manager"},
+		agents: []string{"orchestrator"},
 	},
 	{
 		key:    "Workers",
@@ -89,7 +89,6 @@ var agentDescriptions = map[string]string{
 	"tech-planner":    "Writes PLAN.md with technical steps",
 	"product-planner": "Writes SPEC.md with business context",
 	"coder":           "Implements code changes",
-	"manager":         "Executes plan step by step",
 	"verifier":        "Runs lint, build, tests",
 	"test-reviewer":   "Reviews test quality",
 	"security":        "Adversarial security judge",
@@ -99,7 +98,6 @@ var agentDescriptions = map[string]string{
 
 var agentList = []string{
 	"orchestrator", "tech-planner", "product-planner",
-	"coder", "manager", "verifier",
 	"test-reviewer", "security", "skill-validator", "advisor",
 }
 
@@ -110,13 +108,13 @@ var agentList = []string{
 type wizardState int
 
 const (
-	stateNameInput        wizardState = iota
-	stateModeSelect                   // choose Simple or Advanced
-	stateSimpleModelPick              // list of groups, press enter to pick model
-	stateAdvancedModelPick            // list of agents, press enter to pick model
-	stateProviderSelect               // sub-state: choose provider
-	stateModelSelect                  // sub-state: choose model within provider
-	stateSummary                      // review and confirm
+	stateNameInput         wizardState = iota
+	stateModeSelect                    // choose Simple or Advanced
+	stateSimpleModelPick               // list of groups, press enter to pick model
+	stateAdvancedModelPick             // list of agents, press enter to pick model
+	stateProviderSelect                // sub-state: choose provider
+	stateModelSelect                   // sub-state: choose model within provider
+	stateSummary                       // review and confirm
 )
 
 // ---------------------------------------------------------------------------

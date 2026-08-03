@@ -21,27 +21,6 @@
       },
       "model": "anthropic/claude-sonnet-4-6"
     },
-    "linear-orchestrator": {
-      "description": "Linear-driven orchestrator — drives a single Linear issue end-to-end with strict TDD and human gates. Reads/clarifies the issue, writes 6 phase comments, spawns parallel sub-agents to write failing tests (red), waits for explicit human validation, implements to green, and opens a PR. Never writes code itself.",
-      "mode": "all",
-      "prompt": "{file:./agents/linear-orchestrator.md}",
-      "tools": {
-        "bash": true,
-        "edit": true,
-        "read": true,
-        "write": true,
-        "glob": true,
-        "grep": true,
-        "linear*": true,
-        "neurox_session_start": true,
-        "neurox_context": true,
-        "neurox_recall": true,
-        "neurox_save": true,
-        "neurox_update": true,
-        "neurox_session_end": true
-      },
-      "model": "anthropic/claude-sonnet-4-6"
-    },
     "advisor": {
       "description": "Senior strategic advisor for complex decisions. Pure thinking — no file tools.",
       "model": "anthropic/claude-opus-4-6",
@@ -69,24 +48,6 @@
         "neurox_session_end": true,
         "advisor_consult": true
       }
-    },
-
-    "manager": {
-      "description": "Project Manager Agent - reads PLAN.md, delegates one step at a time to coder, and enforces the human review loop",
-      "mode": "subagent",
-      "prompt": "{file:./agents/manager.md}",
-      "tools": {
-        "bash": true,
-        "read": true,
-        "neurox_session_start": true,
-        "neurox_context": true,
-        "neurox_recall": true,
-        "neurox_save": true,
-        "neurox_update": true,
-        "neurox_session_end": true,
-        "advisor_consult": true
-      },
-      "model": "anthropic/claude-haiku-4-5"
     },
     "tech-planner": {
       "model": "anthropic/claude-sonnet-4-6",
@@ -234,11 +195,6 @@
     "jina-mcp-server": {
       "type": "remote",
       "url": "https://mcp.jina.ai/v1"
-    },
-    "linear": {
-      "type": "remote",
-      "url": "https://mcp.linear.app/mcp",
-      "enabled": true
     },
     "neurox": {
       "command": [

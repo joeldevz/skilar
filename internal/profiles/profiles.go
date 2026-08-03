@@ -25,7 +25,6 @@ var AgentOrder = []string{
 	"tech-planner",
 	"product-planner",
 	"coder",
-	"manager",
 	"verifier",
 	"test-reviewer",
 	"security",
@@ -35,7 +34,7 @@ var AgentOrder = []string{
 
 // SimpleGroups organizes agents into logical groups for simple mode.
 var SimpleGroups = map[string][]string{
-	"orchestrator": {"orchestrator", "manager"},
+	"orchestrator": {"orchestrator"},
 	"workers": {
 		"tech-planner",
 		"product-planner",
@@ -57,7 +56,6 @@ var BuiltinTiers = map[string]*Profile{
 			"tech-planner":    "anthropic/claude-haiku-4-5",
 			"product-planner": "anthropic/claude-haiku-4-5",
 			"coder":           "anthropic/claude-haiku-4-5",
-			"manager":         "anthropic/claude-haiku-4-5",
 			"verifier":        "anthropic/claude-haiku-4-5",
 			"test-reviewer":   "anthropic/claude-haiku-4-5",
 			"security":        "anthropic/claude-haiku-4-5",
@@ -72,7 +70,6 @@ var BuiltinTiers = map[string]*Profile{
 			"tech-planner":    "anthropic/claude-sonnet-4-6",
 			"product-planner": "anthropic/claude-haiku-4-5",
 			"coder":           "anthropic/claude-haiku-4-5",
-			"manager":         "anthropic/claude-haiku-4-5",
 			"verifier":        "anthropic/claude-haiku-4-5",
 			"test-reviewer":   "anthropic/claude-haiku-4-5",
 			"security":        "anthropic/claude-haiku-4-5",
@@ -87,7 +84,6 @@ var BuiltinTiers = map[string]*Profile{
 			"tech-planner":    "anthropic/claude-sonnet-4-6",
 			"product-planner": "anthropic/claude-sonnet-4-6",
 			"coder":           "anthropic/claude-sonnet-4-6",
-			"manager":         "anthropic/claude-sonnet-4-6",
 			"verifier":        "anthropic/claude-haiku-4-5",
 			"test-reviewer":   "anthropic/claude-haiku-4-5",
 			"security":        "anthropic/claude-sonnet-4-6",

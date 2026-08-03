@@ -15,6 +15,9 @@ import (
 func InstallOpencode(srcDir string, req *models.InstallRequest) error {
 	sourceDir := filepath.Join(srcDir, "opencode")
 	target := opencodeDir()
+	if err := archiveInactiveLegacyWorkflowDB(target); err != nil {
+		return err
+	}
 	if err := validateInstallDestinationTree(target); err != nil {
 		return fmt.Errorf("validate opencode install destination: %w", err)
 	}
@@ -46,7 +49,7 @@ func InstallOpencode(srcDir string, req *models.InstallRequest) error {
 
 	// Copy opencode/ → target using Go (no rsync)
 	fmt.Printf("    Copying OpenCode config to %s...\n", target)
-	if err := copyDirExcluding(sourceDir, target, []string{"node_modules"}); err != nil {
+	if err := installOwnedTree(sourceDir, target); err != nil {
 		return fmt.Errorf("copy opencode dir: %w", err)
 	}
 

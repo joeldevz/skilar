@@ -8,8 +8,6 @@ Tests mínimos para validar que los 3 agentes se comportan como esperamos.
 |------|--------|------------|
 | 01-planner-reads-conventions | planner | Lee CONVENTIONS.md antes de preguntar |
 | 02-planner-uses-template | planner | Usa template PLAN-crud para tareas CRUD |
-| 03-orchestrator-reads-plan-first | manager | Lee PLAN.md antes de hacer nada |
-| 04-orchestrator-stops-for-review | manager | Se detiene tras un paso y pide review |
 | 05-coder-reads-before-writing | coder | Lee código existente antes de escribir |
 | 06-coder-runs-verification | coder | Corre tsc/build/test antes de reportar éxito |
 
@@ -33,7 +31,6 @@ id: unique-id
 name: "Nombre legible"
 description: |
   Qué valida este test.
-agent: planner | manager | coder
 
 prompt: |
   Lo que se le envía al agente.

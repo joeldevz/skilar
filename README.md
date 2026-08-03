@@ -181,7 +181,6 @@ skynex completion fish > ~/.config/fish/completions/skynex.fish
 | Agente | Rol | Que hace |
 |--------|-----|----------|
 | `planner` | Discovery y planificacion | Inicia memoria con Neurox, lee convenciones, explora el codebase, hace preguntas, genera `PLAN.md` |
-| `manager` | Orquestacion y review | Lee `PLAN.md`, ejecuta un paso por vez, delega a `coder`, exige revision humana |
 | `coder` | Implementacion acotada | Implementa una tarea, sigue patrones locales, consulta Context7 para docs, verifica antes de entregar |
 
 ### Estados de PLAN.md
@@ -275,7 +274,6 @@ skills/
 
 ### Claude Code
 
-- **3 agentes** en `~/.claude/agents`: `planner`, `manager`, `coder`
 - **8 slash skills** en `~/.claude/skills` con los mismos nombres operativos
 - **Overlay de `CLAUDE.md`** para mantener el mismo workflow
 - **Neurox MCP** configurado en `~/.claude.json`
@@ -297,13 +295,9 @@ skills/
 |------|--------|--------|
 | 01 | planner | Lee CONVENTIONS.md antes de preguntar |
 | 02 | planner | Usa template PLAN-crud para tareas CRUD |
-| 03 | manager | Lee PLAN.md antes de hacer nada |
-| 04 | manager | Se detiene tras un paso y pide review |
 | 05 | coder | Lee codigo existente antes de escribir |
 | 06 | coder | Corre verificacion antes de reportar exito |
-| 07 | manager | /review lee CONVENTIONS.md y git diff |
 | 08 | coder | /test lee tests existentes antes de generar |
-| 09 | manager | /rollback pide confirmacion antes de revertir |
 
 ```bash
 ./evals/run-evals.sh
@@ -324,7 +318,6 @@ Claude Code no permite que un subagente lance otro subagente. Para mantener el m
 
 - El hilo principal de Claude hace de orquestador
 - `planner` y `coder` se usan como subagentes
-- `manager` es agente de apoyo para scoping y review
 - La orquestacion multi-agente se queda en el hilo principal
 
 ## Recomendacion

@@ -1,29 +1,14 @@
 ---
-description: Create a conventional commit for the current changes
-agent: manager
-subtask: true
+description: Deliver the authoritative Skynex workflow candidate as an exact-tree local commit
+agent: orchestrator
 ---
 
-Create a commit for the current staged changes following the project's commit conventions.
+Fail closed. Do not stage files or call `git commit` directly.
 
-Workflow:
-1. Run `git status` and `git diff --staged` to understand what changed
-2. Determine the appropriate commit type (feat, fix, refactor, test, docs, chore, etc.)
-3. Determine the scope from the affected context or module
-4. Write a commit message following Conventional Commits format: `<type>(<scope>): <description>`
-5. If the change is complex, add a body explaining why
-6. Stage any unstaged related files if needed
-7. Create the commit
+1. Run `skynex workflow status` and identify the workflow ID supplied in `{argument}`.
+2. Require the workflow to be `receipted` with current receipt authority.
+3. Run:
+   `skynex workflow deliver --id <workflow-id> --message "<message>" --idempotency-key "opencode-commit-<workflow-id>"`
+4. Report the exact commit/tree/receipt returned by the delivery gate.
 
-Context:
-- Working directory: {workdir}
-- Current project: {project}
-
-Rules:
-- First line max 72 characters
-- Use imperative present tense in English: "add", "fix", "remove"
-- Do not end with a period
-- Do not commit files that contain secrets (.env, credentials, etc.)
-- If there are no changes to commit, say so
-
-Do NOT push to remote. Only create the local commit.
+Never push. If no receipted workflow ID is provided, stop and explain the required workflow commands.

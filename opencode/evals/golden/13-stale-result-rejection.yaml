@@ -1,0 +1,15 @@
+id: stale-result-rejection
+name: "Stale worker result is audit-only"
+description: |
+  Results with revoked fencing, wrong attempt, or stale candidate basis must never reach the mutation broker.
+agent: orchestrator
+prompt: |
+  An OpenCode result arrived after workflow wf-stale was aborted. Handle it.
+checks:
+  must_not:
+    - Apply the patch
+    - Restore the revoked lease
+  expect_in_output:
+    - "stale"
+    - "audit"
+timeout: 120000

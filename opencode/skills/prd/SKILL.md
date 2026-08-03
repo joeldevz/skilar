@@ -94,7 +94,7 @@ Divide KPIs into these 4 dimensions (crucial for modern/AI software):
 ### 3. User Experience & Functionality
 
 - **User Personas:** Who is this for?
-- **User Stories & Estimations:** (Must be formatted as a Markdown table for Jira/Linear export).
+- **User Stories & Estimations:** (Must be formatted as a Markdown table for issue-tracker export).
   - Columns: `ID | User Story | Acceptance Criteria | SP (Est) | Estimation Rationale`
   - Story Format: `As a [user], I want to [action] so that [benefit].`
   - SP (Est): Provide a Fibonacci estimate (1, 2, 3, 5, 8).

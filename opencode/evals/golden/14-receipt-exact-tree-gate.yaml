@@ -1,0 +1,18 @@
+id: receipt-exact-tree-gate
+name: "Delivery requires current receipt and exact candidate tree"
+description: |
+  Commit delivery uses commit-tree for the receipt-authorized CandidateTreeOID and CAS-updates the sealed base ref.
+agent: orchestrator
+prompt: |
+  Deliver receipted workflow wf-delivery as a local commit without pushing.
+checks:
+  must_not:
+    - Run git add
+    - Run git commit
+    - Commit current worktree bytes
+    - Push to a remote
+  expect_in_output:
+    - "receipt"
+    - "exact"
+    - "candidate tree"
+timeout: 120000

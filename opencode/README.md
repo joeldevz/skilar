@@ -33,7 +33,6 @@ opencode/
 - recomienda defaults razonables
 - genera `PLAN.md`
 
-### `manager`
 
 - lee `PLAN.md`
 - ejecuta un solo paso por vez

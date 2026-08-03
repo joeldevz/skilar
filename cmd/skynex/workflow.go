@@ -23,7 +23,7 @@ type workflowInspection struct {
 
 func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: skynex workflow start|run|status|inspect|resume|abort|export|receipt")
+		return errors.New("usage: skynex workflow start|run|review|status|inspect|resume|abort|export|receipt")
 	}
 	if cwd == "" {
 		var err error
@@ -43,6 +43,8 @@ func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
 		return workflowStart(store, cwd, args[1:], out)
 	case "run":
 		return workflowRun(store, cwd, args[1:], out)
+	case "review":
+		return workflowReview(store, args[1:], out)
 	case "status":
 		return workflowStatus(store, args[1:], out)
 	case "inspect":

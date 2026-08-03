@@ -201,6 +201,36 @@ func workflowRun(store *workflow.SQLiteStore, repo string, args []string, out io
 	return nil
 }
 
+func workflowReview(store *workflow.SQLiteStore, args []string, out io.Writer) error {
+	id, ok := flagValue(args, "--id")
+	var err error
+	if !ok {
+		id, err = requiredWorkflowID(args)
+		if err != nil {
+			return err
+		}
+	}
+	var raw []byte
+	if err = store.Database().QueryRow(`SELECT input FROM workflow_run_inputs WHERE workflow_id=?`, id).Scan(&raw); err != nil {
+		return err
+	}
+	var input workflowRunInput
+	if err = json.Unmarshal(raw, &input); err != nil {
+		return err
+	}
+	model := input.Model
+	if model == "" {
+		model = "default"
+	}
+	runner := review.OpenCodeReviewRunner{Store: store, Options: review.OpenCodeReviewOptions{Executable: input.Executable, Model: model, Timeout: input.Timeout}}
+	receipt, err := runner.Run(context.Background(), id)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "%s\t%s\t%s\n", id, workflow.StateReceipted, receipt.ID)
+	return nil
+}
+
 func flagValues(args []string, name string) []string {
 	var values []string
 	for i := 0; i < len(args); i++ {

@@ -152,3 +152,90 @@ func TestWorkflowAttemptsUseDistinctRandomFencingTokens(t *testing.T) {
 		t.Fatalf("tokens are not random and distinct: %q %q", tokens[0], tokens[1])
 	}
 }
+
+func TestWorkflowOpenCodeReviewDepthsAndReplay(t *testing.T) {
+	for _, tc := range []struct {
+		risk        string
+		lens        string
+		invocations int
+	}{{"low", "", 1}, {"medium", "reliability", 2}, {"high", "", 5}} {
+		t.Run(tc.risk, func(t *testing.T) {
+			repo, store := cliWorkflowRepo(t)
+			defer store.Close()
+			fake := filepath.Join(t.TempDir(), "opencode")
+			body := `#!/bin/sh
+set -eu
+case "$*" in
+  *"Assess risk"*) printf '{"requested_risk":"` + tc.risk + `","selected_lens":"` + tc.lens + `","justification":"fake assessment"}' > "$SKYNEX_RESULT_FILE"; exit 0 ;;
+  *"Review lens"*) printf '{"findings":[]}' > "$SKYNEX_RESULT_FILE"; exit 0 ;;
+esac
+tree=$(git write-tree)
+printf '{"envelope":{"WorkflowID":"wf","NodeID":"slice_main","AttemptID":"wf:slice_main","BaseCandidateOID":"%s","Status":"completed"},"patch":{"Operations":[{"Path":"a.txt","Data":"bmV3Cg==","Mode":384}]}}' "$tree" > "$SKYNEX_RESULT_FILE"
+`
+			if err := os.WriteFile(fake, []byte(body), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			args := []string{"--id", "wf", "--request", "change a", "--accept", "true", "--check", "true", "--path", "a.txt", "--opencode", fake, "--model", "fake", "--timeout", "2s"}
+			if err := workflowStart(store, repo, args, &bytes.Buffer{}); err != nil {
+				t.Fatal(err)
+			}
+			if err := workflowRun(store, repo, []string{"wf"}, &bytes.Buffer{}); err != nil {
+				t.Fatal(err)
+			}
+			if err := workflowReview(store, []string{"--id", "wf"}, &bytes.Buffer{}); err != nil {
+				t.Fatal(err)
+			}
+			var count int
+			if err := store.Database().QueryRow(`SELECT COUNT(*) FROM review_invocations WHERE workflow_id='wf'`).Scan(&count); err != nil || count != tc.invocations {
+				t.Fatalf("invocations=%d err=%v", count, err)
+			}
+			if err := workflowReview(store, []string{"--id", "wf"}, &bytes.Buffer{}); err != nil {
+				t.Fatalf("replay=%v", err)
+			}
+			if err := store.Database().QueryRow(`SELECT COUNT(*) FROM review_invocations WHERE workflow_id='wf'`).Scan(&count); err != nil || count != tc.invocations {
+				t.Fatalf("replay invocations=%d err=%v", count, err)
+			}
+		})
+	}
+}
+
+func TestWorkflowOpenCodeReviewRejectsBadResultsAndDrift(t *testing.T) {
+	for _, tc := range []struct {
+		name, reviewScript string
+		drift              bool
+	}{
+		{"lowering", `printf '{"requested_risk":"","justification":"lower"}' > "$SKYNEX_RESULT_FILE"`, false},
+		{"malformed", `echo bad > "$SKYNEX_RESULT_FILE"`, false},
+		{"timeout", `sleep 2`, false},
+		{"severe", `case "$*" in *"Assess risk"*) printf '{"requested_risk":"high","justification":"high"}' ;; *) printf '{"findings":[{"severity":"severe","message":"boom","reproducible":true,"candidate_caused":true}]}' ;; esac > "$SKYNEX_RESULT_FILE"`, false},
+		{"drift", `printf '{"requested_risk":"low","justification":"ok"}' > "$SKYNEX_RESULT_FILE"`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, store := cliWorkflowRepo(t)
+			defer store.Close()
+			fake := cliFakeOpenCode(t, "true")
+			args := []string{"--id", "wf", "--request", "change a", "--accept", "true", "--check", "true", "--path", "a.txt", "--opencode", fake, "--model", "fake", "--timeout", "30ms"}
+			if err := workflowStart(store, repo, args, &bytes.Buffer{}); err != nil {
+				t.Fatal(err)
+			}
+			if err := workflowRun(store, repo, []string{"wf"}, &bytes.Buffer{}); err != nil {
+				t.Fatal(err)
+			}
+			if tc.drift {
+				_ = os.WriteFile(filepath.Join(repo, "a.txt"), []byte("drift\n"), 0o600)
+			}
+			if err := os.WriteFile(fake, []byte("#!/bin/sh\nset -eu\n"+tc.reviewScript+"\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := workflowReview(store, []string{"--id", "wf"}, &bytes.Buffer{}); err == nil {
+				t.Fatal("review unexpectedly succeeded")
+			}
+			if tc.name == "severe" || tc.name == "drift" {
+				w, _ := store.Get("wf")
+				if w.State != workflow.StateReplanRequired {
+					t.Fatalf("state=%s", w.State)
+				}
+			}
+		})
+	}
+}

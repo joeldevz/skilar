@@ -57,7 +57,7 @@ func (s *SQLiteStore) migrate() error {
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		return err
 	}
-	if version > 8 {
+	if version > 9 {
 		return fmt.Errorf("workflow database schema %d is newer than supported schema 7", version)
 	}
 	if version == 7 {
@@ -167,7 +167,15 @@ COMMIT;`
 CREATE TABLE IF NOT EXISTS workflow_run_inputs (workflow_id TEXT PRIMARY KEY REFERENCES workflows(id), input BLOB NOT NULL);
 PRAGMA user_version=8;
 COMMIT;`
-	_, err := s.db.Exec(schemaV8)
+	if _, err := s.db.Exec(schemaV8); err != nil {
+		return err
+	}
+	const schemaV9 = `BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS review_invocations (id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, candidate_tree TEXT NOT NULL, lens TEXT NOT NULL, model TEXT NOT NULL, status TEXT NOT NULL, output_digest TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS review_findings (id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, candidate_tree TEXT NOT NULL, lens TEXT NOT NULL, finding BLOB NOT NULL);
+PRAGMA user_version=9;
+COMMIT;`
+	_, err := s.db.Exec(schemaV9)
 	return err
 }
 

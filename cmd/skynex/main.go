@@ -37,6 +37,13 @@ var (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "workflow" {
+		if err := runWorkflowCLI(os.Args[2:], "", os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "Workflow error:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	args := parseArgs()
 
 	if args.ShowVersion {
@@ -845,6 +852,7 @@ func printUsage() {
 	fmt.Println(`Usage: skynex [command] [options]
 
 Commands:
+  workflow <command>      Inspect or control managed workflows
   install                 Interactive installer (TUI)
   update [package]        Update installed packages to latest version
   status                  Show installed packages, profiles, and tools

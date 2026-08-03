@@ -161,3 +161,37 @@ func TestRunInstallForceSkipsExactCurrentGate(t *testing.T) {
 		t.Fatalf("events = %v", events)
 	}
 }
+
+func TestNeuroxFlagsResolveExplicitAndRecommendedDefaults(t *testing.T) {
+	cat := &models.Catalog{Packages: map[string]*models.PackageDefinition{"skills": {ID: "skills", DefaultVersion: "latest"}}}
+	for _, tc := range []struct {
+		name string
+		argv []string
+		want bool
+	}{
+		{"recommended default", []string{"install", "--package", "skills", "--target", "opencode", "--non-interactive"}, true},
+		{"explicit on", []string{"install", "--package", "skills", "--target", "opencode", "--non-interactive", "--with-neurox"}, true},
+		{"explicit off", []string{"install", "--package", "skills", "--target", "opencode", "--non-interactive", "--without-neurox"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := parseArgsFrom(tc.argv)
+			req, err := resolveNonInteractive(args, cat, map[string]interface{}{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if req.NeuroxEnabled != tc.want {
+				t.Fatalf("NeuroxEnabled=%v want %v", req.NeuroxEnabled, tc.want)
+			}
+		})
+	}
+	if args := parseArgsFrom([]string{"install", "--with-neurox", "--without-neurox"}); args.ParseError == "" {
+		t.Fatal("conflicting Neurox flags must fail")
+	}
+}
+
+func TestUpdateRequestDefaultsToRecommendedNeurox(t *testing.T) {
+	req := newUpdateInstallRequest([]string{"skills"}, []string{"opencode"}, map[string]string{"skills": "latest"}, t.TempDir(), false)
+	if !req.NeuroxEnabled || !req.NeuroxSelectionSet {
+		t.Fatalf("update request lost recommended Neurox default: %#v", req)
+	}
+}

@@ -122,6 +122,15 @@ func TestWizardDefaultsAndSelection(t *testing.T) {
 	if len(defaults.Components) != len(optionalComponents) {
 		t.Fatalf("components=%d, want %d", len(defaults.Components), len(optionalComponents))
 	}
+	if !selectionEnablesNeurox(defaults) {
+		t.Fatal("recommended setup must enable Neurox")
+	}
+	if selectionEnablesNeurox(WizardSelection{Environment: "opencode", Setup: setupCustom, Components: []string{"official-skills"}}) {
+		t.Fatal("custom setup without neurox-memory must disable Neurox")
+	}
+	if !selectionEnablesNeurox(WizardSelection{Environment: "opencode", Setup: setupCustom, Components: []string{"neurox-memory"}}) {
+		t.Fatal("custom neurox-memory selection must enable Neurox")
+	}
 
 }
 

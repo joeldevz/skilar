@@ -57,6 +57,18 @@ type WizardSelection struct {
 	Components  []string
 }
 
+func selectionEnablesNeurox(selection WizardSelection) bool {
+	if selection.Setup == setupRecommended {
+		return true
+	}
+	for _, component := range selection.Components {
+		if component == "neurox-memory" {
+			return true
+		}
+	}
+	return false
+}
+
 func NewWizardSelection() WizardSelection {
 	return WizardSelection{
 		Environment: "opencode",
@@ -294,6 +306,7 @@ func runWizardWithIO(options WizardOptions, input io.Reader, output io.Writer) (
 	return &models.InstallRequest{
 		Packages: []string{"skills"}, Targets: []string{"opencode"},
 		Versions: map[string]string{"skills": "latest"}, Interactive: true,
+		NeuroxEnabled: selectionEnablesNeurox(selection), NeuroxSelectionSet: true,
 	}, nil
 }
 

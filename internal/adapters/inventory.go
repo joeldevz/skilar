@@ -30,6 +30,10 @@ func loadInventory(root string) inventory {
 }
 
 func installOwnedTree(source, target string) error {
+	return installOwnedTreeExcluding(source, target, nil)
+}
+
+func installOwnedTreeExcluding(source, target string, excluded map[string]bool) error {
 	old := loadInventory(target)
 	next := inventory{Files: map[string]string{}}
 	err := filepath.WalkDir(source, func(path string, d fs.DirEntry, err error) error {
@@ -37,6 +41,10 @@ func installOwnedTree(source, target string) error {
 			return err
 		}
 		rel, _ := filepath.Rel(source, path)
+		relSlash := filepath.ToSlash(rel)
+		if excluded[relSlash] {
+			return nil
+		}
 		if d.IsDir() && (rel == "skills" || rel == "node_modules") {
 			return filepath.SkipDir
 		}
@@ -55,7 +63,7 @@ func installOwnedTree(source, target string) error {
 		write := true
 		if current, e := os.ReadFile(dest); e == nil && rel != "opencode.json" {
 			currentDigest := fileDigest(current)
-			if owned, ok := old.Files[filepath.ToSlash(rel)]; ok {
+			if owned, ok := old.Files[relSlash]; ok {
 				if currentDigest != owned {
 					fmt.Printf("    Preserving modified managed file: %s\n", dest)
 					write = false
@@ -72,9 +80,9 @@ func installOwnedTree(source, target string) error {
 			if err = os.WriteFile(dest, raw, 0o600); err != nil {
 				return err
 			}
-			next.Files[filepath.ToSlash(rel)] = digest
-		} else if owned, ok := old.Files[filepath.ToSlash(rel)]; ok {
-			next.Files[filepath.ToSlash(rel)] = owned
+			next.Files[relSlash] = digest
+		} else if owned, ok := old.Files[relSlash]; ok {
+			next.Files[relSlash] = owned
 		}
 		return nil
 	})

@@ -77,6 +77,9 @@ func SaveConfig(path string, req *models.InstallRequest, existing map[string]int
 	defaults := cloneMap(asMap(cfg["defaults"]))
 	defaults["interactive"] = req.Interactive
 	defaults["targets"] = req.Targets
+	if req.NeuroxSelectionSet {
+		defaults["neuroxEnabled"] = req.NeuroxEnabled
+	}
 	cfg["defaults"] = defaults
 	pkgs := cloneMap(asMap(cfg["packages"]))
 	for _, pkgID := range req.Packages {

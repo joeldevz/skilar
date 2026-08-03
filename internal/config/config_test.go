@@ -181,3 +181,19 @@ func TestSaveConfigRejectsExternalChangeAfterLoad(t *testing.T) {
 		t.Fatal("external config was not preserved")
 	}
 }
+
+func TestSaveConfigPersistsExplicitNeuroxSelection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "skills.config.json")
+	req := &models.InstallRequest{NeuroxEnabled: false, NeuroxSelectionSet: true, Versions: map[string]string{}}
+	if err := SaveConfig(path, req, map[string]interface{}{}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadOrDefault(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaults := cfg["defaults"].(map[string]interface{})
+	if enabled, ok := defaults["neuroxEnabled"].(bool); !ok || enabled {
+		t.Fatalf("neuroxEnabled=%v (%v), want false", enabled, ok)
+	}
+}

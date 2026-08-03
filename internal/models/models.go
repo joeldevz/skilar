@@ -22,6 +22,10 @@ type InstallRequest struct {
 	CleanupDeprecated bool
 	// TrustSetupScripts is an explicit opt-in for package lifecycle scripts.
 	TrustSetupScripts bool
+	// NeuroxEnabled controls the optional OpenCode Neurox MCP and plugin.
+	NeuroxEnabled bool
+	// NeuroxSelectionSet distinguishes an explicit choice from legacy config.
+	NeuroxSelectionSet bool
 	// SkillsDecisions is ephemeral and is not persisted in configuration.
 	SkillsDecisions     map[string]string
 	SkillsBundleVersion string

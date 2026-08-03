@@ -278,6 +278,8 @@ type cliArgs struct {
 	BackupKeep        int
 	LegacyVersion     bool
 	ParseError        string
+	WithNeurox        bool
+	WithoutNeurox     bool
 }
 
 func parseArgs() *cliArgs {
@@ -444,6 +446,10 @@ func parseArgsFrom(osArgs []string) *cliArgs {
 			}
 		case "--trust-setup-scripts":
 			args.TrustScripts = true
+		case "--with-neurox":
+			args.WithNeurox = true
+		case "--without-neurox":
+			args.WithoutNeurox = true
 		case "--state-dir":
 			if v, ok := value(&i, "--state-dir"); ok {
 				args.StateDir = v
@@ -470,6 +476,9 @@ func parseArgsFrom(osArgs []string) *cliArgs {
 				args.ParseError = fmt.Sprintf("unknown option: %s", osArgs[i])
 			}
 		}
+	}
+	if args.WithNeurox && args.WithoutNeurox {
+		args.ParseError = "--with-neurox and --without-neurox are mutually exclusive"
 	}
 	return args
 }
@@ -532,12 +541,14 @@ func resolveNonInteractive(args *cliArgs, cat *models.Catalog, cfg map[string]in
 	}
 
 	req := &models.InstallRequest{
-		Packages:          args.Packages,
-		Targets:           args.Targets,
-		Versions:          versions,
-		Interactive:       false,
-		CleanupDeprecated: args.CleanupDeprecated,
-		TrustSetupScripts: args.TrustScripts,
+		Packages:           args.Packages,
+		Targets:            args.Targets,
+		Versions:           versions,
+		Interactive:        false,
+		CleanupDeprecated:  args.CleanupDeprecated,
+		TrustSetupScripts:  args.TrustScripts,
+		NeuroxEnabled:      !args.WithoutNeurox,
+		NeuroxSelectionSet: true,
 	}
 
 	return req, nil
@@ -788,6 +799,11 @@ func handleUpdate(pkg string, stateDir string, cleanupDeprecated bool, trustScri
 	}
 
 	request := newUpdateInstallRequest(packagesToUpdate, targets, versions, stateDir, cleanupDeprecated, trustScripts...)
+	if defaults, ok := cfg["defaults"].(map[string]interface{}); ok {
+		if enabled, ok := defaults["neuroxEnabled"].(bool); ok {
+			request.NeuroxEnabled, request.NeuroxSelectionSet = enabled, true
+		}
+	}
 
 	// Preflight
 	issues := preflight.Run(request, cat)
@@ -854,13 +870,15 @@ func handleUpdate(pkg string, stateDir string, cleanupDeprecated bool, trustScri
 func newUpdateInstallRequest(packages, targets []string, versions map[string]string, stateDir string, cleanupDeprecated bool, trustScripts ...bool) *models.InstallRequest {
 	trust := len(trustScripts) > 0 && trustScripts[0]
 	return &models.InstallRequest{
-		Packages:          packages,
-		Targets:           targets,
-		Versions:          versions,
-		Interactive:       false,
-		StateDir:          stateDir,
-		CleanupDeprecated: cleanupDeprecated,
-		TrustSetupScripts: trust,
+		Packages:           packages,
+		Targets:            targets,
+		Versions:           versions,
+		Interactive:        false,
+		StateDir:           stateDir,
+		CleanupDeprecated:  cleanupDeprecated,
+		TrustSetupScripts:  trust,
+		NeuroxEnabled:      true,
+		NeuroxSelectionSet: true,
 	}
 }
 
@@ -1031,6 +1049,8 @@ Options:
    --non-interactive          Skip prompts, require all inputs via flags.
    --yes, -y                  Skip confirmation prompt.
    --trust-setup-scripts      Trust external setup scripts.
+	--with-neurox              Install the Neurox MCP and OpenCode plugin (recommended default).
+	--without-neurox           Do not install Neurox integration.
    --state-dir DIR            State directory (default: ~/.config/skynex).
    --list-packages            List available packages.
    --list-versions PKG        List versions for a package.

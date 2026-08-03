@@ -2,23 +2,30 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/joeldevz/skynex/internal/adapters"
+	"github.com/joeldevz/skynex/internal/assets"
+	"github.com/joeldevz/skynex/internal/binaryinstall"
 	"github.com/joeldevz/skynex/internal/catalog"
 	"github.com/joeldevz/skynex/internal/completion"
 	"github.com/joeldevz/skynex/internal/config"
 	"github.com/joeldevz/skynex/internal/doctor"
+	"github.com/joeldevz/skynex/internal/installer"
 	"github.com/joeldevz/skynex/internal/models"
 	"github.com/joeldevz/skynex/internal/paths"
 	"github.com/joeldevz/skynex/internal/preflight"
 	"github.com/joeldevz/skynex/internal/profiles"
 	"github.com/joeldevz/skynex/internal/prompts"
 	"github.com/joeldevz/skynex/internal/runner"
+	"github.com/joeldevz/skynex/internal/skillsync"
 )
 
 // truncate safely truncates a string to n characters
@@ -37,7 +44,18 @@ var (
 )
 
 func main() {
+	if len(os.Args) == 4 && os.Args[1] == "internal-install-binary" {
+		if err := binaryinstall.Install(os.Args[2], os.Args[3]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	args := parseArgs()
+	if args.ParseError != "" {
+		fmt.Fprintf(os.Stderr, "Error: %s\n", args.ParseError)
+		os.Exit(2)
+	}
 
 	if args.ShowVersion {
 		fmt.Printf("skynex %s (%s) built %s\n", version, commit, date)
@@ -56,6 +74,10 @@ func main() {
 	// status
 	if args.Status {
 		handleStatus()
+		os.Exit(0)
+	}
+	if args.BackupCommand != "" {
+		handleBackup(args)
 		os.Exit(0)
 	}
 
@@ -124,82 +146,92 @@ func main() {
 
 	// update
 	if args.Update {
-		handleUpdate(args.UpdatePkg, args.StateDir, args.CleanupDeprecated)
+		handleUpdate(args.UpdatePkg, args.StateDir, args.CleanupDeprecated, args.TrustScripts)
 		os.Exit(0)
 	}
 
 	// install
 	if args.Install {
-		// Load catalog
-		cat, err := catalog.Load()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading catalog: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Load existing config
-		stateDir := args.StateDir
-		if stateDir == "" {
-			stateDir = paths.StateDir()
-		}
-		cfg := config.LoadOrDefault(stateDir + "/skills.config.json")
-
-		// Resolve request
-		var request *models.InstallRequest
-		if args.NonInteractive {
-			request, err = resolveNonInteractive(args, cat, cfg)
-		} else {
-			request, err = prompts.ResolveInteractive(cat, cfg, args)
-		}
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(2)
-		}
-		request.StateDir = stateDir
-
-		// Preflight
-		issues := preflight.Run(request, cat)
-		if preflight.HasErrors(issues) {
-			preflight.PrintIssues(issues)
-			fmt.Fprintln(os.Stderr, "\nInstallation aborted due to validation errors.")
-			os.Exit(2)
-		}
-
-		// Confirm
-		if !args.NonInteractive && !args.Yes {
-			if !prompts.ConfirmPlan(request, cat) {
-				fmt.Println("Installation cancelled.")
-				os.Exit(0)
+		if err := runInstall(args, productionInstallDependencies()); err != nil {
+			if errors.Is(err, prompts.ErrWizardCancelled) {
+				fmt.Println("Installation cancelled. No changes were made.")
+			} else {
+				fmt.Fprintln(os.Stderr, compactInstallError(err, args.Verbose))
+				os.Exit(1)
 			}
 		}
-
-		// Install
-		fmt.Println("\nInstalling packages...")
-		results, err := adapters.InstallAll(request, cat)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "\nInstallation failed: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Save state
-		config.SaveConfig(stateDir+"/skills.config.json", request, cfg)
-		config.SaveLock(stateDir+"/skills.lock.json", results, request)
-
-		// Print results
-		fmt.Println("\nInstallation complete!")
-		for _, r := range results {
-			fmt.Printf("\n  %s @ %s (%s)\n", r.PackageID, r.ResolvedVersion, truncate(r.Commit, 8))
-			for target, tr := range r.Targets {
-				fmt.Printf("    [%s] %s: %s\n", target, tr.Status, joinStrings(tr.Artifacts))
-			}
-		}
-		fmt.Printf("\nState files written to %s\n", stateDir)
 		os.Exit(0)
 	}
 
 	// No recognized command — show help
 	printUsage()
 	os.Exit(0)
+}
+
+func compactInstallError(err error, verbose bool) string {
+	message := strings.ReplaceAll(err.Error(), "^[[", "\x1b[")
+	message = strings.Join(strings.Fields(ansi.Strip(message)), " ")
+	if verbose {
+		return "Installation failed: " + message
+	}
+	return "Installation failed: " + message + " (rerun with --verbose for details)"
+}
+
+func handleBackup(args *cliArgs) {
+	stateDir := args.StateDir
+	if stateDir == "" {
+		stateDir = paths.StateDir()
+	}
+	snapshots, err := installer.ListSnapshots(stateDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Backup error: %v\n", err)
+		return
+	}
+	if args.BackupCommand == "list" {
+		if len(snapshots) == 0 {
+			fmt.Println("No retained backups.")
+			return
+		}
+		for _, snapshot := range snapshots {
+			status := snapshot.Status
+			if status == "" {
+				status = "unknown"
+			}
+			eligible := "no"
+			if snapshot.EligibleToPrune {
+				eligible = "yes"
+			}
+			fmt.Printf("%s  %s  %s  %s  files=%d  prune=%s\n", snapshot.ID, status, snapshot.CreatedAt.Format("2006-01-02 15:04:05Z07:00"), formatSnapshotSize(snapshot.Size), snapshot.FileCount, eligible)
+		}
+		fmt.Printf("Retained: %d\n", len(snapshots))
+		return
+	}
+	keep := args.BackupKeep
+	if keep == 0 {
+		keep = 3
+	}
+	eligible := 0
+	for _, snapshot := range snapshots {
+		if snapshot.EligibleToPrune {
+			eligible++
+		}
+	}
+	remove := eligible - keep
+	if remove <= 0 {
+		fmt.Printf("Pruned: 0; retained: %d\n", len(snapshots))
+		return
+	}
+	if !args.BackupYes && !prompts.ConfirmBackupPrune(os.Stdin, os.Stdout, remove) {
+		fmt.Println("Backup prune cancelled.")
+		return
+	}
+	removed, err := installer.PruneSnapshots(stateDir, remove)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Backup prune failed: %v\n", err)
+		return
+	}
+	remaining, _ := installer.ListSnapshots(stateDir)
+	fmt.Printf("Pruned: %d; retained: %d\n", removed, len(remaining))
 }
 
 type cliArgs struct {
@@ -232,11 +264,30 @@ type cliArgs struct {
 	Completion        string // bash, zsh, or fish
 	Status            bool
 	CleanupDeprecated bool
+	DryRun            bool
+	Verbose           bool
+	Force             bool
+	BackupCommand     string
+	BackupYes         bool
+	BackupKeep        int
+	LegacyVersion     bool
+	ParseError        string
 }
 
 func parseArgs() *cliArgs {
+	return parseArgsFrom(os.Args[1:])
+}
+
+func parseArgsFrom(osArgs []string) *cliArgs {
 	args := &cliArgs{Versions: make(map[string]string)}
-	osArgs := os.Args[1:]
+	value := func(i *int, flag string) (string, bool) {
+		if *i+1 >= len(osArgs) || isFlag(osArgs[*i+1]) {
+			args.ParseError = fmt.Sprintf("%s requires a value", flag)
+			return "", false
+		}
+		*i = *i + 1
+		return osArgs[*i], true
+	}
 
 	for i := 0; i < len(osArgs); i++ {
 		switch osArgs[i] {
@@ -248,6 +299,18 @@ func parseArgs() *cliArgs {
 			args.Doctor = true
 		case "install":
 			args.Install = true
+		case "backup":
+			if i+1 >= len(osArgs) {
+				args.ParseError = "backup requires list or prune"
+				break
+			}
+			sub := osArgs[i+1]
+			if sub != "list" && sub != "prune" {
+				args.ParseError = "backup requires list or prune"
+				break
+			}
+			args.BackupCommand = sub
+			i++
 		case "profiles":
 			// alias for `profile list`
 			args.ProfileList = true
@@ -289,9 +352,8 @@ func parseArgs() *cliArgs {
 				}
 			}
 		case "completion":
-			if i+1 < len(osArgs) {
-				i++
-				args.Completion = osArgs[i]
+			if v, ok := value(&i, "completion"); ok {
+				args.Completion = v
 			} else {
 				args.Completion = "help"
 			}
@@ -302,8 +364,15 @@ func parseArgs() *cliArgs {
 				if next == "--web" {
 					args.UpWeb = true
 					i++
-				} else if next == "--port" && i+2 < len(osArgs) {
-					fmt.Sscanf(osArgs[i+2], "%d", &args.UpPort)
+				} else if next == "--port" {
+					if i+2 >= len(osArgs) || isFlag(osArgs[i+2]) {
+						args.ParseError = "--port requires a value"
+						break
+					}
+					if _, err := fmt.Sscanf(osArgs[i+2], "%d", &args.UpPort); err != nil {
+						args.ParseError = "--port requires an integer value"
+						break
+					}
 					i += 2
 				} else if !strings.HasPrefix(next, "-") && args.UpProfile == "" {
 					args.UpProfile = next
@@ -316,54 +385,75 @@ func parseArgs() *cliArgs {
 		case "--list-packages":
 			args.ListPackages = true
 		case "--list-versions":
-			if i+1 < len(osArgs) {
-				i++
-				args.ListVersions = osArgs[i]
+			if v, ok := value(&i, "--list-versions"); ok {
+				args.ListVersions = v
 			}
 		case "--package":
-			if i+1 < len(osArgs) {
-				i++
-				args.Packages = append(args.Packages, osArgs[i])
+			if v, ok := value(&i, "--package"); ok {
+				args.Packages = append(args.Packages, v)
 			}
 		case "--target":
-			if i+1 < len(osArgs) {
-				i++
-				if osArgs[i] == "both" {
+			if v, ok := value(&i, "--target"); ok {
+				if v == "both" {
 					args.Targets = append(args.Targets, "claude", "opencode")
 				} else {
-					args.Targets = append(args.Targets, osArgs[i])
+					args.Targets = append(args.Targets, v)
 				}
 			}
+		case "--package-version":
+			if i+1 >= len(osArgs) || isFlag(osArgs[i+1]) {
+				args.ParseError = "--package-version requires PKG=VER"
+				break
+			}
+			i++
+			parts := splitOnce(osArgs[i], "=")
+			if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+				args.ParseError = "--package-version requires PKG=VER"
+				break
+			}
+			args.Versions[parts[0]] = parts[1]
 		case "--version":
-			// Check if this is the info flag or package version flag
-			if i+1 < len(osArgs) && !isFlag(osArgs[i+1]) {
+			if args.Install && i+1 < len(osArgs) && !isFlag(osArgs[i+1]) {
 				i++
 				parts := splitOnce(osArgs[i], "=")
-				if len(parts) == 2 {
-					args.Versions[parts[0]] = parts[1]
+				if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+					args.ParseError = "--version requires PKG=VER"
+					break
 				}
+				args.Versions[parts[0]] = parts[1]
+				args.LegacyVersion = true
 			} else {
-				// --version with no arg or followed by flag = show version
 				args.ShowVersion = true
 			}
 		case "--non-interactive":
 			args.NonInteractive = true
 		case "--yes", "-y":
 			args.Yes = true
+			args.BackupYes = true
+		case "--keep":
+			if v, ok := value(&i, "--keep"); ok {
+				if _, err := fmt.Sscanf(v, "%d", &args.BackupKeep); err != nil || args.BackupKeep < 0 {
+					args.ParseError = "--keep requires a non-negative integer"
+				}
+			}
 		case "--trust-setup-scripts":
 			args.TrustScripts = true
 		case "--state-dir":
-			if i+1 < len(osArgs) {
-				i++
-				args.StateDir = osArgs[i]
+			if v, ok := value(&i, "--state-dir"); ok {
+				args.StateDir = v
 			}
 		case "--advisor-model":
-			if i+1 < len(osArgs) {
-				i++
-				args.AdvisorModel = osArgs[i]
+			if v, ok := value(&i, "--advisor-model"); ok {
+				args.AdvisorModel = v
 			}
 		case "--cleanup-deprecated":
 			args.CleanupDeprecated = true
+		case "--dry-run":
+			args.DryRun = true
+		case "--verbose":
+			args.Verbose = true
+		case "--force":
+			args.Force = true
 		case "update":
 			args.Update = true
 			// optional package name
@@ -416,6 +506,14 @@ func resolveNonInteractive(args *cliArgs, cat *models.Catalog, cfg map[string]in
 			return nil, fmt.Errorf("unknown package: %s", pkg)
 		}
 	}
+	for pkg, version := range args.Versions {
+		if _, ok := cat.Packages[pkg]; !ok {
+			return nil, fmt.Errorf("unknown package in --version: %s", pkg)
+		}
+		if !validVersionRef(version) {
+			return nil, fmt.Errorf("unsafe version for %s", pkg)
+		}
+	}
 
 	// Resolve versions
 	versions := make(map[string]string)
@@ -433,6 +531,7 @@ func resolveNonInteractive(args *cliArgs, cat *models.Catalog, cfg map[string]in
 		Versions:          versions,
 		Interactive:       false,
 		CleanupDeprecated: args.CleanupDeprecated,
+		TrustSetupScripts: args.TrustScripts,
 	}
 
 	// Advisor config from flag
@@ -445,6 +544,19 @@ func resolveNonInteractive(args *cliArgs, cat *models.Catalog, cfg map[string]in
 	}
 
 	return req, nil
+}
+
+func validVersionRef(value string) bool {
+	if len(value) == 0 || len(value) > 128 || strings.Contains(value, "..") || strings.HasPrefix(value, "-") {
+		return false
+	}
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || strings.ContainsRune("._+-", r) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func handleProfileList() {
@@ -590,9 +702,27 @@ func handleCompletion(shell string) {
 	}
 }
 
-func handleUpdate(pkg string, stateDir string, cleanupDeprecated bool) {
+func handleUpdate(pkg string, stateDir string, cleanupDeprecated bool, trustScripts ...bool) {
 	if stateDir == "" {
 		stateDir = paths.StateDir()
+	}
+	// Update is deliberately non-interactive: never overwrite local skill
+	// edits, and perform this gate before the binary self-upgrade can mutate.
+	if pkg == "" || pkg == "skills" {
+		if bundle, bundleErr := assets.OpencodeSkillsFS(); bundleErr == nil {
+			report, inspectErr := skillsync.Inspect(bundle, filepath.Join(paths.OpencodeDir(), "skills"), filepath.Join(stateDir, "skills.ownership.json"))
+			if inspectErr != nil {
+				fmt.Fprintf(os.Stderr, "Update aborted: cannot inspect OpenCode skills: %v\n", inspectErr)
+				os.Exit(2)
+			}
+			for _, entry := range report.Entries {
+				if entry.Status == skillsync.Modified {
+					fmt.Fprintf(os.Stderr, "Update aborted: modified OpenCode skill %q would require a decision.\nRun: skynex install\n", entry.Path)
+					os.Exit(2)
+				}
+			}
+			_ = report.Close()
+		}
 	}
 
 	// Self-upgrade binary when updating all packages
@@ -605,7 +735,11 @@ func handleUpdate(pkg string, stateDir string, cleanupDeprecated bool) {
 	}
 
 	// Load existing config to know what was installed
-	cfg := config.LoadOrDefault(stateDir + "/skills.config.json")
+	cfg, err := config.LoadOrDefault(stateDir + "/skills.config.json")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
+		os.Exit(1)
+	}
 	pkgsMap, ok := cfg["packages"].(map[string]interface{})
 	if !ok || len(pkgsMap) == 0 {
 		fmt.Fprintln(os.Stderr, "No packages installed yet. Run: skynex install")
@@ -656,7 +790,7 @@ func handleUpdate(pkg string, stateDir string, cleanupDeprecated bool) {
 		versions[p] = "latest"
 	}
 
-	request := newUpdateInstallRequest(packagesToUpdate, targets, versions, stateDir, cleanupDeprecated)
+	request := newUpdateInstallRequest(packagesToUpdate, targets, versions, stateDir, cleanupDeprecated, trustScripts...)
 
 	// Preflight
 	issues := preflight.Run(request, cat)
@@ -666,40 +800,48 @@ func handleUpdate(pkg string, stateDir string, cleanupDeprecated bool) {
 		os.Exit(2)
 	}
 
-	// Install
+	// Install, skill ownership, config, and lock are one snapshot transaction.
 	fmt.Printf("\n  Updating %s...\n", strings.Join(packagesToUpdate, ", "))
-	results, err := adapters.InstallAll(request, cat)
+	plan, err := installer.Build(request, cat, installer.Destinations{
+		ClaudeDir: paths.ClaudeDir(), OpencodeDir: paths.OpencodeDir(), StateDir: stateDir,
+		StateConfigFile: filepath.Join(stateDir, "skills.config.json"), StateLockFile: filepath.Join(stateDir, "skills.lock.json"),
+		OwnershipManifest: filepath.Join(stateDir, "skills.ownership.json"),
+	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "\nUpdate failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "\nUpdate failed while building plan: %v\n", err)
 		os.Exit(1)
 	}
-
-	// Handle deprecated file cleanup (update: only if --cleanup-deprecated is set)
-	if request.CleanupDeprecated {
-		deprecated, err := adapters.FindDeprecatedFiles()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: deprecated file discovery failed: %v\n", err)
-			os.Exit(1)
+	var results []*models.InstallResult
+	if err := installer.Apply(plan, func() error {
+		var installErr error
+		results, installErr = adapters.InstallAll(request, cat)
+		if installErr != nil {
+			return installErr
 		}
-		if len(deprecated) > 0 {
+		if request.CleanupDeprecated {
+			deprecated, discoveryErr := adapters.FindDeprecatedFiles()
+			if discoveryErr != nil {
+				return discoveryErr
+			}
 			var allFiles []adapters.DeprecatedFile
 			for _, files := range deprecated {
 				allFiles = append(allFiles, files...)
 			}
-			adapters.NotifyDeprecatedFiles("", allFiles)
-			removed, err := adapters.RemoveDeprecatedFiles(allFiles)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: cleanup failed: %v\n", err)
-				os.Exit(1)
-			} else if removed > 0 {
-				fmt.Printf("  Removed %d deprecated files.\n", removed)
+			if len(allFiles) > 0 {
+				adapters.NotifyDeprecatedFiles("", allFiles)
+				if _, removeErr := adapters.RemoveDeprecatedFiles(allFiles); removeErr != nil {
+					return removeErr
+				}
 			}
 		}
+		if saveErr := config.SaveConfig(stateDir+"/skills.config.json", request, cfg); saveErr != nil {
+			return saveErr
+		}
+		return config.SaveLock(stateDir+"/skills.lock.json", results, request)
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "\nUpdate failed: %v\n", err)
+		os.Exit(1)
 	}
-
-	// Save state
-	config.SaveConfig(stateDir+"/skills.config.json", request, cfg)
-	config.SaveLock(stateDir+"/skills.lock.json", results, request)
 
 	// Print results
 	fmt.Println("\n  Update complete!")
@@ -712,7 +854,8 @@ func handleUpdate(pkg string, stateDir string, cleanupDeprecated bool) {
 	fmt.Println()
 }
 
-func newUpdateInstallRequest(packages, targets []string, versions map[string]string, stateDir string, cleanupDeprecated bool) *models.InstallRequest {
+func newUpdateInstallRequest(packages, targets []string, versions map[string]string, stateDir string, cleanupDeprecated bool, trustScripts ...bool) *models.InstallRequest {
+	trust := len(trustScripts) > 0 && trustScripts[0]
 	return &models.InstallRequest{
 		Packages:          packages,
 		Targets:           targets,
@@ -720,6 +863,7 @@ func newUpdateInstallRequest(packages, targets []string, versions map[string]str
 		Interactive:       false,
 		StateDir:          stateDir,
 		CleanupDeprecated: cleanupDeprecated,
+		TrustSetupScripts: trust,
 	}
 }
 
@@ -846,6 +990,9 @@ func printUsage() {
 
 Commands:
   install                 Interactive installer (TUI)
+  backup list              List retained recovery backups
+  backup prune             Remove eligible backups (interactive)
+  backup prune --yes --keep N  Prune eligible backups for automation
   update [package]        Update installed packages to latest version
   status                  Show installed packages, profiles, and tools
   doctor                  Check environment and dependencies
@@ -880,7 +1027,10 @@ Options:
    --target TARGET            Target: claude, opencode, or both. Repeatable.
    --version PKG=VER          Version for a package (e.g., skills=latest). Repeatable.
    --advisor-model MODEL      Advisor model (e.g., anthropic/claude-opus-4-6).
-   --cleanup-deprecated       Remove deprecated skynex-managed files (interactive install: prompts; update: flag only).
+    --cleanup-deprecated       Remove deprecated skynex-managed files (interactive install: prompts; update: flag only).
+    --dry-run                  Print the deterministic install plan and run read-only preflight.
+   --verbose                 Show detailed install progress.
+	   --force                   Bypass the exact-current no-op check.
    --non-interactive          Skip prompts, require all inputs via flags.
    --yes, -y                  Skip confirmation prompt.
    --trust-setup-scripts      Trust external setup scripts.

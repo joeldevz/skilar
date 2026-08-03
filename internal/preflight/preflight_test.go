@@ -73,3 +73,28 @@ func TestEnsureWritablePreservesExistingProbeFile(t *testing.T) {
 		t.Fatalf("sentinel content changed: got %q, want %q", content, sentinel)
 	}
 }
+
+func TestReadOnlyDoesNotMutateMissingDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "missing", "destination")
+	if err, warning := checkWritable(dir, true); err != nil || warning == "" {
+		t.Fatalf("checkWritable = (%v, %q), want warning only", err, warning)
+	}
+	if _, err := os.Lstat(dir); !os.IsNotExist(err) {
+		t.Fatalf("read-only check mutated directory: %v", err)
+	}
+}
+
+func TestReadOnlyRejectsSymlinkWithoutMutation(t *testing.T) {
+	root := t.TempDir()
+	external := t.TempDir()
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(external, link); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	if err, _ := checkWritable(filepath.Join(link, "new"), true); err == nil {
+		t.Fatal("read-only check followed symlink")
+	}
+	if _, err := os.Lstat(filepath.Join(external, "new")); !os.IsNotExist(err) {
+		t.Fatalf("external directory was mutated: %v", err)
+	}
+}

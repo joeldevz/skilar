@@ -14,13 +14,19 @@ type PackageDefinition struct {
 
 // InstallRequest is the user's resolved install request.
 type InstallRequest struct {
-	Packages           []string
-	Targets            []string
-	Versions           map[string]string
-	Interactive        bool
-	StateDir           string
-	Advisor            *AdvisorConfig
-	CleanupDeprecated  bool
+	Packages          []string
+	Targets           []string
+	Versions          map[string]string
+	Interactive       bool
+	StateDir          string
+	Advisor           *AdvisorConfig
+	CleanupDeprecated bool
+	// TrustSetupScripts is an explicit opt-in for package lifecycle scripts.
+	TrustSetupScripts bool
+	// SkillsDecisions is ephemeral and is not persisted in configuration.
+	SkillsDecisions     map[string]string
+	SkillsBundleVersion string
+	SkillsBundleCommit  string
 }
 
 // AdvisorConfig holds the advisor strategy configuration.

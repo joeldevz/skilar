@@ -108,5 +108,5 @@ Shared conventions in `~/.claude/skills/_shared/`:
 
 ## Installer
 
-Run `./scripts/setup.sh --claude` to install/update all agents, skills, and templates.
+Run `skynex install` (or the compatibility shim `./scripts/setup.sh`) to install/update all agents, skills, and templates.
 The installer also writes a Neurox MCP entry to `~/.claude.json`.

@@ -3,16 +3,28 @@ package preflight
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 
 	"github.com/joeldevz/skynex/internal/models"
 	"github.com/joeldevz/skynex/internal/paths"
+	"github.com/joeldevz/skynex/internal/safefs"
 )
 
 // Run executes all preflight validations.
 func Run(req *models.InstallRequest, cat *models.Catalog) []*models.ValidationIssue {
+	return RunWithOptions(req, cat, Options{})
+}
+
+// Options controls side effects performed by preflight.
+type Options struct {
+	ReadOnly bool
+}
+
+// RunWithOptions executes preflight validations, optionally without filesystem mutations.
+func RunWithOptions(req *models.InstallRequest, cat *models.Catalog, options Options) []*models.ValidationIssue {
 	var issues []*models.ValidationIssue
 
 	// Global: git must exist
@@ -88,9 +100,19 @@ func Run(req *models.InstallRequest, cat *models.Catalog) []*models.ValidationIs
 						})
 					}
 				}
+				if options.ReadOnly {
+					err, warning := checkWritable(paths.OpencodeDir(), true)
+					if err != nil {
+						issues = append(issues, &models.ValidationIssue{Level: "error", PackageID: pkgID, Target: target, Message: fmt.Sprintf("cannot write to %s", paths.OpencodeDir()), FixHint: err.Error()})
+					}
+					if warning != "" {
+						issues = append(issues, &models.ValidationIssue{Level: "warning", PackageID: pkgID, Target: target, Message: warning})
+					}
+				}
 			case pkgID == "skills" && target == "claude":
 				claudeDir := paths.ClaudeDir()
-				if err := ensureWritable(claudeDir); err != nil {
+				err, warning := checkWritable(claudeDir, options.ReadOnly)
+				if err != nil {
 					issues = append(issues, &models.ValidationIssue{
 						Level:     "error",
 						PackageID: pkgID,
@@ -99,7 +121,19 @@ func Run(req *models.InstallRequest, cat *models.Catalog) []*models.ValidationIs
 						FixHint:   "Check permissions on " + claudeDir,
 					})
 				}
+				if warning != "" {
+					issues = append(issues, &models.ValidationIssue{Level: "warning", PackageID: pkgID, Target: target, Message: warning})
+				}
 			}
+		}
+	}
+	if req.StateDir != "" {
+		err, warning := checkWritable(req.StateDir, options.ReadOnly)
+		if err != nil {
+			issues = append(issues, &models.ValidationIssue{Level: "error", Message: fmt.Sprintf("cannot write to %s", req.StateDir), FixHint: err.Error()})
+		}
+		if warning != "" {
+			issues = append(issues, &models.ValidationIssue{Level: "warning", Message: warning})
 		}
 	}
 
@@ -117,8 +151,12 @@ func HasErrors(issues []*models.ValidationIssue) bool {
 }
 
 // PrintIssues displays validation issues to stderr.
-func PrintIssues(issues []*models.ValidationIssue) {
-	fmt.Fprintln(os.Stderr, "\nPreflight validation:")
+func PrintIssues(issues []*models.ValidationIssue, writers ...io.Writer) {
+	out := io.Writer(os.Stderr)
+	if len(writers) > 0 && writers[0] != nil {
+		out = writers[0]
+	}
+	fmt.Fprintln(out, "\nPreflight validation:")
 	for _, i := range issues {
 		prefix := ""
 		if i.PackageID != "" {
@@ -130,9 +168,9 @@ func PrintIssues(issues []*models.ValidationIssue) {
 		if prefix != "" {
 			prefix += " "
 		}
-		fmt.Fprintf(os.Stderr, "  %s%s: %s\n", prefix, i.Level, i.Message)
+		fmt.Fprintf(out, "  %s%s: %s\n", prefix, i.Level, i.Message)
 		if i.FixHint != "" {
-			fmt.Fprintf(os.Stderr, "    Fix: %s\n", i.FixHint)
+			fmt.Fprintf(out, "    Fix: %s\n", i.FixHint)
 		}
 	}
 }
@@ -147,25 +185,50 @@ func ensureWritable(dir string) error {
 		return err
 	}
 
-	if err := os.MkdirAll(cleaned, 0o755); err != nil {
+	root, err := safefs.OpenOrCreate(cleaned, 0o700)
+	if err != nil {
 		return err
 	}
-	if err := validateAncestors(cleaned); err != nil {
+	defer root.Close()
+	if err := safefs.ChmodRoot(root, 0o700); err != nil {
 		return err
 	}
 
 	// Use a unique name so a user's existing file is never truncated or removed.
-	f, err := os.CreateTemp(cleaned, ".skynex-preflight-check-*")
+	tmp, f, err := safefs.TempFile(root, ".skynex-preflight-check-")
 	if err != nil {
 		return err
 	}
-	tmp := f.Name()
+	defer root.Remove(tmp)
 	closeErr := f.Close()
-	removeErr := os.Remove(tmp)
+	removeErr := root.Remove(tmp)
 	if closeErr != nil || removeErr != nil {
 		return errors.Join(closeErr, removeErr)
 	}
 	return nil
+}
+
+func checkWritable(dir string, readOnly bool) (error, string) {
+	cleaned := filepath.Clean(dir)
+	if cleaned != dir {
+		return fmt.Errorf("writable directory %q is not a clean path", dir), ""
+	}
+	if err := validateAncestors(cleaned); err != nil {
+		return err, ""
+	}
+	info, err := os.Lstat(cleaned)
+	if err == nil {
+		if !info.IsDir() {
+			return fmt.Errorf("path is not a directory: %s", cleaned), ""
+		}
+		if readOnly {
+			return nil, fmt.Sprintf("writability not proven in read-only mode: %s", cleaned)
+		}
+	}
+	if !readOnly {
+		return ensureWritable(dir), ""
+	}
+	return nil, fmt.Sprintf("writability not proven in read-only mode (directory does not exist): %s", cleaned)
 }
 
 // validateAncestors rejects symlinks in every existing component of path.

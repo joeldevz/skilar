@@ -18,11 +18,12 @@ type workflowInspection struct {
 	Workflow workflow.Workflow `json:"workflow"`
 	Events   []workflow.Event  `json:"events"`
 	Receipt  *review.Receipt   `json:"authoritative_receipt,omitempty"`
+	RunInput json.RawMessage   `json:"run_input,omitempty"`
 }
 
 func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: skynex workflow status|inspect|resume|abort|export|receipt")
+		return errors.New("usage: skynex workflow start|run|status|inspect|resume|abort|export|receipt")
 	}
 	if cwd == "" {
 		var err error
@@ -38,6 +39,10 @@ func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
 	defer store.Close()
 	reviews := review.NewSQLiteStore(store.Database())
 	switch args[0] {
+	case "start":
+		return workflowStart(store, cwd, args[1:], out)
+	case "run":
+		return workflowRun(store, cwd, args[1:], out)
 	case "status":
 		return workflowStatus(store, args[1:], out)
 	case "inspect":
@@ -94,6 +99,10 @@ func workflowInspect(store *workflow.SQLiteStore, reviews *review.SQLiteStore, i
 		return err
 	}
 	inspection := workflowInspection{Workflow: w, Events: events}
+	var input []byte
+	if e := store.Database().QueryRow(`SELECT input FROM workflow_run_inputs WHERE workflow_id=?`, id).Scan(&input); e == nil {
+		inspection.RunInput = input
+	}
 	if receipt, e := reviews.Authority(id); e == nil {
 		inspection.Receipt = &receipt
 	} else if !errors.Is(e, review.ErrNoAuthority) {

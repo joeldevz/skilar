@@ -57,10 +57,10 @@ func (s *SQLiteStore) migrate() error {
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		return err
 	}
-	if version > 4 {
-		return fmt.Errorf("workflow database schema %d is newer than supported schema 4", version)
+	if version > 5 {
+		return fmt.Errorf("workflow database schema %d is newer than supported schema 5", version)
 	}
-	if version == 4 {
+	if version == 5 {
 		return nil
 	}
 	if version == 0 {
@@ -121,14 +121,27 @@ COMMIT;`
 			return err
 		}
 	}
-	const schemaV4 = `BEGIN IMMEDIATE;
+	if version < 4 {
+		const schemaV4 = `BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS orchestration_routes (workflow_id TEXT PRIMARY KEY REFERENCES workflows(id), decision BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS wayfinder_graphs (workflow_id TEXT NOT NULL REFERENCES workflows(id), version INTEGER NOT NULL, graph BLOB NOT NULL, PRIMARY KEY(workflow_id,version));
 CREATE TABLE IF NOT EXISTS execution_contracts (workflow_id TEXT PRIMARY KEY REFERENCES workflows(id), contract BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS execution_graphs (workflow_id TEXT NOT NULL REFERENCES workflows(id), version INTEGER NOT NULL, graph BLOB NOT NULL, PRIMARY KEY(workflow_id,version));
 PRAGMA user_version=4;
 COMMIT;`
-	_, err := s.db.Exec(schemaV4)
+		if _, err := s.db.Exec(schemaV4); err != nil {
+			return err
+		}
+	}
+	const schemaV5 = `BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS execution_slice_state (workflow_id TEXT NOT NULL, slice_id TEXT NOT NULL, status TEXT NOT NULL, PRIMARY KEY(workflow_id,slice_id));
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_mutation ON execution_slice_state(workflow_id) WHERE status='active';
+CREATE TABLE IF NOT EXISTS mutation_attempts (attempt_id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, slice_id TEXT NOT NULL, worktree_id TEXT NOT NULL, owner TEXT NOT NULL, fencing_token TEXT NOT NULL, basis_tree TEXT NOT NULL, allowed_paths BLOB NOT NULL, operation_id TEXT NOT NULL UNIQUE, live INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS mutation_operations (operation_id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, attempt_id TEXT NOT NULL, pre_tree TEXT NOT NULL, post_tree TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, evidence BLOB NOT NULL DEFAULT '[]');
+CREATE TABLE IF NOT EXISTS stale_result_audit (sequence INTEGER PRIMARY KEY AUTOINCREMENT, attempt_id TEXT NOT NULL, reason TEXT NOT NULL, envelope BLOB NOT NULL, occurred_at TEXT NOT NULL);
+PRAGMA user_version=5;
+COMMIT;`
+	_, err := s.db.Exec(schemaV5)
 	return err
 }
 
@@ -392,6 +405,18 @@ func (s *SQLiteStore) HeartbeatLease(resource, owner, token string, now, expires
 		return Lease{}, ErrLeaseConflict
 	}
 	return Lease{resource, owner, token, expiresAt.UTC()}, nil
+}
+
+func (s *SQLiteStore) ValidateLease(resource, owner, token string, now time.Time) error {
+	var count int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM leases WHERE resource=? AND owner=? AND fencing_token=? AND expires_at>?`, resource, owner, token, now.UnixNano()).Scan(&count)
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return ErrLeaseConflict
+	}
+	return nil
 }
 
 func isConstraint(err error) bool {

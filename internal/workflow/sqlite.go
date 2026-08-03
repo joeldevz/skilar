@@ -57,10 +57,10 @@ func (s *SQLiteStore) migrate() error {
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		return err
 	}
-	if version > 6 {
-		return fmt.Errorf("workflow database schema %d is newer than supported schema 6", version)
+	if version > 7 {
+		return fmt.Errorf("workflow database schema %d is newer than supported schema 7", version)
 	}
-	if version == 6 {
+	if version == 7 {
 		return nil
 	}
 	if version == 0 {
@@ -146,12 +146,21 @@ COMMIT;`
 			return err
 		}
 	}
-	const schemaV6 = `BEGIN IMMEDIATE;
+	if version < 6 {
+		const schemaV6 = `BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS verification_evidence (id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, candidate_tree TEXT NOT NULL, kind TEXT NOT NULL, evidence BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS verification_runs (workflow_id TEXT PRIMARY KEY, candidate_tree TEXT NOT NULL, result BLOB NOT NULL);
 PRAGMA user_version=6;
 COMMIT;`
-	_, err := s.db.Exec(schemaV6)
+		if _, err := s.db.Exec(schemaV6); err != nil {
+			return err
+		}
+	}
+	const schemaV7 = `BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS opencode_invocations (invocation_id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, attempt_id TEXT NOT NULL, model TEXT NOT NULL, command BLOB NOT NULL, exit_code INTEGER NOT NULL, stdout_digest TEXT NOT NULL, stderr_digest TEXT NOT NULL, evidence_ids BLOB NOT NULL, status TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT NOT NULL);
+PRAGMA user_version=7;
+COMMIT;`
+	_, err := s.db.Exec(schemaV7)
 	return err
 }
 

@@ -226,7 +226,7 @@ func TestSQLiteMigratesExistingV1SchemaToCurrent(t *testing.T) {
 	}
 	defer store.Close()
 	var version int
-	if err = store.Database().QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 6 {
+	if err = store.Database().QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 7 {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 	var table string

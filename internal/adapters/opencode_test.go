@@ -3,9 +3,96 @@ package adapters
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 )
+
+func TestInstallJSDepsRejectsDirectoryReplacementBeforeSubprocess(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("descriptor-backed install cwd is Linux-only")
+	}
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	replacement := filepath.Join(root, "replacement")
+	external := filepath.Join(root, "external")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(external, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	externalMarker := filepath.Join(external, "marker")
+	if err := os.WriteFile(externalMarker, []byte("untouched"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	started := filepath.Join(root, "started")
+	bin := filepath.Join(root, "bin")
+	if err := os.Mkdir(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	npm := filepath.Join(bin, "npm")
+	if err := os.WriteFile(npm, []byte("#!/bin/sh\nprintf started > \"$STARTED\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	t.Setenv("STARTED", started)
+
+	beforeInstallCwdOpen = func() error {
+		if err := os.Rename(target, replacement); err != nil {
+			return err
+		}
+		return os.Symlink(external, target)
+	}
+	t.Cleanup(func() {
+		beforeInstallCwdOpen = nil
+		_ = os.Remove(target)
+		_ = os.Rename(replacement, target)
+	})
+
+	err := installJSDeps(target)
+	if err == nil {
+		t.Fatal("expected replaced install directory to be rejected")
+	}
+	if _, statErr := os.Stat(started); !os.IsNotExist(statErr) {
+		t.Fatalf("subprocess started: stat(%q) = %v", started, statErr)
+	}
+	data, readErr := os.ReadFile(externalMarker)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(data) != "untouched" {
+		t.Fatalf("external marker = %q, want untouched", data)
+	}
+}
+
+func TestInstallCwdUsesRetainedDescriptor(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "marker"), []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := os.Lstat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cwd, err := openInstallCwd(dir, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cwd.Close()
+	cmd := exec.Command("sh", "-c", "test -f marker")
+	if err := runWithInstallCwd(cwd, cmd); err != nil {
+		t.Fatalf("descriptor-backed command failed: %v", err)
+	}
+	if !strings.HasPrefix(cmd.Dir, "/proc/self/fd/") {
+		t.Fatalf("command cwd = %q, want descriptor path", cmd.Dir)
+	}
+	if err := cwd.verify(dir); err != nil {
+		t.Fatalf("directory identity verification failed: %v", err)
+	}
+}
 
 func TestMergeOpencodeConfig_PreservesUserMCP(t *testing.T) {
 	dir := t.TempDir()

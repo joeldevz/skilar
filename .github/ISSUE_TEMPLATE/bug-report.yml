@@ -41,7 +41,7 @@ body:
       label: Reproduction steps
       description: Pasos exactos para reproducir / Exact steps to reproduce
       placeholder: |
-        1. Run /onboard
+        1. Run the affected command or installer
         2. Create a session...
         3. Observe...
     validations:

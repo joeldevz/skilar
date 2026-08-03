@@ -18,7 +18,7 @@ Resolution order:
 2. Search Neurox: `neurox_recall(query: 'skill-registry', namespace: '{project}')`
 3. Read `.skynex/skill-registry.md` from project root if it exists
 4. Read `CONVENTIONS.md` from project root if it exists
-5. If nothing found: report 'No skill registry found — run /skills:scan to generate one' and return status: partial
+5. If nothing found: report 'No skill registry found — run /skills-scan to generate one' and return status: partial
 
 STEP 2 — Match relevant skills to modified files
 

@@ -1,10 +1,29 @@
 package adapters
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
+
+func TestConfigureClaudeNeuroxMCPFailsOnUnreadableExistingConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.Mkdir(filepath.Join(home, ".claude.json"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err := configureClaudeNeuroxMCP()
+	if err == nil {
+		t.Fatal("expected non-NotExist config read error")
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected the concrete read error, got %v", err)
+	}
+}
 
 func TestParseFrontmatter_WithFrontmatter(t *testing.T) {
 	input := "---\nname: test\ndescription: A test skill\nagent: coder\n---\n\nBody content here.\n"
@@ -66,6 +85,120 @@ func TestRenderAgentsAllowsSafeName(t *testing.T) {
 	}
 	if !contains(string(content), "safe prompt") {
 		t.Fatalf("safe agent content = %q, want prompt", content)
+	}
+}
+
+func TestRenderAgentsRejectsSymlinkedConfigWithoutReadingTarget(t *testing.T) {
+	source := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "secret.json")
+	if err := os.WriteFile(outside, []byte(`{"agent":{"leaked":{"prompt":"secret"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(source, "opencode"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(source, "opencode", "opencode.json")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := renderAgents(source, t.TempDir()); err == nil {
+		t.Fatal("expected symlinked config rejection")
+	}
+}
+
+func TestRenderAgentsRejectsHardLinkedConfig(t *testing.T) {
+	if _, err := os.Stat("/proc"); err != nil {
+		t.Skip("filesystem does not expose hard links")
+	}
+	source := t.TempDir()
+	secret := filepath.Join(t.TempDir(), "secret.json")
+	if err := os.WriteFile(secret, []byte(`{"agent":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(source, "opencode"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(secret, filepath.Join(source, "opencode", "opencode.json")); err != nil {
+		t.Skipf("hard links unavailable: %v", err)
+	}
+	if err := renderAgents(source, t.TempDir()); err == nil {
+		t.Fatal("expected hard-linked config rejection")
+	}
+}
+
+func TestRenderCommandSkillsRejectsUnsafeBasenames(t *testing.T) {
+	for _, name := range []string{"...", "../x", "%2e%2e", "bad\nname", "bad\x00name", ".", ""} {
+		if err := validateAgentName(name); err == nil {
+			t.Errorf("validateAgentName(%q) accepted unsafe command basename", name)
+		}
+	}
+	for _, filename := range []string{"...md", "%2e%2e.md", "bad\nname.md"} {
+		source := t.TempDir()
+		commands := filepath.Join(source, "opencode", "commands")
+		if err := os.MkdirAll(commands, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(commands, filename), []byte("body\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := renderCommandSkills(source, t.TempDir()); err == nil {
+			t.Errorf("renderCommandSkills accepted unsafe filename %q", filename)
+		}
+	}
+	if err := validateAgentName("safe-command"); err != nil {
+		t.Fatalf("safe command basename rejected: %v", err)
+	}
+}
+
+func TestParseLsRemoteCommitResolvesImmutableCommit(t *testing.T) {
+	sha := "0123456789abcdef0123456789abcdef01234567"
+	if got := parseLsRemoteCommit(sha+"\trefs/tags/v1\n"+sha+"\trefs/tags/v1^{}\n", "refs/tags/v1"); got != sha {
+		t.Fatalf("resolved commit = %q, want peeled commit %q", got, sha)
+	}
+	if got := parseLsRemoteCommit("not-a-sha\trefs/heads/main\n", "main"); got != "" {
+		t.Fatalf("invalid ls-remote output resolved to %q", got)
+	}
+}
+
+func TestRenderCommandSkillsQuotesRepositoryMetadata(t *testing.T) {
+	source := t.TempDir()
+	commands := filepath.Join(source, "opencode", "commands")
+	if err := os.MkdirAll(commands, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := "---\nname: ignored\ndescription: |\n  harmless\n  ---\n  injected: true\n  ...\nagent: coder\n---\nbody\n"
+	if err := os.WriteFile(filepath.Join(commands, "safe-command.md"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := t.TempDir()
+	if err := renderCommandSkills(source, target); err != nil {
+		t.Fatal(err)
+	}
+	generated, err := os.ReadFile(filepath.Join(target, "skills", "safe-command", "SKILL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(generated), "injected: true") {
+		t.Fatalf("generated frontmatter permits injection: %s", generated)
+	}
+	var document map[string]any
+	frontmatter := strings.TrimPrefix(string(generated), "---\n")
+	end := strings.Index(frontmatter, "\n---\n")
+	if err := yaml.Unmarshal([]byte(frontmatter[:end]), &document); err != nil {
+		t.Fatalf("generated frontmatter is not YAML: %v", err)
+	}
+	if _, ok := document["injected"]; ok {
+		t.Fatalf("injected key became frontmatter: %#v", document)
+	}
+}
+
+func TestYAMLScalarCannotInjectKeysOrDocuments(t *testing.T) {
+	value := "title\nowned: true\n---\n..."
+	var parsed map[string]string
+	if err := yaml.Unmarshal([]byte("title: "+yamlScalar(value)+"\n"), &parsed); err != nil {
+		t.Fatalf("quoted scalar is not YAML: %v", err)
+	}
+	if parsed["title"] != value || len(parsed) != 1 {
+		t.Fatalf("scalar changed document structure: %#v", parsed)
 	}
 }
 

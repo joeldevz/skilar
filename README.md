@@ -58,26 +58,24 @@ Tres conceptos:
 ### macOS / Linux
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/joeldevz/skynex/main/scripts/install.sh | bash
+# Download install.sh and install.sh.sig from a tagged release, verify the
+# signature with release/trust/skynex-release-signing-key.pub, then run locally.
+./install.sh
 ```
 
 ### Windows (PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/joeldevz/skynex/main/scripts/install.ps1 | iex
+# Download install.ps1 and its signature from a tagged release, verify first,
+# then run the local script.
+./install.ps1
 ```
 
-### Homebrew (macOS / Linux)
+### Homebrew (macOS / Linux, explicit delegated trust)
 
 ```bash
 brew tap joeldevz/tap
 brew install skynex
-```
-
-### Go install (cualquier plataforma con Go 1.23+)
-
-```bash
-go install github.com/joeldevz/skynex/cmd/skynex@latest
 ```
 
 ---
@@ -94,8 +92,8 @@ skynex install --package skills --target claude
 # Solo OpenCode
 skynex install --package skills --target opencode
 
-# Todo (skills + neurox)
-skynex install --package skills --package neurox --target both
+# Ambos targets (skills; Neurox es opcional)
+skynex install --package skills --target both
 ```
 
 El setup hace backup de tu configuracion existente antes de escribir.
@@ -171,8 +169,8 @@ skynex completion fish > ~/.config/fish/completions/skynex.fish
 
 | Herramienta | Sub-agentes | Setup |
 |-------------|-------------|-------|
-| Claude Code | Full (Agent tool) | `./scripts/setup.sh --claude` |
-| OpenCode | Full (delegate/task) | `./scripts/setup.sh --opencode` |
+| Claude Code | Full (Agent tool) | `skynex install` |
+| OpenCode | Full (delegate/task) | `skynex install` |
 
 > **Full** = el orquestador delega a sub-agentes con contexto independiente.
 
@@ -196,11 +194,10 @@ skynex completion fish > ~/.config/fish/completions/skynex.fish
 
 > **Nota**: solo se listan los commands realmente disponibles en `opencode/commands/`. Las matrices anteriores prometían commands ficticios (doc rot eliminado en QW1).
 
-### Onboarding y exploracion
+### Exploracion
 
 | Command | Que hace |
 |---------|----------|
-| `/onboard` | Explora el proyecto: stack, arquitectura, convenciones |
 | `/docs <lib> <tema>` | Busca docs en vivo via Context7 MCP |
 
 ### Calidad y verificacion
@@ -209,6 +206,8 @@ skynex completion fish > ~/.config/fish/completions/skynex.fish
 |---------|----------|
 | `/review-pr [scope]` | Revisa en profundidad un PR o diff actual con jueces en paralelo |
 | `/rollback [step]` | Deshace el ultimo paso (pide confirmacion) |
+| `/setup` | Configura el proyecto para OpenCode |
+| `/skills-scan` | Regenera el registro físico de skills |
 
 ### Git
 
@@ -219,16 +218,14 @@ skynex completion fish > ~/.config/fish/completions/skynex.fish
 
 ### Backlog (commands planeados, aún no implementados)
 
-Los siguientes commands están en el roadmap (`docs/IMPROVEMENT-PLAN.md`) pero **no existen aún**: `/grill`, `/skills:scan`, `/afk-run`. Hasta que se implementen, los flujos equivalentes se hacen invocando skills directamente o via el orchestrator.
+Los comandos no incluidos en la tabla no forman parte del inventario actual; consulta `opencode/commands/` para la lista canónica.
 
 ## Flujo recomendado
 
 ```text
 /review-pr                      # revisar el PR o diff actual en profundidad
-/apply-feedback <correcciones>  # aplicar feedback si hay issues
 /commit                         # commit con Conventional Commits
 /pr                             # abrir pull request
-/context                        # guardar aprendizajes en memoria
 ```
 
 ## Memoria persistente
@@ -266,8 +263,7 @@ skills/
 ├── skills/
 │   └── prd/                   # skill compartida de PRD
 └── scripts/
-    ├── setup.sh               # instalador principal
-    └── install_claude_assets.py
+    └── setup.sh               # compatibility shim
 ```
 
 ## Que instala en cada herramienta
@@ -280,7 +276,7 @@ skills/
 
 ### OpenCode
 
-- **3 agentes** con roles claros en `opencode.json`
+- **11 agentes** con roles claros en `opencode.json`
 - **8 commands** para todo el ciclo
 - **Neurox + Context7 MCP** como sistemas externos
 - **Templates** para convenciones, commits/PRs, y 5 tipos de plan

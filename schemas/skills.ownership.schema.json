@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["version", "source", "sourceKind", "bundleVersion", "treeSHA256", "package", "target", "files"],
+  "properties": {
+    "version": {"const": 1},
+    "source": {"type": "string"},
+    "sourceKind": {"type": "string"},
+    "bundleVersion": {"type": "string"},
+    "bundleCommit": {"type": "string"},
+    "package": {"type": "string", "minLength": 1},
+    "target": {"type": "string", "minLength": 1},
+    "treeSHA256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "files": {"type": "array", "items": {"type": "object", "required": ["path", "sha256"], "properties": {"path": {"type": "string"}, "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}}, "additionalProperties": false}}
+  },
+  "additionalProperties": false
+}

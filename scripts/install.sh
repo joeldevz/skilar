@@ -6,10 +6,11 @@ set -euo pipefail
 # One command to install AI agent skills for OpenCode and Claude Code.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/joeldevz/skynex/main/scripts/install.sh | bash
+#   Download this script from a tagged release and verify its detached signature
+#   before running it. Never pipe an unverified network response to a shell.
 #
 # Options:
-#   --method brew|binary|go   Force install method (default: auto)
+#   --method brew|binary      Force install method (default: binary)
 #   --dir PATH                Custom install directory
 #   -h, --help                Show help
 # ============================================================================
@@ -18,6 +19,19 @@ GITHUB_OWNER="joeldevz"
 GITHUB_REPO="skynex"
 BINARY_NAME="skynex"
 BREW_TAP="joeldevz/tap"
+MAX_COMPRESSED_BYTES=$((100 * 1024 * 1024))
+MAX_EXTRACTED_BYTES=$((250 * 1024 * 1024))
+
+release_base_url() {
+  printf '%s' "https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/releases/download"
+}
+
+limit_value() {
+  local name="$1" default="$2" value
+  value="${!name:-$default}"
+  [[ "$value" =~ ^[0-9]+$ ]] || fatal "${name} must be an integer"
+  printf '%s' "$value"
+}
 
 # ============================================================================
 # Colors (only when TTY)
@@ -42,12 +56,13 @@ setup_colors() {
 # Logging
 # ============================================================================
 
-info()    { echo -e "${BLUE}[info]${NC} $*"; }
-success() { echo -e "${GREEN}[ok]${NC} $*"; }
-warn()    { echo -e "${YELLOW}[warn]${NC} $*"; }
-error()   { echo -e "${RED}[error]${NC} $*" >&2; }
+safe_display() { printf '%s' "$1" | LC_ALL=C tr -cd '[:print:]'; }
+info()    { printf '%b%s%b\n' "$BLUE" "[info] $*" "$NC"; }
+success() { printf '%b%s%b\n' "$GREEN" "[ok] $*" "$NC"; }
+warn()    { printf '%b%s%b\n' "$YELLOW" "[warn] $*" "$NC"; }
+error()   { printf '%b%s%b\n' "$RED" "[error] $*" "$NC" >&2; }
 fatal()   { error "$@"; exit 1; }
-step()    { echo -e "\n${CYAN}${BOLD}==>${NC} ${BOLD}$*${NC}"; }
+step()    { printf '\n%b%s%b\n' "$CYAN" "${BOLD}==>${NC} ${BOLD}$*${NC}" "$NC"; }
 
 # ============================================================================
 # Help
@@ -58,16 +73,16 @@ show_help() {
 skynex installer
 
 USAGE:
-  curl -fsSL https://raw.githubusercontent.com/joeldevz/skynex/main/scripts/install.sh | bash
-  ./install.sh [OPTIONS]
+  Verify this local file and its detached signature from a tagged release,
+  then run: ./install.sh [OPTIONS]
 
 OPTIONS:
-  --method METHOD   Install method: brew, binary, go (default: auto)
+  --method METHOD   Install method: brew or binary (default: binary)
   --dir PATH        Custom install directory (default: ~/.local/bin)
   -h, --help        Show this help
 
 EXAMPLES:
-  ./install.sh                     # Auto-detect best method
+  ./install.sh                     # Install a signed release binary
   ./install.sh --method brew       # Force Homebrew
   ./install.sh --dir ~/bin         # Custom install dir
 EOF
@@ -79,14 +94,14 @@ EOF
 
 print_banner() {
   echo ""
-  echo -e "${CYAN}${BOLD}"
+  printf '%b\n' "${CYAN}${BOLD}"
   echo "   ____           _                    ____  _    _ _ _     "
   echo "  / ___| ___  ___| | ___ ___  ___     / ___|| | _(_) | |___ "
   echo " | |   / _ \/ __| |/ / '__\ \/ /     \\___ \\| |/ / | | / __|"
   echo " | |__| (_) \\__ \\   <| |   >  <       ___) |   <| | | \\__ \\"
   echo "  \\____\\___/|___/_|\\_\\_|  /_/\\_\\     |____/|_|\\_\\_|_|_|___/"
-  echo -e "${NC}"
-  echo -e " ${DIM}AI agent skills installer for OpenCode and Claude Code${NC}"
+  printf '%b\n' "${NC}"
+  printf '%b\n' " ${DIM}AI agent skills installer for OpenCode and Claude Code${NC}"
   echo ""
 }
 
@@ -123,15 +138,11 @@ check_prerequisites() {
   if ! command -v curl &>/dev/null; then
     missing+=("curl")
   fi
-  if ! command -v git &>/dev/null; then
-    missing+=("git")
-  fi
-
   if [ ${#missing[@]} -gt 0 ]; then
     fatal "Missing required tools: ${missing[*]}. Please install them and try again."
   fi
 
-  success "curl and git are available"
+  success "curl is available"
 }
 
 # ============================================================================
@@ -141,8 +152,8 @@ check_prerequisites() {
 detect_install_method() {
   if [ -n "${FORCE_METHOD:-}" ]; then
     case "$FORCE_METHOD" in
-      brew|go|binary) INSTALL_METHOD="$FORCE_METHOD" ;;
-      *) fatal "Unknown install method: $FORCE_METHOD. Use: brew, binary, or go" ;;
+      brew|binary) INSTALL_METHOD="$FORCE_METHOD" ;;
+      *) fatal "Unknown install method: $FORCE_METHOD. Use: brew or binary" ;;
     esac
     info "Using forced method: $INSTALL_METHOD"
     return
@@ -150,17 +161,10 @@ detect_install_method() {
 
   step "Detecting best install method"
 
-  # Priority: brew > binary > go
-  # Brew handles upgrades natively.
-  # Binary download is always up-to-date.
-  # go install last: Go module proxy can lag ~30min behind new tags.
-  if command -v brew &>/dev/null; then
-    INSTALL_METHOD="brew"
-    success "Homebrew found — will install via brew tap"
-  else
-    INSTALL_METHOD="binary"
-    info "Will download pre-built binary from GitHub Releases"
-  fi
+  # Signed release binaries are the default. Homebrew is an explicitly
+  # delegated trust boundary and must be selected explicitly.
+  INSTALL_METHOD="binary"
+  info "Will download and verify a signed pre-built binary from GitHub Releases"
 }
 
 # ============================================================================
@@ -169,6 +173,7 @@ detect_install_method() {
 
 install_brew() {
   step "Installing via Homebrew"
+  warn "Homebrew is an explicitly delegated trust path; release signatures are not verified by this method."
 
   info "Refreshing ${BREW_TAP}..."
   brew untap "$BREW_TAP" 2>/dev/null || true
@@ -194,33 +199,6 @@ install_brew() {
 }
 
 # ============================================================================
-# Install via go install
-# ============================================================================
-
-install_go() {
-  step "Installing via go install"
-
-  local go_package="github.com/${GITHUB_OWNER}/${GITHUB_REPO}/cmd/${BINARY_NAME}@latest"
-  info "Running: go install ${go_package}"
-
-  if ! go install "$go_package"; then
-    fatal "Failed to install via go install. Make sure Go is properly configured."
-  fi
-
-  local gobin
-  gobin="$(go env GOBIN)"
-  if [ -z "$gobin" ]; then
-    gobin="$(go env GOPATH)/bin"
-  fi
-
-  if [[ ":$PATH:" != *":$gobin:"* ]]; then
-    warn "${gobin} is not in your PATH"
-    warn "Add this to your shell profile: export PATH=\"\$PATH:${gobin}\""
-  fi
-
-  success "Installed ${BINARY_NAME} via go install"
-}
-
 # ============================================================================
 # Install via binary download
 # ============================================================================
@@ -230,14 +208,14 @@ get_latest_version() {
   info "Fetching latest release from GitHub..."
 
   local response
-  response="$(curl -sL -w "\n%{http_code}" "$url")" || fatal "Failed to fetch latest release"
+  response="$(curl --connect-timeout 10 --max-time 60 -sL -w "\n%{http_code}" "$url")" || fatal "Failed to fetch latest release"
 
   local http_code body
   http_code="$(echo "$response" | tail -n1)"
   body="$(echo "$response" | sed '$d')"
 
   if [ "$http_code" != "200" ]; then
-    fatal "GitHub API returned HTTP $http_code. Rate limited? Try again later or use --method brew/go"
+    fatal "GitHub API returned HTTP $http_code. Rate limited? Try again later or use --method brew"
   fi
 
   LATEST_VERSION="$(echo "$body" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
@@ -247,7 +225,34 @@ get_latest_version() {
   fi
 
   VERSION_NUMBER="${LATEST_VERSION#v}"
-  success "Latest version: ${LATEST_VERSION}"
+  [[ "$LATEST_VERSION" =~ ^v?[0-9A-Za-z][0-9A-Za-z._-]{0,127}$ ]] || fatal "Release tag contains unsafe characters"
+  success "Latest version: $(safe_display "$LATEST_VERSION")"
+}
+
+validate_archive() {
+  local archive="$1"
+  local listing member mode count=0
+  listing="$(tar -tzf "$archive")" || fatal "Could not list archive; refusing extraction"
+  while IFS= read -r member; do
+    [ -n "$member" ] || continue
+    case "$member" in
+      /*|*'../'*|../*|*/..|..|*'/'..'/'*) fatal "Unsafe archive member: $(safe_display "$member")" ;;
+    esac
+    [ "$member" = "$BINARY_NAME" ] || fatal "Unexpected archive member: $(safe_display "$member")"
+    count=$((count + 1))
+  done <<< "$listing"
+  [ "$count" -eq 1 ] || fatal "Archive must contain exactly one member: $BINARY_NAME"
+
+  while read -r mode _; do
+    case "$mode" in
+      -?????????) ;;
+      *) fatal "Archive contains a non-regular or unsafe member" ;;
+    esac
+  done < <(tar -tvzf "$archive")
+}
+
+link_count() {
+  if stat -c '%h' "$1" >/dev/null 2>&1; then stat -c '%h' "$1"; else stat -f '%l' "$1"; fi
 }
 
 install_binary() {
@@ -256,15 +261,17 @@ install_binary() {
   get_latest_version
 
   local archive_name="${BINARY_NAME}_${VERSION_NUMBER}_${OS}_${ARCH}.tar.gz"
-  local download_url="https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/releases/download/${LATEST_VERSION}/${archive_name}"
-  local checksums_url="https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/releases/download/${LATEST_VERSION}/checksums.txt"
+  local extracted_size
+  local download_url="$(release_base_url)/${LATEST_VERSION}/${archive_name}"
+  local checksums_url="$(release_base_url)/${LATEST_VERSION}/checksums.txt"
+  local signature_url="${checksums_url}.sig"
 
   local tmpdir
   tmpdir="$(mktemp -d)"
   trap '[ -n "${tmpdir:-}" ] && rm -rf "$tmpdir"' EXIT
 
-  info "Downloading ${archive_name}..."
-  if ! curl -sfL -o "${tmpdir}/${archive_name}" "$download_url"; then
+  info "Downloading $(safe_display "${archive_name}")..."
+  if ! curl --connect-timeout 10 --max-time 120 -sfL -o "${tmpdir}/${archive_name}" "$download_url"; then
     fatal "Failed to download ${download_url}"
   fi
 
@@ -273,43 +280,49 @@ install_binary() {
   if [ "$file_size" -lt 1000 ]; then
     fatal "Downloaded file is suspiciously small (${file_size} bytes). Archive may not exist for this platform."
   fi
+  [ "$file_size" -le "$(limit_value SKYNEX_MAX_COMPRESSED_BYTES "$MAX_COMPRESSED_BYTES")" ] || fatal "Downloaded archive exceeds compressed size limit"
   success "Downloaded ${archive_name} (${file_size} bytes)"
 
   info "Verifying checksum..."
-  if curl -sL -o "${tmpdir}/checksums.txt" "$checksums_url"; then
-    local expected_checksum
-    expected_checksum="$(grep "${archive_name}" "${tmpdir}/checksums.txt" 2>/dev/null | awk '{print $1}' || true)"
-
-    if [ -n "$expected_checksum" ]; then
-      local actual_checksum
-      if command -v sha256sum &>/dev/null; then
-        actual_checksum="$(sha256sum "${tmpdir}/${archive_name}" | awk '{print $1}')"
-      elif command -v shasum &>/dev/null; then
-        actual_checksum="$(shasum -a 256 "${tmpdir}/${archive_name}" | awk '{print $1}')"
-      else
-        warn "No sha256sum or shasum found — skipping checksum verification"
-        actual_checksum="$expected_checksum"
-      fi
-
-      if [ "$actual_checksum" != "$expected_checksum" ]; then
-        fatal "Checksum mismatch!\n  Expected: ${expected_checksum}\n  Got:      ${actual_checksum}"
-      fi
-      success "Checksum verified"
-    else
-      warn "Archive not found in checksums.txt — skipping verification"
-    fi
+  curl --connect-timeout 10 --max-time 60 -sfL -o "${tmpdir}/checksums.txt" "$checksums_url" || fatal "Could not download checksums.txt; refusing unverified archive"
+  curl --connect-timeout 10 --max-time 60 -sfL -o "${tmpdir}/checksums.txt.sig" "$signature_url" || fatal "Could not download checksums.txt.sig; refusing unverified archive"
+  command -v ssh-keygen >/dev/null 2>&1 || fatal "ssh-keygen is required to verify release authenticity"
+  cat > "${tmpdir}/allowed_signers" <<'EOF'
+skynex-release ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINUht44Rk/nWIXqcKizh8SWdnECJZOQ5yuPjaxaWxAAF skynex release signing
+EOF
+  ssh-keygen -Y verify -f "${tmpdir}/allowed_signers" -I skynex-release -n file -s "${tmpdir}/checksums.txt.sig" < "${tmpdir}/checksums.txt" >/dev/null 2>&1 || fatal "Invalid checksums.txt signature"
+  success "Release signature verified"
+  local expected_checksum
+  expected_checksum="$(awk -v file="$archive_name" '$2 == file || $2 == "*" file { print tolower($1) }' "${tmpdir}/checksums.txt")"
+  [ "$(printf '%s\n' "$expected_checksum" | wc -l | tr -d ' ')" = 1 ] || fatal "checksums.txt must contain exactly one entry for ${archive_name}"
+  [[ "$expected_checksum" =~ ^[0-9a-f]{64}$ ]] || fatal "Malformed checksum for ${archive_name}"
+  local actual_checksum
+  if command -v sha256sum &>/dev/null; then
+    actual_checksum="$(sha256sum "${tmpdir}/${archive_name}" | awk '{print tolower($1)}')"
+  elif command -v shasum &>/dev/null; then
+    actual_checksum="$(shasum -a 256 "${tmpdir}/${archive_name}" | awk '{print tolower($1)}')"
   else
-    warn "Could not download checksums.txt — skipping verification"
+    fatal "No SHA-256 checksum utility available"
   fi
+  [ "$actual_checksum" = "$expected_checksum" ] || fatal "Checksum mismatch! Expected ${expected_checksum}, got ${actual_checksum}"
+  success "Checksum verified"
+
+  info "Validating archive members..."
+  validate_archive "${tmpdir}/${archive_name}"
+  actual_checksum="$(sha256sum "${tmpdir}/${archive_name}" 2>/dev/null | awk '{print tolower($1)}' || shasum -a 256 "${tmpdir}/${archive_name}" | awk '{print tolower($1)}')"
+  [ "$actual_checksum" = "$expected_checksum" ] || fatal "Archive changed after checksum verification"
 
   info "Extracting ${BINARY_NAME}..."
-  if ! tar -xzf "${tmpdir}/${archive_name}" -C "$tmpdir"; then
+  if ! tar -xOzf "${tmpdir}/${archive_name}" -- "$BINARY_NAME" | head -c "$((MAX_EXTRACTED_BYTES + 1))" > "${tmpdir}/${BINARY_NAME}"; then
     fatal "Failed to extract archive"
   fi
 
   if [ ! -f "${tmpdir}/${BINARY_NAME}" ]; then
     fatal "Binary '${BINARY_NAME}' not found in archive"
   fi
+  chmod 700 "${tmpdir}/${BINARY_NAME}" || fatal "Extracted binary is not executable"
+  extracted_size="$(wc -c < "${tmpdir}/${BINARY_NAME}" | tr -d '[:space:]')"
+  [ "$extracted_size" -gt 0 ] && [ "$extracted_size" -le "$(limit_value SKYNEX_MAX_EXTRACTED_BYTES "$MAX_EXTRACTED_BYTES")" ] || fatal "Extracted binary exceeds size limit"
 
   # Determine install directory
   local install_dir="${INSTALL_DIR:-}"
@@ -323,15 +336,21 @@ install_binary() {
     fi
   fi
 
-  mkdir -p "$install_dir"
+  if [ -e "$install_dir" ] || [ -L "$install_dir" ]; then
+    [ ! -L "$install_dir" ] || fatal "Refusing symlink install directory"
+    [ -d "$install_dir" ] || fatal "Install path is not a directory"
+  else
+    mkdir -p "$install_dir" || true
+  fi
+  [ -d "$install_dir" ] && [ ! -L "$install_dir" ] || fatal "Install directory is not safe"
 
-  info "Installing to ${install_dir}/${BINARY_NAME}..."
-  if cp "${tmpdir}/${BINARY_NAME}" "${install_dir}/${BINARY_NAME}" 2>/dev/null; then
-    chmod +x "${install_dir}/${BINARY_NAME}"
+  info "Installing to $(safe_display "${install_dir}/${BINARY_NAME}")..."
+  if "${tmpdir}/${BINARY_NAME}" internal-install-binary "${tmpdir}/${BINARY_NAME}" "${install_dir}/${BINARY_NAME}" 2>/dev/null; then
+    :
   elif command -v sudo &>/dev/null; then
     warn "Permission denied. Trying with sudo..."
-    sudo cp "${tmpdir}/${BINARY_NAME}" "${install_dir}/${BINARY_NAME}"
-    sudo chmod +x "${install_dir}/${BINARY_NAME}"
+    sudo "${tmpdir}/${BINARY_NAME}" internal-install-binary "${tmpdir}/${BINARY_NAME}" "${install_dir}/${BINARY_NAME}" \
+      || fatal "Verified binary could not perform privileged installation"
   else
     fatal "Cannot write to ${install_dir}. Run with sudo or use --dir to specify a writable directory."
   fi
@@ -342,7 +361,7 @@ install_binary() {
     warn "${install_dir} is not in your PATH"
     echo ""
     warn "Add this to your shell profile (~/.bashrc, ~/.zshrc, etc.):"
-    echo -e "  ${DIM}export PATH=\"\$PATH:${install_dir}\"${NC}"
+    printf '%b%s%b\n' "$DIM" "  export PATH=\"\$PATH:$(safe_display "${install_dir}")\"" "$NC"
     echo ""
   fi
 }
@@ -386,15 +405,15 @@ verify_installation() {
 
 print_next_steps() {
   echo ""
-  echo -e "${GREEN}${BOLD}Installation complete!${NC}"
+  printf '%b\n' "${GREEN}${BOLD}Installation complete!${NC}"
   echo ""
-  echo -e "${BOLD}Next steps:${NC}"
-  echo -e "  ${CYAN}1.${NC} Run ${BOLD}${BINARY_NAME}${NC} to start the interactive installer"
-  echo -e "  ${CYAN}2.${NC} Select your AI tool(s): Claude Code, OpenCode"
-  echo -e "  ${CYAN}3.${NC} Follow the prompts"
+  printf '%b\n' "${BOLD}Next steps:${NC}"
+  printf '%b\n' "  ${CYAN}1.${NC} Run ${BOLD}${BINARY_NAME}${NC} to start the interactive installer"
+  printf '%b\n' "  ${CYAN}2.${NC} Select your AI tool(s): Claude Code, OpenCode"
+  printf '%b\n' "  ${CYAN}3.${NC} Follow the prompts"
   echo ""
-  echo -e "${DIM}For help: ${BINARY_NAME} --help${NC}"
-  echo -e "${DIM}Docs: https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}${NC}"
+  printf '%b\n' "${DIM}For help: ${BINARY_NAME} --help${NC}"
+  printf '%b\n' "${DIM}Docs: https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}${NC}"
   echo ""
 }
 
@@ -439,7 +458,6 @@ main() {
 
   case "$INSTALL_METHOD" in
     brew)   install_brew ;;
-    go)     install_go ;;
     binary) install_binary ;;
   esac
 

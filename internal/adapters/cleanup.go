@@ -4,10 +4,15 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"charm.land/huh/v2"
+	"github.com/joeldevz/skynex/internal/safefs"
 )
 
 // DeprecatedFile is a single deprecated file to potentially remove.
@@ -105,8 +110,9 @@ func FindDeprecatedFiles() (map[string][]DeprecatedFile, error) {
 	return result, nil
 }
 
-// RemoveDeprecatedFiles removes the given deprecated files.
-// Returns count removed and any errors.
+// RemoveDeprecatedFiles explicitly retires safe regular files by renaming them
+// beside the managed root. Directories, symlinks, and special files are never
+// recursively deleted.
 func RemoveDeprecatedFiles(files []DeprecatedFile) (int, error) {
 	// Validate every candidate before mutating anything. This is deliberately a
 	// separate pass so a later unsafe path cannot leave an earlier path removed.
@@ -133,15 +139,33 @@ func RemoveDeprecatedFiles(files []DeprecatedFile) (int, error) {
 	files = filtered
 
 	count := 0
+	roots := make(map[string]*safefs.Root)
+	defer func() {
+		for _, root := range roots {
+			_ = root.Close()
+		}
+	}()
 	for _, f := range files {
 		if err := validateDeprecatedFile(f); err != nil {
 			return count, fmt.Errorf("revalidate deprecated path %q: %w", f.Path, err)
 		}
-		// This Lstat is intentionally immediately before the destructive call.
-		// Portable pathname APIs cannot eliminate every concurrent mutation
-		// between these operations; they only ensure we never intentionally
-		// follow the final candidate as part of cleanup.
-		info, err := os.Lstat(f.Path)
+		if _, err := os.Lstat(f.Root); os.IsNotExist(err) {
+			continue
+		} else if err != nil {
+			return count, fmt.Errorf("stat cleanup root %s: %w", f.Root, err)
+		}
+		root := roots[f.Root]
+		if root == nil {
+			var openErr error
+			root, openErr = safefs.Open(f.Root)
+			if openErr != nil {
+				return count, fmt.Errorf("open cleanup root %s: %w", f.Root, openErr)
+			}
+			roots[f.Root] = root
+		}
+		rel, _ := filepath.Rel(f.Root, f.Path)
+		rel = filepath.ToSlash(rel)
+		info, err := root.Lstat(rel)
 		if os.IsNotExist(err) {
 			continue
 		}
@@ -150,27 +174,20 @@ func RemoveDeprecatedFiles(files []DeprecatedFile) (int, error) {
 		}
 
 		if info.Mode()&os.ModeSymlink != 0 {
-			// Remove the manifest-approved link itself, never its target.
-			err = os.Remove(f.Path)
-		} else if info.IsDir() {
-			err = os.RemoveAll(f.Path)
-		} else {
-			err = os.Remove(f.Path)
+			if err := root.Remove(rel); err != nil {
+				return count, fmt.Errorf("remove deprecated symlink %s: %w", f.Path, err)
+			}
+			count++
+			continue
 		}
-		if err != nil {
-			return count, fmt.Errorf("remove %s: %w", f.Path, err)
+		if !info.Mode().IsRegular() || !safefs.SingleLink(info) {
+			return count, fmt.Errorf("refusing deprecated non-single regular file %s; preserved", f.Path)
+		}
+		backup := filepath.ToSlash(filepath.Join(filepath.Dir(rel), fmt.Sprintf(".skynex-deprecated-backup-%d", time.Now().UnixNano())))
+		if err := root.Rename(rel, backup); err != nil {
+			return count, fmt.Errorf("backup deprecated file %s: %w", f.Path, err)
 		}
 		count++
-
-		if !info.IsDir() {
-			parent := filepath.Dir(f.Path)
-			entries, readErr := os.ReadDir(parent)
-			if readErr == nil && len(entries) == 0 && !isManagedRoot(parent, f.Target) {
-				if err := os.Remove(parent); err != nil && !os.IsNotExist(err) {
-					return count, fmt.Errorf("remove empty parent %s: %w", parent, err)
-				}
-			}
-		}
 	}
 	return count, nil
 }
@@ -242,9 +259,8 @@ func validateDeprecatedFile(f DeprecatedFile) error {
 }
 
 // validateInstallDestination checks every existing component from the
-// filesystem anchor through path. It stops at the first missing component so
-// first installs may create missing descendants, but rejects symlinks anywhere
-// in the existing prefix.
+// filesystem anchor through path. Missing components are skipped, not treated
+// as the end of the walk: a later existing component must still be checked.
 func validateInstallDestination(path string) error {
 	cleaned := filepath.Clean(path)
 	if cleaned != path {
@@ -269,7 +285,7 @@ func validateInstallDestination(path string) error {
 		component := components[i]
 		info, err := os.Lstat(component)
 		if os.IsNotExist(err) {
-			return nil
+			continue
 		}
 		if err != nil {
 			return fmt.Errorf("lstat install destination component %s: %w", component, err)
@@ -284,18 +300,26 @@ func validateInstallDestination(path string) error {
 // validateInstallDestinationTree validates the existing destination tree
 // without following any symlink entries below its root.
 func validateInstallDestinationTree(root string) error {
+	_, err := validateInstallDestinationTreeIdentity(root)
+	return err
+}
+
+func validateInstallDestinationTreeIdentity(root string) (os.FileInfo, error) {
 	if err := validateInstallDestination(root); err != nil {
-		return err
+		return nil, err
 	}
 	info, err := os.Lstat(filepath.Clean(root))
 	if os.IsNotExist(err) {
-		return nil
+		return nil, nil
 	}
 	if err != nil {
-		return fmt.Errorf("lstat install destination tree root %s: %w", root, err)
+		return nil, fmt.Errorf("lstat install destination tree root %s: %w", root, err)
 	}
 	if !info.IsDir() {
-		return nil
+		return info, nil
+	}
+	if err := validateExistingNodeModules(root); err != nil {
+		return nil, err
 	}
 	if err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -304,14 +328,183 @@ func validateInstallDestinationTree(root string) error {
 			}
 			return fmt.Errorf("walk install destination tree %s: %w", path, walkErr)
 		}
+		rel, relErr := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+		if relErr == nil && (rel == "node_modules" || strings.HasPrefix(rel, "node_modules"+string(filepath.Separator))) {
+			if rel == "node_modules" {
+				return filepath.SkipDir
+			}
+			return filepath.SkipDir
+		}
 		if entry.Type()&os.ModeSymlink != 0 {
+			if isTopLevelNodeModulesBinLink(root, path) {
+				return validateNpmBinLink(root, path)
+			}
 			return fmt.Errorf("install destination tree contains symlink %s", path)
+		}
+		if !entry.IsDir() && !entry.Type().IsRegular() {
+			return fmt.Errorf("install destination tree contains special entry %s", path)
 		}
 		return nil
 	}); err != nil {
-		return err
+		return nil, err
+	}
+	return info, nil
+}
+
+// validateExistingNodeModules walks the dependency tree through a retained
+// descriptor. The only symlinks npm-style installs legitimately create are
+// direct children of node_modules/.bin; every other entry must be a real
+// directory or a single-link regular file.
+func validateExistingNodeModules(root string) error {
+	nodeModules := filepath.Join(root, "node_modules")
+	info, err := os.Lstat(nodeModules)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("lstat install destination node_modules %s: %w", nodeModules, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("install destination node_modules must be a real directory: %s", nodeModules)
+	}
+	rootHandle, err := safefs.Open(root)
+	if err != nil {
+		return fmt.Errorf("open install destination root: %w", err)
+	}
+	defer rootHandle.Close()
+	nodeRoot, err := rootHandle.OpenRoot("node_modules")
+	if err != nil {
+		return fmt.Errorf("open install destination node_modules: %w", err)
+	}
+	defer nodeRoot.Close()
+	return fs.WalkDir(nodeRoot.FS(), ".", func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return fmt.Errorf("walk install destination node_modules %s: %w", path, walkErr)
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			if !isNodeModulesBinChild(path) {
+				return fmt.Errorf("install destination node_modules contains symlink %s", filepath.Join(nodeModules, filepath.FromSlash(path)))
+			}
+			return validateNpmBinLinkRoot(nodeRoot, path)
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		if !entry.Type().IsRegular() {
+			return fmt.Errorf("install destination node_modules contains special entry %s", filepath.Join(nodeModules, filepath.FromSlash(path)))
+		}
+		info, err := nodeRoot.Lstat(path)
+		if err != nil {
+			return err
+		}
+		if !safefs.SingleLink(info) {
+			return fmt.Errorf("install destination node_modules contains hard-linked file %s", filepath.Join(nodeModules, filepath.FromSlash(path)))
+		}
+		return nil
+	})
+}
+
+func isNodeModulesBinChild(path string) bool {
+	parts := strings.Split(filepath.ToSlash(path), "/")
+	return len(parts) == 2 && parts[0] == ".bin"
+}
+
+func validateNpmBinLinkRoot(nodeRoot *safefs.Root, path string) error {
+	target, err := nodeRoot.Readlink(path)
+	if err != nil {
+		return fmt.Errorf("read npm .bin link %s: %w", path, err)
+	}
+	if target == "" || filepath.IsAbs(target) || strings.Contains(target, "\\") || filepath.Clean(target) != target {
+		return fmt.Errorf("npm .bin link has non-relative clean target %s: %s", path, target)
+	}
+	resolved := filepath.Clean(filepath.Join(filepath.Dir(path), target))
+	rel, err := safefs.Relative(filepath.ToSlash(resolved))
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, "../") {
+		return fmt.Errorf("npm .bin link escapes node_modules: %s", path)
+	}
+	if strings.HasPrefix(rel, ".bin/") {
+		return fmt.Errorf("npm .bin link resolves into .bin: %s", path)
+	}
+	parts := strings.Split(rel, "/")
+	for i, part := range parts {
+		_ = part
+		component := strings.Join(parts[:i+1], "/")
+		info, err := nodeRoot.Lstat(component)
+		if err != nil {
+			return fmt.Errorf("npm .bin link target is not an existing file: %s: %w", path, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("npm .bin link target contains symlink: %s", component)
+		}
+		if i < len(parts)-1 {
+			if !info.IsDir() {
+				return fmt.Errorf("npm .bin link target ancestor is not a directory: %s", component)
+			}
+		} else if !info.Mode().IsRegular() || !safefs.SingleLink(info) {
+			return fmt.Errorf("npm .bin link target is not a single regular file: %s", rel)
+		}
 	}
 	return nil
+}
+
+// validateNpmBinLink validates the target without ever resolving a symlink.
+// npm links are the sole permitted symlinks in an install tree, and their
+// target must be an existing, unlinked regular file in the same node_modules.
+func validateNpmBinLink(root, path string) error {
+	target, err := os.Readlink(path)
+	if err != nil {
+		return fmt.Errorf("read npm .bin link %s: %w", path, err)
+	}
+	if filepath.IsAbs(target) || filepath.Clean(target) != target {
+		return fmt.Errorf("npm .bin link has non-relative clean target %s: %s", path, target)
+	}
+
+	nodeModules := filepath.Join(filepath.Clean(root), "node_modules")
+	resolved := filepath.Clean(filepath.Join(filepath.Dir(path), target))
+	rel, err := filepath.Rel(nodeModules, resolved)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return fmt.Errorf("npm .bin link escapes node_modules: %s", path)
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	if len(parts) > 0 && parts[0] == ".bin" {
+		return fmt.Errorf("npm .bin link resolves into .bin: %s", path)
+	}
+
+	components := []string{}
+	current := resolved
+	for {
+		components = append(components, current)
+		parent := filepath.Dir(current)
+		if parent == current || parent == nodeModules {
+			break
+		}
+		current = parent
+	}
+	for i := len(components) - 1; i >= 0; i-- {
+		info, err := os.Lstat(components[i])
+		if err != nil {
+			return fmt.Errorf("npm .bin link target is not an existing file: %s: %w", path, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("npm .bin link target contains symlink: %s", components[i])
+		}
+		if i == 0 && (!info.Mode().IsRegular() || !safefs.SingleLink(info)) {
+			return fmt.Errorf("npm .bin link target is not a single regular file: %s", resolved)
+		}
+	}
+	return nil
+}
+
+// isTopLevelNodeModulesBinLink permits direct executable links created by
+// npm/bun. WalkDir does not follow the link, so its target is never used for
+// validation or subsequent writes.
+func isTopLevelNodeModulesBinLink(root, path string) bool {
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	return len(parts) == 3 && parts[0] == "node_modules" && parts[1] == ".bin"
 }
 
 func isManagedRoot(path, target string) bool {
@@ -351,41 +544,56 @@ func normalizeDisplayPath(path string) string {
 
 // NotifyDeprecatedFiles lists the managed paths that will be removed.
 func NotifyDeprecatedFiles(target string, files []DeprecatedFile) {
+	notifyDeprecatedFiles(discardReporter(), target, files)
+}
+
+func notifyDeprecatedFiles(reporter Reporter, target string, files []DeprecatedFile) {
 	if len(files) == 0 {
 		return
 	}
 
-	fmt.Println("    Removing deprecated skynex-managed files:")
+	reporter.Detail("Removing deprecated skynex-managed files:")
 	for _, f := range files {
 		displayFile := f
 		if displayFile.Target == "" {
 			displayFile.Target = target
 		}
-		fmt.Printf("      • %s\n", formatDeprecatedFileForDisplay(displayFile))
+		reporter.Detail("  • %s", formatDeprecatedFileForDisplay(displayFile))
 	}
 }
 
 // PromptCleanupDeprecated asks the user interactively if they want to remove deprecated files.
 // Returns true if user confirms, false otherwise.
-func PromptCleanupDeprecated(grouped map[string][]DeprecatedFile) bool {
+func PromptCleanupDeprecated(grouped map[string][]DeprecatedFile, reporters ...Reporter) bool {
+	return PromptCleanupDeprecatedWithIO(grouped, os.Stdin, io.Discard, reporters...)
+}
+
+func PromptCleanupDeprecatedWithIO(grouped map[string][]DeprecatedFile, input io.Reader, output io.Writer, reporters ...Reporter) bool {
 	if len(grouped) == 0 {
 		return false
 	}
-
-	fmt.Println("\n  Deprecated skynex-managed files detected:")
+	var reporter Reporter = discardReporter()
+	if len(reporters) > 0 && reporters[0] != nil {
+		reporter = reporters[0]
+	}
+	reporter.Detail("Deprecated skynex-managed files detected:")
 	for target, files := range grouped {
-		fmt.Printf("\n    [%s]\n", target)
+		reporter.Detail("[%s]", target)
 		for _, f := range files {
 			displayFile := f
 			if displayFile.Target == "" {
 				displayFile.Target = target
 			}
-			fmt.Printf("      • %s\n", formatDeprecatedFileForDisplay(displayFile))
+			reporter.Detail("  • %s", formatDeprecatedFileForDisplay(displayFile))
 		}
 	}
-
-	fmt.Print("\n  Remove these deprecated files? [y/N] ")
-	var input string
-	fmt.Scanln(&input)
-	return strings.ToLower(strings.TrimSpace(input)) == "y"
+	confirmed := false
+	if input == nil || output == nil {
+		return false
+	}
+	form := huh.NewForm(huh.NewGroup(huh.NewConfirm().Title("Remove deprecated skynex-managed files?").Affirmative("Remove").Negative("Keep").Value(&confirmed))).WithAccessible(true).WithInput(input).WithOutput(output)
+	if err := form.Run(); err != nil {
+		return false
+	}
+	return confirmed
 }

@@ -1,51 +1,32 @@
 # Instalacion
 
-Guia paso a paso para instalar Skills en tu maquina. Puedes usar el instalador automatico o hacerlo manualmente.
+Guia para instalar el paquete `skills`. El asistente sin flags instala OpenCode; `--target claude` instala también los assets de Claude Code.
+Las versiones `latest` usan el bundle embebido del binario firmado. `workspace` solo
+permite un checkout local. Versiones o refs remotos arbitrarios fallan cerrados hasta
+que existan manifiestos de origen firmados.
+
+## Bootstrap y confianza
+
+No uses `curl ... | bash` ni `irm ... | iex`: HTTPS protege el transporte, pero
+el contenido remoto todavía se ejecutaría sin revisión. Descarga `install.sh` o
+`install.ps1` y su firma desde un release etiquetado, verifica la firma con la
+clave pública de `release/trust/`, y ejecuta el archivo local. También puedes
+usar Homebrew (confianza delegada explícita) o el binario firmado del release.
 
 ## Requisitos previos
 
 | Requisito | Obligatorio | Para que |
 |-----------|-------------|----------|
-| `git` | Si | Clonar el repositorio |
-| `python3` | Si | El instalador usa scripts Python internamente |
-| [`neurox`](https://github.com/joeldevz/neurox) | Si | Memoria persistente. Se instala con `skynex install` |
+| `git` | Solo workspace local | Leer el commit de un checkout local |
+| `python3` | No requerido | El instalador y el CLI son Go |
 | `bun` o `npm` | Solo OpenCode | Instalar dependencias de plugins |
 | `gh` | Opcional | Para usar `/pr` (crear pull requests desde terminal) |
 | `opencode` | Solo si usas OpenCode | CLI de OpenCode instalado |
 | `claude` | Solo si usas Claude Code | CLI de Claude Code instalado |
 
-### Instalar Neurox
-
-[Neurox](https://github.com/joeldevz/neurox) es el sistema de memoria persistente.
-
-```bash
-# Via skynex (recomendado)
-skynex install    # seleccionar neurox en el instalador
-```
-
-O manual como fallback:
-
-```bash
-# Requiere Go 1.23+ y CGO habilitado
-git clone git@github.com:joeldevz/neurox.git
-cd neurox
-CGO_ENABLED=1 go build -tags fts5 -o neurox .
-
-# Mover a un directorio en PATH
-sudo mv neurox /usr/local/bin/
-
-# Verificar
-neurox status
-```
-
-Neurox funciona sin servicios externos (solo FTS5). Opcionalmente, con Ollama o una API compatible con OpenAI, habilita busqueda semantica, quality gate y reflexion. Ver [documentacion de Neurox](https://github.com/joeldevz/neurox) para configuracion avanzada.
-
 ## Instalacion automatica (recomendado)
 
-```bash
-git clone git@github.com:joeldevz/skynex.git
-cd skynex
-```
+Usa el binario firmado de un release etiquetado o Homebrew. Para desarrollo, ejecuta el CLI desde un checkout local ya obtenido por un canal que tu organización haya verificado.
 
 ### Instalar con el CLI unificado (recomendado)
 
@@ -56,56 +37,53 @@ skynex install
 # Instalar skills para ambos targets
 skynex install --non-interactive --package skills --target both --version skills=latest --trust-setup-scripts
 
-# Instalar skills y neurox
-skynex install --non-interactive --package skills --package neurox --target both --trust-setup-scripts
+# El asistente sin flags instala skills para OpenCode
+skynex install --non-interactive --package skills --target opencode
 ```
 
-`--non-interactive` omite la confirmacion final. Si falta algun valor obligatorio, el comando termina con error antes de instalar.
+`--non-interactive` requiere todos los valores por flags. En modo interactivo, `--yes` conserva la seleccion del asistente y omite solo la confirmacion final.
 
 ### Instalar con el script legacy
 
-> **Nota**: `./scripts/setup.sh` es el instalador interno del paquete `skills`. Se recomienda usar `skynex install` en su lugar.
+> **Nota**: `./scripts/setup.sh` es un shim de compatibilidad que ejecuta `skynex install`.
 
 ```bash
-# Todo lo compatible
-./scripts/setup.sh --all
-
-# Solo OpenCode
-./scripts/setup.sh --opencode
-
-# Solo Claude Code
-./scripts/setup.sh --claude
+./scripts/setup.sh [opciones de skynex install]
 ```
+
+Por defecto, el instalador instala dependencias con `--ignore-scripts`: los scripts de ciclo de vida
+de npm/Bun no se ejecutan. `--trust-setup-scripts` es un opt-in explícito que muestra una
+advertencia y permite ejecutar esos scripts; úsalo solo después de revisar las dependencias.
+Los directorios privados creados por el script usan modo `0700` y sus configuraciones/backups
+modo `0600`.
 
 ### Que hace el instalador
 
-#### Para OpenCode (`--opencode`)
+#### Para OpenCode
 
 1. Hace backup de `~/.config/opencode/` si ya existe
 2. Copia todo el contenido de `opencode/` a `~/.config/opencode/`
 3. Restaura tu API key de Context7 del backup si la tenias configurada
-4. Ejecuta `bun install` (o `npm install` como fallback) para dependencias de plugins
-5. Resultado: 10 agentes, 8 commands, skills, templates, evals, y MCPs configurados
+4. Ejecuta `bun install --ignore-scripts` (o `npm install --ignore-scripts` como fallback) para dependencias de plugins
+5. Resultado: 11 agentes, 8 commands, skills, templates, evals, y MCPs configurados
 
-#### Para Claude Code (`--claude`)
+#### Para Claude Code
 
 1. Hace backup de `~/.claude/` si ya existe
-2. Renderiza los 10 agentes (`orchestrator`, `advisor`, `coder`, `manager`, `tech-planner`, `product-planner`, `verifier`, `test-reviewer`, `security`, `skill-validator`) en `~/.claude/agents/`
+2. Renderiza los agentes (`orchestrator`, `advisor`, `coder`, `manager`, `tech-planner`, `product-planner`, `verifier`, `test-reviewer`, `security`, `skill-validator`, `linear-orchestrator`) en `~/.claude/agents/`
 3. Convierte los 8 commands de OpenCode en skills de Claude Code en `~/.claude/skills/`
 4. Copia skills compartidas (`grill-me`, `prd`, `security`, `write-a-skill`, `diagnose`, `triage`) a `~/.claude/skills/`
 5. Copia templates a `~/.claude/templates/`
 6. Agrega el bloque del workflow a `~/.claude/CLAUDE.md` (sin borrar contenido existente)
 7. Registra Neurox como MCP server en `~/.claude.json`
-8. Resultado: 10 agentes, 8 skills de comando, skills core (grill-me, prd, security, write-a-skill, diagnose, triage), overlay de CLAUDE.md, y Neurox MCP listo
+8. Resultado: 11 agentes, 8 skills de comando, skills core (grill-me, prd, security, write-a-skill, diagnose, triage), overlay de CLAUDE.md, y Neurox MCP listo
 
 ## Instalacion manual
 
 ### OpenCode manual
 
 ```bash
-# 1. Clonar el repo
-git clone git@github.com:joeldevz/skynex.git
-cd skynex
+# 1. Desde un checkout local verificado
 
 # 2. Copiar config de OpenCode
 cp -r opencode/ ~/.config/opencode/
@@ -120,12 +98,10 @@ cd ~/.config/opencode && bun install
 ### Claude Code manual
 
 ```bash
-# 1. Clonar el repo
-git clone git@github.com:joeldevz/skynex.git
-cd skynex
+# 1. Desde un checkout local verificado
 
-# 2. Ejecutar solo el renderer de assets de Claude
-python3 scripts/install_claude_assets.py
+# 2. Ejecutar el instalador Go
+skynex install
 
 # 3. Agregar overlay a CLAUDE.md
 # Copiar el contenido de claude-code/CLAUDE.md y pegarlo en ~/.claude/CLAUDE.md
@@ -148,6 +124,12 @@ python3 scripts/install_claude_assets.py
 
 ## Verificacion post-instalacion
 
+Los instaladores de releases verifican el SHA-256 exacto antes de abrir un archivo. También
+validan todos los miembros del archivo, rechazan traversal/enlaces/archivos especiales y
+reemplazan el binario mediante una raíz temporal privada y reemplazo atómico. Si PowerShell
+está disponible, las pruebas de sintaxis pueden ejecutarse localmente; en otros entornos se
+ejecuta al menos `bash -n` para los scripts POSIX.
+
 ### OpenCode
 
 ```bash
@@ -159,7 +141,7 @@ ls ~/.config/opencode/templates/
 
 # Abrir OpenCode y probar
 opencode
-# Dentro de OpenCode, probar: /status
+# Dentro de OpenCode, probar un command disponible en `opencode/commands/`.
 ```
 
 ### Claude Code
@@ -167,7 +149,7 @@ opencode
 ```bash
 # Verificar agentes
 ls ~/.claude/agents/
-# Deberia mostrar: orchestrator.md  advisor.md  coder.md  manager.md  tech-planner.md  product-planner.md  verifier.md  test-reviewer.md  security.md  skill-validator.md
+# Deberia mostrar también: orchestrator.md  advisor.md  coder.md  manager.md  tech-planner.md  product-planner.md  verifier.md  test-reviewer.md  security.md  skill-validator.md  linear-orchestrator.md
 
 # Verificar skills
 ls ~/.claude/skills/
@@ -184,7 +166,7 @@ grep "neurox" ~/.claude.json
 
 # Abrir Claude Code y probar
 claude
-# Dentro de Claude, probar: /status
+# Dentro de Claude, probar una skill instalada.
 ```
 
 ## Configuracion opcional
@@ -230,6 +212,17 @@ Esto actualiza todos los paquetes instalados a la última versión. Para actuali
 
 El instalador hace backup automatico antes de sobreescribir, asi que es seguro correr multiples veces.
 
+### Confianza del manifiesto de Skills
+
+El manifiesto de propiedad de `skills` autentica su propia lista de archivos y
+los metadatos de origen mediante `TreeSHA256`; no exige que el manifiesto
+anterior coincida con el bundle actual. Esto permite actualizar desde una
+version anterior sin tratarla como corrupcion. La frontera de amenaza es el
+binario y el bundle que se esta ejecutando: si el directorio de estado y el
+binario estan bajo control del atacante, el manifiesto no es una raiz de
+confianza. Los archivos retirados o modificados nunca se eliminan sin una
+decision explicita enlazada a la observacion inspeccionada.
+
 ## Diagnostico
 
 ```bash
@@ -246,10 +239,9 @@ skynex doctor
 # OpenCode
 rm -rf ~/.config/opencode/
 
-# Claude Code (solo los assets de Skills, no toda la config de Claude)
-rm -rf ~/.claude/agents/planner.md ~/.claude/agents/manager.md ~/.claude/agents/coder.md
-rm -rf ~/.claude/skills/plan ~/.claude/skills/execute ~/.claude/skills/review
-# ... etc. O restaurar desde el backup:
+# Claude Code: restaura el backup creado por skynex (evita borrar assets ajenos).
+ls -dt ~/.claude.backup.* | head -1
+# Después de revisar el contenido, restaura el backup correspondiente:
 # cp -r ~/.claude.backup.XXXXXXXX-XXXXXX/ ~/.claude/
 ```
 
@@ -262,5 +254,16 @@ rm -rf ~/.claude/skills/plan ~/.claude/skills/execute ~/.claude/skills/review
 | Context7 no funciona | Verificar API key en `opencode.json`. Sin key, se ignora silenciosamente |
 | Skills no aparecen en Claude | Verificar que `~/.claude/skills/` tiene los directorios. Reiniciar Claude Code |
 | Agentes no aparecen en Claude | Verificar que `~/.claude/agents/` tiene los `.md`. Reiniciar Claude Code |
-| `bun: command not found` | Instalar bun (`curl -fsSL https://bun.sh/install \| bash`) o usar npm |
+| `bun: command not found` | Instalar Bun desde su release/package manager verificado o usar npm |
 | Backup no se creo | El backup solo se crea si el directorio destino ya existia |
+# Transaction safety
+
+Install transactions retain private recovery snapshots under the configured
+state directory. `node_modules` is never quarantined or included in snapshots,
+so dependency managers update it in place. If dependency installation fails,
+managed configuration and skills are rolled back, but dependencies may require
+rerunning the install. At most five snapshots are retained; when that limit is
+reached, recover or remove one explicitly before starting another transaction.
+Deprecated managed entries are reported and preserved. Explicit file cleanup,
+where supported, renames a regular file to a recovery backup and never removes
+directories recursively.

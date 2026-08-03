@@ -1,4 +1,7 @@
-# PLAN: Advisor Strategy Integration (PR 1)
+# PLAN: Advisor Strategy Integration (historical migration record)
+
+> Historical plan retained for traceability. The original advisor migration is
+> complete; current work is tracked in issues/reviews rather than this stale plan.
 
 ## Goal
 
@@ -31,8 +34,8 @@ Add the Advisor Strategy pattern to the skills system: a tool that lets worker a
   - Fallback: if unavailable, continue without blocking
   - Max uses: 3 per task, circuit breaker after 2 consecutive without progress
 
-- [x] **Step 4 — Claude Code support**
-  - Update `install_claude_assets.py`: add `advisor` to skill_map
+- [x] **Step 4 — Claude Code support** (historical; renderer moved into Go)
+  - The deleted `install_claude_assets.py` was replaced by the Go asset renderer.
   - Update `CLAUDE.md`: add advisor section — when coder returns blocked, orchestrator consults advisor as Task subagent
 
 - [x] **Step 5 — Schema update for advisor config**
@@ -43,5 +46,5 @@ Add the Advisor Strategy pattern to the skills system: a tool that lets worker a
 - `opencode.json` is valid JSON with advisor agent, coder and tech-planner have advisor tool
 - `advisor.ts` compiles (TypeScript syntax valid)
 - `advisor-protocol.md` is consistent with other _shared/ protocols
-- `install_claude_assets.py` renders advisor agent to `~/.claude/agents/advisor.md`
+- The current Go renderer renders advisor agent to `~/.claude/agents/advisor.md`
 - Schemas validate with example config

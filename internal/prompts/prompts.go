@@ -2,24 +2,50 @@ package prompts
 
 import (
 	"fmt"
+	"io"
 	"os"
-	"sort"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/huh/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/joeldevz/skynex/internal/models"
+	"github.com/joeldevz/skynex/internal/skillsync"
 )
 
-var (
-	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
-	selectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	dimStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-	activeStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("212")).Bold(true)
-	groupStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
+// BackupCapacityChoice is the action selected when an install has reached the
+// retained snapshot cap.
+type BackupCapacityChoice string
+
+const (
+	BackupRemoveOldest BackupCapacityChoice = "remove"
+	BackupManage       BackupCapacityChoice = "manage"
+	BackupCancel       BackupCapacityChoice = "cancel"
 )
 
-// AdvisorModels is the curated list of models for the advisor picker.
+func ChooseBackupCapacity(input io.Reader, output io.Writer, summary string, canPrune bool) BackupCapacityChoice {
+	choice := BackupCapacityChoice(BackupCancel)
+	options := []huh.Option[string]{
+		huh.NewOption("Manage backups", string(BackupManage)),
+		huh.NewOption("Cancel", string(BackupCancel)),
+	}
+	if canPrune {
+		options = append([]huh.Option[string]{huh.NewOption("Remove oldest backup and continue", string(BackupRemoveOldest)).Selected(true)}, options...)
+	}
+	field := huh.NewSelect[string]().Title(summary).Options(options...).Value((*string)(&choice))
+	form := huh.NewForm(huh.NewGroup(field)).WithAccessible(accessibleMode()).WithTheme(wizardTheme(noColor())).WithInput(input).WithOutput(output)
+	if err := form.Run(); err != nil {
+		return BackupCancel
+	}
+	return choice
+}
+
+func ConfirmBackupPrune(input io.Reader, output io.Writer, count int) bool {
+	confirmed := false
+	form := huh.NewForm(huh.NewGroup(huh.NewConfirm().Title(fmt.Sprintf("Remove %d eligible backup(s)?", count)).Affirmative("Remove").Negative("Cancel").Value(&confirmed))).WithAccessible(accessibleMode()).WithTheme(wizardTheme(noColor())).WithInput(input).WithOutput(output)
+	return form.Run() == nil && confirmed
+}
+
+// AdvisorModels is retained for callers that consume the curated advisor catalog.
 var AdvisorModels = []models.AdvisorModel{
 	{ID: "anthropic/claude-opus-4-6", DisplayName: "Claude Opus 4.6", Provider: "Anthropic", Description: "Most capable — best for complex strategic decisions"},
 	{ID: "anthropic/claude-sonnet-4-6", DisplayName: "Claude Sonnet 4.6", Provider: "Anthropic", Description: "Good balance of capability and cost"},
@@ -29,300 +55,100 @@ var AdvisorModels = []models.AdvisorModel{
 	{ID: "anthropic/claude-haiku-4-5", DisplayName: "Claude Haiku 4.5", Provider: "Anthropic", Description: "Fast and cheap — good for simple advice"},
 }
 
-// --- Multi-select model ---
-
-type multiSelectModel struct {
-	title    string
-	options  []string
-	cursor   int
-	selected map[int]bool
-	done     bool
+// ResolveSkillDecisions presents only actionable modified entries. Unknown
+// entries are deliberately informational and can never be selected.
+func ResolveSkillDecisions(report skillsync.Report) (map[string]skillsync.Decision, error) {
+	return ResolveSkillDecisionsWithIO(report, os.Stdin, os.Stdout)
 }
 
-func newMultiSelect(title string, options []string, defaults []int) multiSelectModel {
-	sel := make(map[int]bool)
-	for _, i := range defaults {
-		sel[i] = true
-	}
-	return multiSelectModel{title: title, options: options, selected: sel}
+func ResolveSkillDecisionsWithWriter(report skillsync.Report, out io.Writer) (map[string]skillsync.Decision, error) {
+	return resolveSkillDecisionsWithIO(report, os.Stdin, out)
 }
 
-func (m multiSelectModel) Init() tea.Cmd { return nil }
-
-func (m multiSelectModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "up", "k":
-			if m.cursor > 0 {
-				m.cursor--
-			}
-		case "down", "j":
-			if m.cursor < len(m.options)-1 {
-				m.cursor++
-			}
-		case " ":
-			m.selected[m.cursor] = !m.selected[m.cursor]
-		case "enter":
-			m.done = true
-			return m, tea.Quit
-		case "q", "ctrl+c":
-			fmt.Println("Cancelled.")
-			os.Exit(0)
-		}
-	}
-	return m, nil
+func ResolveSkillDecisionsWithIO(report skillsync.Report, input io.Reader, out io.Writer) (map[string]skillsync.Decision, error) {
+	return resolveSkillDecisionsWithIO(report, input, out)
 }
 
-func (m multiSelectModel) View() string {
-	s := titleStyle.Render(m.title) + "\n"
-	s += dimStyle.Render("  (space to toggle, enter to confirm)") + "\n\n"
-	for i, opt := range m.options {
-		cursor := "  "
-		if i == m.cursor {
-			cursor = "> "
-		}
-		check := "[ ]"
-		style := lipgloss.NewStyle()
-		if m.selected[i] {
-			check = "[x]"
-			style = selectedStyle
-		}
-		s += style.Render(fmt.Sprintf("%s%s %s", cursor, check, opt)) + "\n"
+func resolveSkillDecisionsWithIO(report skillsync.Report, input io.Reader, out io.Writer) (map[string]skillsync.Decision, error) {
+	if input == nil || out == nil {
+		return nil, fmt.Errorf("prompt input and output are required")
 	}
-	return s
+	decisions := make(map[string]skillsync.Decision)
+	modified, retired, unknown := 0, 0, 0
+	for _, entry := range report.Entries {
+		switch entry.Status {
+		case skillsync.Modified:
+			modified++
+		case skillsync.Retired:
+			retired++
+		case skillsync.Unknown:
+			unknown++
+		}
+	}
+	fmt.Fprintf(out, "\nSkills: %d modified, %d retired, %d unknown (unknown entries are preserved)\n", modified, retired, unknown)
+	for _, entry := range report.Entries {
+		if entry.Status != skillsync.Modified && entry.Status != skillsync.Retired {
+			continue
+		}
+		choice := "keep"
+		options := []huh.Option[string]{huh.NewOption("Keep local", "keep"), huh.NewOption("Replace packaged", "replace")}
+		if entry.Status == skillsync.Retired {
+			options = []huh.Option[string]{huh.NewOption("Keep local", "keep"), huh.NewOption("Retire packaged file", "replace")}
+		}
+		field := huh.NewSelect[string]().Title(fmt.Sprintf("%s [%s] local=%s bundle=%s", entry.Path, entry.Status, entry.LocalSHA256, entry.BundleSHA256)).Options(options...).Value(&choice)
+		form := huh.NewForm(huh.NewGroup(field)).WithAccessible(accessibleMode()).WithTheme(wizardTheme(noColor())).WithInput(input).WithOutput(out)
+		if err := form.Run(); err != nil {
+			return nil, err
+		}
+		decisions[entry.Path] = skillsync.BindDecision(entry.Path, skillsync.Decision(choice), entry.LocalSHA256, entry.BundleSHA256, entry.BundleTreeSHA256)
+	}
+	return decisions, nil
 }
 
-// --- Single-select model ---
-
-type singleSelectModel struct {
-	title   string
-	options []string
-	descs   []string
-	cursor  int
-	done    bool
+// ConfirmPlan shows the install plan and asks for confirmation using Huh.
+func ConfirmPlan(req *models.InstallRequest, _ *models.Catalog) bool {
+	return ConfirmPlanWithIO(req, os.Stdin, os.Stdout)
 }
 
-func newSingleSelect(title string, options, descs []string, defaultIdx int) singleSelectModel {
-	return singleSelectModel{title: title, options: options, descs: descs, cursor: defaultIdx}
+func ConfirmPlanWithWriter(req *models.InstallRequest, input io.Reader, out io.Writer) bool {
+	return ConfirmPlanWithIO(req, input, out)
 }
 
-func (m singleSelectModel) Init() tea.Cmd { return nil }
-
-func (m singleSelectModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "up", "k":
-			if m.cursor > 0 {
-				m.cursor--
-			}
-		case "down", "j":
-			if m.cursor < len(m.options)-1 {
-				m.cursor++
-			}
-		case "enter":
-			m.done = true
-			return m, tea.Quit
-		case "q", "ctrl+c":
-			fmt.Println("Cancelled.")
-			os.Exit(0)
-		}
-	}
-	return m, nil
-}
-
-func (m singleSelectModel) View() string {
-	s := titleStyle.Render(m.title) + "\n"
-	s += dimStyle.Render("  (arrows to move, enter to select)") + "\n\n"
-	for i, opt := range m.options {
-		cursor := "  "
-		if i == m.cursor {
-			cursor = "> "
-		}
-		line := opt
-		if i < len(m.descs) && m.descs[i] != "" {
-			line += dimStyle.Render(" — " + m.descs[i])
-		}
-		style := lipgloss.NewStyle()
-		if i == m.cursor {
-			style = selectedStyle
-		}
-		s += style.Render(cursor+line) + "\n"
-	}
-	return s
-}
-
-// --- Yes/No model ---
-
-type confirmModel struct {
-	title string
-	yes   bool
-	done  bool
-}
-
-func (m confirmModel) Init() tea.Cmd { return nil }
-
-func (m confirmModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "y", "Y":
-			m.yes = true
-			m.done = true
-			return m, tea.Quit
-		case "n", "N", "q", "ctrl+c":
-			m.yes = false
-			m.done = true
-			return m, tea.Quit
-		case "enter":
-			m.yes = true
-			m.done = true
-			return m, tea.Quit
-		}
-	}
-	return m, nil
-}
-
-func (m confirmModel) View() string {
-	return titleStyle.Render(m.title) + " [Y/n] "
-}
-
-// --- Public API ---
-
-// ResolveInteractive guides the user through package/target/version/advisor selection.
-func ResolveInteractive(cat *models.Catalog, cfg map[string]interface{}, args interface{}) (*models.InstallRequest, error) {
-	// 1. Package selection — sort IDs for deterministic order
-	pkgIDs := make([]string, 0, len(cat.Packages))
-	for id := range cat.Packages {
-		pkgIDs = append(pkgIDs, id)
-	}
-	sort.Strings(pkgIDs)
-
-	pkgNames := make([]string, len(pkgIDs))
-	for i, id := range pkgIDs {
-		pkgNames[i] = fmt.Sprintf("%s (%s)", cat.Packages[id].DisplayName, id)
-	}
-	defaults := make([]int, len(pkgIDs))
-	for i := range defaults {
-		defaults[i] = i
-	}
-
-	pkgModel := newMultiSelect("Select packages to install:", pkgNames, defaults)
-	p := tea.NewProgram(pkgModel)
-	finalModel, err := p.Run()
-	if err != nil {
-		return nil, fmt.Errorf("package selection: %w", err)
-	}
-	pkgResult := finalModel.(multiSelectModel)
-	selectedPkgs := []string{}
-	for i, id := range pkgIDs {
-		if pkgResult.selected[i] {
-			selectedPkgs = append(selectedPkgs, id)
-		}
-	}
-	if len(selectedPkgs) == 0 {
-		return nil, fmt.Errorf("no packages selected")
-	}
-
-	// 2. Target selection
-	targetOptions := []string{"claude", "opencode"}
-	targetModel := newMultiSelect("Select targets:", targetOptions, []int{0, 1})
-	p = tea.NewProgram(targetModel)
-	finalModel, err = p.Run()
-	if err != nil {
-		return nil, fmt.Errorf("target selection: %w", err)
-	}
-	targetResult := finalModel.(multiSelectModel)
-	selectedTargets := []string{}
-	for i, t := range targetOptions {
-		if targetResult.selected[i] {
-			selectedTargets = append(selectedTargets, t)
-		}
-	}
-	if len(selectedTargets) == 0 {
-		return nil, fmt.Errorf("no targets selected")
-	}
-
-	// 3. Version selection per package
-	versions := make(map[string]string)
-	for _, pkgID := range selectedPkgs {
-		versionOptions := []string{"latest", "workspace"}
-		versionDescs := []string{"Latest tagged release", "Current local checkout"}
-		vModel := newSingleSelect(
-			fmt.Sprintf("Select version for %s:", pkgID),
-			versionOptions, versionDescs, 0,
-		)
-		p = tea.NewProgram(vModel)
-		finalModel, err = p.Run()
-		if err != nil {
-			return nil, fmt.Errorf("version selection for %s: %w", pkgID, err)
-		}
-		vResult := finalModel.(singleSelectModel)
-		versions[pkgID] = versionOptions[vResult.cursor]
-	}
-
-	// 4. Advisor configuration
-	var advisorCfg *models.AdvisorConfig
-	advisorConfirm := confirmModel{title: "Enable Advisor Strategy? (larger model for strategic guidance)"}
-	p = tea.NewProgram(advisorConfirm)
-	finalModel, err = p.Run()
-	if err != nil {
-		return nil, fmt.Errorf("advisor confirmation: %w", err)
-	}
-	if finalModel.(confirmModel).yes {
-		// Model picker
-		modelNames := make([]string, len(AdvisorModels))
-		modelDescs := make([]string, len(AdvisorModels))
-		for i, m := range AdvisorModels {
-			modelNames[i] = fmt.Sprintf("%s (%s)", m.DisplayName, m.Provider)
-			modelDescs[i] = m.Description
-		}
-		modelSelect := newSingleSelect("Select advisor model:", modelNames, modelDescs, 0)
-		p = tea.NewProgram(modelSelect)
-		finalModel, err = p.Run()
-		if err != nil {
-			return nil, fmt.Errorf("advisor model selection: %w", err)
-		}
-		selected := finalModel.(singleSelectModel)
-		advisorCfg = &models.AdvisorConfig{
-			Enabled: true,
-			Model:   AdvisorModels[selected.cursor].ID,
-			MaxUses: 3,
-		}
-
-		fmt.Printf("\n%s Advisor enabled: %s\n\n",
-			selectedStyle.Render("✓"),
-			selectedStyle.Render(AdvisorModels[selected.cursor].DisplayName))
-	}
-
-	return &models.InstallRequest{
-		Packages:    selectedPkgs,
-		Targets:     selectedTargets,
-		Versions:    versions,
-		Interactive: true,
-		Advisor:     advisorCfg,
-	}, nil
-}
-
-// ConfirmPlan shows the install plan and asks for confirmation.
-func ConfirmPlan(req *models.InstallRequest, cat *models.Catalog) bool {
-	fmt.Println(titleStyle.Render("\nInstall plan:"))
-	targets := strings.Join(req.Targets, ", ")
-	for _, pkgID := range req.Packages {
-		version := req.Versions[pkgID]
-		fmt.Printf("  %s -> %s -> %s\n", pkgID, version, targets)
-	}
-	if req.Advisor != nil && req.Advisor.Enabled {
-		fmt.Printf("  advisor -> %s (max %d calls/session)\n", req.Advisor.Model, req.Advisor.MaxUses)
-	}
-	fmt.Println()
-
-	confirm := confirmModel{title: "Proceed with installation?"}
-	p := tea.NewProgram(confirm)
-	finalModel, err := p.Run()
-	if err != nil {
+func ConfirmPlanWithIO(req *models.InstallRequest, input io.Reader, out io.Writer) bool {
+	if input == nil || out == nil {
 		return false
 	}
-	return finalModel.(confirmModel).yes
+	// Keep rendering and interaction on the injected streams.
+	if req == nil {
+		return false
+	}
+	var plan strings.Builder
+	for _, pkgID := range req.Packages {
+		fmt.Fprintf(&plan, "  %s -> %s -> %s\n", pkgID, req.Versions[pkgID], strings.Join(req.Targets, ", "))
+	}
+	if noColor() {
+		fmt.Fprintln(out, "\nInstall plan:\n"+plan.String())
+	} else {
+		fmt.Fprintln(out, lipgloss.NewStyle().Bold(true).Render("\nInstall plan:\n"+plan.String()))
+	}
+	confirmed := false
+	form := huh.NewForm(huh.NewGroup(huh.NewConfirm().Title("Proceed with installation?").Affirmative("Proceed").Negative("Cancel").Value(&confirmed))).WithAccessible(accessibleMode()).WithTheme(wizardTheme(noColor())).WithInput(input).WithOutput(out)
+	return form.Run() == nil && confirmed
+}
+
+// ConfirmTrustSetupScripts makes the lifecycle-script opt-in an explicit
+// interactive decision, rather than treating the command-line option alone as
+// consent in a terminal session.
+func ConfirmTrustSetupScripts() bool {
+	return ConfirmTrustSetupScriptsWithIO(os.Stdin, os.Stdout)
+}
+
+func ConfirmTrustSetupScriptsWithIO(input io.Reader, output io.Writer) bool {
+	if input == nil || output == nil {
+		return false
+	}
+	confirmed := false
+	confirm := huh.NewConfirm().Title("Allow npm/bun package setup scripts? They can execute arbitrary code.").Affirmative("Allow scripts").Negative("Keep scripts disabled").Value(&confirmed)
+	form := huh.NewForm(huh.NewGroup(confirm)).WithAccessible(accessibleMode()).WithTheme(wizardTheme(noColor())).WithInput(input).WithOutput(output)
+	return form.Run() == nil && confirmed
 }

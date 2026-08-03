@@ -121,7 +121,7 @@ Phase 0 — PRE-DISCOVERY + DISCOVERY (mandatory before any planning)
    1. Resolve Skill Registry (see: opencode/skills/_shared/skill-resolver.md):
       a. neurox_recall(query: "skill-registry", namespace: "{project}") → full registry
        b. Fallback: read .skynex/skill-registry.md or CONVENTIONS.md from project root
-      c. If no registry: warn user, suggest /skills:scan
+      c. If no registry: warn user, suggest /skills-scan
 
   2. Match relevant skills by TWO dimensions:
      a. CODE CONTEXT — which files/modules will be affected?

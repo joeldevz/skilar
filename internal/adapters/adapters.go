@@ -3,9 +3,11 @@ package adapters
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/joeldevz/skynex/internal/assets"
@@ -13,22 +15,46 @@ import (
 	"github.com/joeldevz/skynex/internal/paths"
 )
 
+// InstallOptions contains process-boundary dependencies for an install.
+// Empty paths retain the normal user destinations.
+type InstallOptions struct {
+	ClaudeDir   string
+	OpencodeDir string
+	Input       io.Reader
+	Output      io.Writer
+}
+
 // InstallAll installs all packages in the request.
 func InstallAll(req *models.InstallRequest, cat *models.Catalog) ([]*models.InstallResult, error) {
+	return InstallAllWithReporter(req, cat, discardReporter())
+}
+
+// InstallAllWithReporter runs installation without writing to process stdout.
+func InstallAllWithReporter(req *models.InstallRequest, cat *models.Catalog, reporter Reporter) ([]*models.InstallResult, error) {
+	return InstallAllWithReporterAndOptions(req, cat, reporter, InstallOptions{})
+}
+
+func InstallAllWithReporterAndOptions(req *models.InstallRequest, cat *models.Catalog, reporter Reporter, options InstallOptions) ([]*models.InstallResult, error) {
 	var results []*models.InstallResult
+	if options.ClaudeDir == "" {
+		options.ClaudeDir = paths.ClaudeDir()
+	}
+	if options.OpencodeDir == "" {
+		options.OpencodeDir = paths.OpencodeDir()
+	}
 
 	for _, pkgID := range req.Packages {
 		pkg := cat.Packages[pkgID]
 		version := req.Versions[pkgID]
 
-		fmt.Printf("\n  Installing %s (%s)...\n", pkgID, version)
+		reporter.Detail("Installing %s (%s)...", pkgID, version)
 
 		var result *models.InstallResult
 		var err error
 
 		switch pkg.Adapter {
 		case "skills_repo":
-			result, err = installSkillsRepo(pkg, req, version)
+			result, err = installSkillsRepo(pkg, req, version, reporter, options)
 		default:
 			return nil, fmt.Errorf("unknown adapter: %s", pkg.Adapter)
 		}
@@ -42,20 +68,19 @@ func InstallAll(req *models.InstallRequest, cat *models.Catalog) ([]*models.Inst
 	return results, nil
 }
 
-func installSkillsRepo(pkg *models.PackageDefinition, req *models.InstallRequest, version string) (*models.InstallResult, error) {
+func installSkillsRepo(pkg *models.PackageDefinition, req *models.InstallRequest, version string, reporter Reporter, options InstallOptions) (*models.InstallResult, error) {
 	var checkoutDir string
 	var commit string
 
 	// Use embedded assets if available (self-contained binary) and version is "latest"
 	if assets.Available() && version == "latest" {
-		fmt.Println("    Using embedded assets (self-contained mode)...")
+		reporter.Detail("Using embedded assets (self-contained mode)...")
 		// Extract to temp dir
 		tmpDir, err := os.MkdirTemp("", "skynex-assets-*")
 		if err != nil {
 			return nil, fmt.Errorf("create temp dir: %w", err)
 		}
-		// Don't defer removal — adapters need the dir during install
-		// It will be cleaned by OS on next boot
+		defer os.RemoveAll(tmpDir)
 
 		// Extract claude-code assets
 		if claudeCodeFS, err := assets.ClaudeCodeFS(); err == nil {
@@ -72,41 +97,57 @@ func installSkillsRepo(pkg *models.PackageDefinition, req *models.InstallRequest
 				return nil, fmt.Errorf("extract opencode assets: %w", err)
 			}
 		}
+		if skillsFS, err := assets.OpencodeSkillsFS(); err == nil {
+			destSkills := filepath.Join(tmpDir, "opencode", "skills")
+			if err := assets.ExtractTo(skillsFS, destSkills); err != nil {
+				return nil, fmt.Errorf("extract opencode skills assets: %w", err)
+			}
+		}
 
 		checkoutDir = tmpDir
 		commit = "embedded"
 	} else {
-		// Clone or use workspace (fallback)
+		// Only an explicitly local workspace is allowed as a source. Remote Git
+		// refs cannot be authenticated with the pinned release signing key.
 		var err error
-		checkoutDir, commit, err = checkoutPackage(pkg, version)
+		checkoutDir, commit, err = checkoutPackage(pkg, version, reporter)
 		if err != nil {
 			return nil, err
 		}
 	}
+	if version != "workspace" {
+		defer os.RemoveAll(checkoutDir)
+	}
 
 	timestamp := time.Now().UTC().Format(time.RFC3339)
+	req.SkillsBundleCommit = commit
+	req.SkillsBundleVersion = version
 	targets := make(map[string]*models.TargetResult)
 
 	for _, target := range req.Targets {
 		var artifacts []string
 		switch target {
 		case "claude":
-			fmt.Println("    Installing Claude Code assets...")
-			if err := InstallClaude(checkoutDir, req); err != nil {
+			reporter.Detail("Installing Claude Code assets...")
+			if err := InstallClaudeWithReporter(checkoutDir, req, reporter); err != nil {
 				return nil, fmt.Errorf("install claude: %w", err)
 			}
 			artifacts = []string{
-				paths.ClaudeDir(),
-				filepath.Join(paths.ClaudeDir(), "agents"),
-				filepath.Join(paths.ClaudeDir(), "skills"),
-				filepath.Join(paths.ClaudeDir(), "CLAUDE.md"),
+				options.ClaudeDir,
+				filepath.Join(options.ClaudeDir, "agents"),
+				filepath.Join(options.ClaudeDir, "skills"),
+				filepath.Join(options.ClaudeDir, "CLAUDE.md"),
 			}
 		case "opencode":
-			fmt.Println("    Installing OpenCode config...")
-			if err := InstallOpencode(checkoutDir, req); err != nil {
+			reporter.Detail("Installing OpenCode config...")
+			if err := InstallOpencodeWithReporterAndOptions(checkoutDir, req, reporter, options); err != nil {
 				return nil, fmt.Errorf("install opencode: %w", err)
 			}
-			artifacts = []string{paths.OpencodeDir()}
+			artifactDir := options.OpencodeDir
+			if artifactDir == "" {
+				artifactDir = paths.OpencodeDir()
+			}
+			artifacts = []string{artifactDir}
 		}
 
 		targets[target] = &models.TargetResult{
@@ -130,7 +171,7 @@ func installSkillsRepo(pkg *models.PackageDefinition, req *models.InstallRequest
 	}, nil
 }
 
-func checkoutPackage(pkg *models.PackageDefinition, version string) (string, string, error) {
+func checkoutPackage(pkg *models.PackageDefinition, version string, _ Reporter) (checkoutDir, commit string, err error) {
 	if version == "workspace" {
 		// Use current directory
 		cwd, err := os.Getwd()
@@ -141,31 +182,39 @@ func checkoutPackage(pkg *models.PackageDefinition, version string) (string, str
 		return cwd, commit, nil
 	}
 
-	// Clone to temp dir
-	tmpDir, err := os.MkdirTemp("", "skynex-*")
-	if err != nil {
-		return "", "", err
-	}
+	return "", "", fmt.Errorf("remote package version %q is disabled: use embedded latest assets or --package-version %s=workspace from a local checkout; signed source manifests are required for remote refs", version, pkg.ID)
+}
 
-	fmt.Printf("    Cloning %s...\n", pkg.RepoURL)
-	cmd := exec.Command("git", "clone", "--depth", "1", pkg.RepoURL, tmpDir)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return "", "", fmt.Errorf("git clone failed: %w", err)
-	}
-
-	// If version is a specific tag, checkout
-	if version != "latest" {
-		checkoutCmd := exec.Command("git", "checkout", version)
-		checkoutCmd.Dir = tmpDir
-		if err := checkoutCmd.Run(); err != nil {
-			return "", "", fmt.Errorf("git checkout %s failed: %w", version, err)
+// parseLsRemoteCommit is retained for catalog tooling/tests; installation does
+// not invoke Git remote resolution because GitHub verification is not a release
+// signature and signed source manifests are not yet available.
+func parseLsRemoteCommit(output, ref string) string {
+	var fallback string
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || !validCommitSHA(fields[0]) {
+			continue
+		}
+		if fields[1] == ref+"^{}" {
+			return fields[0]
+		}
+		if fallback == "" {
+			fallback = fields[0]
 		}
 	}
+	return fallback
+}
 
-	commit := getCommit(tmpDir)
-	return tmpDir, commit, nil
+func validCommitSHA(value string) bool {
+	if len(value) != 40 {
+		return false
+	}
+	for _, char := range value {
+		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f') || (char >= 'A' && char <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 func getCommit(dir string) string {
@@ -189,7 +238,7 @@ func trimNewline(s string) string {
 func injectAdvisorModel(model string) {
 	configPath := filepath.Join(paths.OpencodeDir(), "opencode.json")
 
-	data, err := os.ReadFile(configPath)
+	data, err := readExistingFile(configPath)
 	if err != nil {
 		return // Silently skip if not installed
 	}

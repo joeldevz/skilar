@@ -36,10 +36,13 @@ func installOwnedTree(source, target string) error {
 		if err != nil {
 			return err
 		}
+		rel, _ := filepath.Rel(source, path)
+		if d.IsDir() && (rel == "skills" || rel == "node_modules") {
+			return filepath.SkipDir
+		}
 		if d.IsDir() {
 			return nil
 		}
-		rel, _ := filepath.Rel(source, path)
 		if rel == inventoryName {
 			return nil
 		}

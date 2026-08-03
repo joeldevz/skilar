@@ -12,14 +12,18 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Styles (shared across this file; titleStyle, dimStyle, etc. live in prompts.go)
+// Styles shared by the legacy profile form.
 // ---------------------------------------------------------------------------
 
 var (
-	errorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	warnStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	checkStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("82"))
-	keyStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Bold(true)
+	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
+	dimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	activeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("212")).Bold(true)
+	groupStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
+	errorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	warnStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	checkStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("82"))
+	keyStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Bold(true)
 )
 
 // shortModel strips the provider prefix: "anthropic/claude-haiku-4-5" → "claude-haiku-4-5"

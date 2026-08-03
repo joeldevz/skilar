@@ -4,7 +4,11 @@
   "title": "Skynex Configuration",
   "description": "User intent and defaults for skynex installations",
   "type": "object",
-  "required": ["version", "defaults", "packages"],
+  "required": [
+    "version",
+    "defaults",
+    "packages"
+  ],
   "properties": {
     "version": {
       "description": "Schema version",
@@ -13,7 +17,10 @@
     "defaults": {
       "type": "object",
       "description": "Default settings for interactive mode",
-      "required": ["interactive", "targets"],
+      "required": [
+        "interactive",
+        "targets"
+      ],
       "properties": {
         "interactive": {
           "type": "boolean",
@@ -23,7 +30,10 @@
           "type": "array",
           "description": "Default target environments",
           "items": {
-            "enum": ["claude", "opencode"]
+            "enum": [
+              "claude",
+              "opencode"
+            ]
           },
           "uniqueItems": true
         }
@@ -34,7 +44,10 @@
       "description": "Per-package configuration",
       "additionalProperties": {
         "type": "object",
-        "required": ["version", "targets"],
+        "required": [
+          "version",
+          "targets"
+        ],
         "properties": {
           "version": {
             "type": "string",
@@ -44,33 +57,13 @@
             "type": "array",
             "description": "Target environments for this package",
             "items": {
-              "enum": ["claude", "opencode"]
+              "enum": [
+                "claude",
+                "opencode"
+              ]
             },
             "uniqueItems": true
           }
-        }
-      }
-    },
-    "advisor": {
-      "type": "object",
-      "description": "Advisor strategy configuration — optional strategic escalation to a larger model",
-      "properties": {
-        "enabled": {
-          "type": "boolean",
-          "description": "Whether the advisor tool is available to worker agents",
-          "default": false
-        },
-        "model": {
-          "type": "string",
-          "description": "Model to use for the advisor agent (e.g., anthropic/claude-opus-4-6, openai/gpt-4o)",
-          "default": "anthropic/claude-opus-4-6"
-        },
-        "maxUses": {
-          "type": "integer",
-          "description": "Maximum advisor calls per session",
-          "default": 3,
-          "minimum": 1,
-          "maximum": 10
         }
       }
     }

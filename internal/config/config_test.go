@@ -37,8 +37,8 @@ func TestSaveConfigHardensAndPreservesState(t *testing.T) {
 	if _, ok := cfg["external"]; !ok {
 		t.Fatal("unknown top-level field was not preserved")
 	}
-	if _, ok := cfg["advisor"]; !ok {
-		t.Fatal("existing advisor config was not preserved")
+	if _, ok := cfg["advisor"]; ok {
+		t.Fatal("legacy advisor config was not migrated away")
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {

@@ -73,3 +73,10 @@ func boolString(value bool) string {
 	}
 	return "false"
 }
+
+func TestAdvisorModelFlagIsNotPublicCLIState(t *testing.T) {
+	args := parseArgsFrom([]string{"install", "--advisor-model", "legacy/model"})
+	if args.ParseError == "" {
+		t.Fatal("retired --advisor-model flag was silently accepted")
+	}
+}

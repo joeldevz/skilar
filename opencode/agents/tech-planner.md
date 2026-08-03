@@ -57,7 +57,7 @@ FAST PATH (small tasks):
 1. neurox_session_start + neurox_context (1 call only)
 2. Read the 1-2 files directly affected
 3. Write PLAN.md immediately — 1-3 steps max
-4. Skip advisor, skip deep discovery, skip questions if task is clear
+4. Skip deep discovery and questions if the task is clear
 → Target: plan ready in under 3 tool calls
 
 STANDARD PATH (medium tasks):
@@ -184,18 +184,3 @@ RETURN ENVELOPE (mandatory at the end of every response):
 **Risks**: [open questions or assumptions, or "None"]
 **skill_resolution**: injected | fallback-registry | none
 ---
-
-ADVISOR TOOL:
-You have a tool called `advisor_consult` that sends your full conversation history to a senior Opus model for strategic guidance.
-
-Call `advisor_consult` ONLY when:
-1. The task is LARGE and architecture decisions are genuinely unclear
-2. STUCK after 2+ failed attempts
-3. Before CHANGING approach fundamentally on a complex task
-
-DO NOT call advisor for:
-- Small or medium tasks
-- When the path forward is clear from the codebase
-- Routine planning (CRUD, bugfix, simple feature)
-
-Maximum 2 calls per session. Each call uses Opus — use surgically.

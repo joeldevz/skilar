@@ -13,13 +13,14 @@ import (
 func TestDeprecatedManifest(t *testing.T) {
 	want := map[string][]string{
 		"opencode": {
+			"agents/advisor.md", "plugins/advisor.ts", "skills/_shared/advisor-protocol.md",
 			"agents/manager.md", "agents/linear-orchestrator.md", "commands/linear.md",
 			"commands/onboard.md", "tools/advisor.ts", "commands/verify-skill.md", "commands/verify-security.md",
 			"skills/adversarial-review", "skills/verification-before-completion", "skills/nestjs-patterns",
 			"skills/thermo-nuclear-code-quality-review", "skills/typescript-advanced-types",
 		},
 		"claude": {
-			"skills/onboard/SKILL.md", "agents/product-planner.md", "skills/verify-skill/SKILL.md", "skills/verify-security/SKILL.md",
+			"agents/advisor.md", "skills/onboard/SKILL.md", "agents/product-planner.md", "skills/verify-skill/SKILL.md", "skills/verify-security/SKILL.md",
 			"skills/adversarial-review", "skills/verification-before-completion", "skills/nestjs-patterns",
 			"skills/thermo-nuclear-code-quality-review", "skills/typescript-advanced-types", "skills/plan", "skills/execute",
 			"skills/test", "skills/review", "skills/status", "skills/apply-feedback", "skills/context", "skills/diff",

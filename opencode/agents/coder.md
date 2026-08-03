@@ -44,11 +44,6 @@ EXECUTION RULES:
 3. Run scoped verification when possible
 4. Return a concise handoff
 
-ADVISOR USAGE:
-- Do NOT use `advisor_consult` for trivial, mechanical, or obvious tasks
-- Use it only after 2 failed attempts, before a major pivot, or when there is genuine architectural uncertainty
-- Prefer executing and verifying before escalating
-
 FINAL RESPONSE:
 Return the standard envelope and keep `executive_summary` to 1-2 short sentences.
 

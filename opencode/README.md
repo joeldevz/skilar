@@ -150,7 +150,7 @@ Reglas de Conventional Commits y estructura de PR.
 - `triage` — triage issues through a state-machine of roles (bug/enhancement + states)
 
 Compartidas en `_shared/`:
-- `advisor-protocol.md`, `neurox-protocol.md`, `return-envelope.md`, `skill-resolver.md`, `smart-zone-budget.md`
+- `neurox-protocol.md`, `return-envelope.md`, `skill-resolver.md`, `smart-zone-budget.md`
 
 ## Regla mas importante
 

@@ -19,7 +19,6 @@ type InstallRequest struct {
 	Versions          map[string]string
 	Interactive       bool
 	StateDir          string
-	Advisor           *AdvisorConfig
 	CleanupDeprecated bool
 	// TrustSetupScripts is an explicit opt-in for package lifecycle scripts.
 	TrustSetupScripts bool
@@ -27,13 +26,6 @@ type InstallRequest struct {
 	SkillsDecisions     map[string]string
 	SkillsBundleVersion string
 	SkillsBundleCommit  string
-}
-
-// AdvisorConfig holds the advisor strategy configuration.
-type AdvisorConfig struct {
-	Enabled bool   `json:"enabled"`
-	Model   string `json:"model"`
-	MaxUses int    `json:"maxUses"`
 }
 
 // ResolvedVersion holds version resolution results.
@@ -77,12 +69,4 @@ type ValidationIssue struct {
 type Catalog struct {
 	Version  int                           `json:"version"`
 	Packages map[string]*PackageDefinition `json:"packages"`
-}
-
-// AdvisorModel is a model option for the advisor picker.
-type AdvisorModel struct {
-	ID          string `json:"id"`
-	DisplayName string `json:"displayName"`
-	Provider    string `json:"provider"`
-	Description string `json:"description"`
 }

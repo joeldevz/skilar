@@ -252,7 +252,6 @@ type cliArgs struct {
 	Help              bool
 	ListPackages      bool
 	ListVersions      string
-	AdvisorModel      string
 	ShowVersion       bool
 	Doctor            bool
 	Install           bool
@@ -449,10 +448,6 @@ func parseArgsFrom(osArgs []string) *cliArgs {
 			if v, ok := value(&i, "--state-dir"); ok {
 				args.StateDir = v
 			}
-		case "--advisor-model":
-			if v, ok := value(&i, "--advisor-model"); ok {
-				args.AdvisorModel = v
-			}
 		case "--cleanup-deprecated":
 			args.CleanupDeprecated = true
 		case "--dry-run":
@@ -470,6 +465,10 @@ func parseArgsFrom(osArgs []string) *cliArgs {
 			}
 		case "status":
 			args.Status = true
+		default:
+			if isFlag(osArgs[i]) && args.ParseError == "" {
+				args.ParseError = fmt.Sprintf("unknown option: %s", osArgs[i])
+			}
 		}
 	}
 	return args
@@ -539,15 +538,6 @@ func resolveNonInteractive(args *cliArgs, cat *models.Catalog, cfg map[string]in
 		Interactive:       false,
 		CleanupDeprecated: args.CleanupDeprecated,
 		TrustSetupScripts: args.TrustScripts,
-	}
-
-	// Advisor config from flag
-	if args.AdvisorModel != "" {
-		req.Advisor = &models.AdvisorConfig{
-			Enabled: true,
-			Model:   args.AdvisorModel,
-			MaxUses: 3,
-		}
 	}
 
 	return req, nil
@@ -1034,7 +1024,6 @@ Options:
    --package PACKAGE          Package to install (skills). Repeatable.
    --target TARGET            Target: claude, opencode, or both. Repeatable.
    --version PKG=VER          Version for a package (e.g., skills=latest). Repeatable.
-   --advisor-model MODEL      Advisor model (e.g., anthropic/claude-opus-4-6).
     --cleanup-deprecated       Remove deprecated skynex-managed files (interactive install: prompts; update: flag only).
     --dry-run                  Print the deterministic install plan and run read-only preflight.
    --verbose                 Show detailed install progress.

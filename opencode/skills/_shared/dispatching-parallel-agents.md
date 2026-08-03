@@ -99,4 +99,3 @@ Each parallel subagent has its own 100K cap. The orchestrator's job is to:
 
 - obra/Superpowers — RELEASE-NOTES on subagent context isolation
 - Matt Pocock — smart zone awareness + DAG canban patterns
-- Anthropic — Advisor Strategy (parallel dispatch with synthesis)

@@ -45,16 +45,6 @@ func ConfirmBackupPrune(input io.Reader, output io.Writer, count int) bool {
 	return form.Run() == nil && confirmed
 }
 
-// AdvisorModels is retained for callers that consume the curated advisor catalog.
-var AdvisorModels = []models.AdvisorModel{
-	{ID: "anthropic/claude-opus-4-6", DisplayName: "Claude Opus 4.6", Provider: "Anthropic", Description: "Most capable — best for complex strategic decisions"},
-	{ID: "anthropic/claude-sonnet-4-6", DisplayName: "Claude Sonnet 4.6", Provider: "Anthropic", Description: "Good balance of capability and cost"},
-	{ID: "openai/gpt-4o", DisplayName: "GPT-4o", Provider: "OpenAI", Description: "Strong reasoning, multi-modal"},
-	{ID: "openai/o3", DisplayName: "o3", Provider: "OpenAI", Description: "Advanced reasoning model"},
-	{ID: "google/gemini-2.5-pro", DisplayName: "Gemini 2.5 Pro", Provider: "Google", Description: "Strong reasoning, large context window"},
-	{ID: "anthropic/claude-haiku-4-5", DisplayName: "Claude Haiku 4.5", Provider: "Anthropic", Description: "Fast and cheap — good for simple advice"},
-}
-
 // ResolveSkillDecisions presents only actionable modified entries. Unknown
 // entries are deliberately informational and can never be selected.
 func ResolveSkillDecisions(report skillsync.Report) (map[string]skillsync.Decision, error) {

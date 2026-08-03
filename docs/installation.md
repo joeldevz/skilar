@@ -70,7 +70,7 @@ modo `0600`.
 #### Para Claude Code
 
 1. Hace backup de `~/.claude/` si ya existe
-2. Renderiza los agentes (`orchestrator`, `advisor`, `coder`, `manager`, `tech-planner`, `product-planner`, `verifier`, `test-reviewer`, `security`, `skill-validator`, `linear-orchestrator`) en `~/.claude/agents/`
+2. Renderiza los agentes (`orchestrator`, `coder`, `tech-planner`, `product-planner`, `verifier`, `test-reviewer`, `security`, `skill-validator`) en `~/.claude/agents/`
 3. Convierte los 8 commands de OpenCode en skills de Claude Code en `~/.claude/skills/`
 4. Copia skills compartidas (`grill-me`, `prd`, `security`, `write-a-skill`, `diagnose`, `triage`) a `~/.claude/skills/`
 5. Copia templates a `~/.claude/templates/`
@@ -149,7 +149,7 @@ opencode
 ```bash
 # Verificar agentes
 ls ~/.claude/agents/
-# Deberia mostrar también: orchestrator.md  advisor.md  coder.md  manager.md  tech-planner.md  product-planner.md  verifier.md  test-reviewer.md  security.md  skill-validator.md  linear-orchestrator.md
+# Deberia mostrar también: orchestrator.md  coder.md  tech-planner.md  product-planner.md  verifier.md  test-reviewer.md  security.md  skill-validator.md
 
 # Verificar skills
 ls ~/.claude/skills/

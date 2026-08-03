@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -26,6 +28,18 @@ type workflowRunInput struct {
 	Acceptance, Checks, AllowedPaths  []string
 	Timeout                           time.Duration
 	Seal                              gitcandidate.ContextSeal
+	SliceConfigs                      map[string]sliceRunConfig
+}
+type sliceRunConfig struct{ Paths, Checks []string }
+type planFile struct {
+	Slices []planFileSlice `json:"slices"`
+}
+type planFileSlice struct {
+	ID, Title          string
+	AcceptanceCriteria []string `json:"acceptance_criteria"`
+	Dependencies       []string `json:"dependencies"`
+	Paths              []string `json:"paths"`
+	Checks             []string `json:"checks"`
 }
 
 func workflowStart(store *workflow.SQLiteStore, repo string, args []string, out io.Writer) error {
@@ -40,7 +54,28 @@ func workflowStart(store *workflow.SQLiteStore, repo string, args []string, out 
 	acceptance := flagValues(args, "--accept")
 	checks := flagValues(args, "--check")
 	paths := flagValues(args, "--path")
-	if len(acceptance) == 0 || len(checks) == 0 || len(paths) == 0 {
+	routeValue := workflow.RouteSimple
+	if value, exists := flagValue(args, "--route"); exists {
+		routeValue = workflow.Route(value)
+	}
+	var planned planFile
+	if routeValue == workflow.RoutePlanned {
+		file, exists := flagValue(args, "--plan-file")
+		if !exists {
+			return errors.New("planned start requires --plan-file")
+		}
+		raw, readErr := os.ReadFile(file)
+		if readErr != nil {
+			return readErr
+		}
+		if json.Unmarshal(raw, &planned) != nil || len(planned.Slices) == 0 {
+			return errors.New("invalid plan file")
+		}
+	} else if routeValue == workflow.RouteDiscovery {
+		if _, exists := flagValue(args, "--wayfinder-file"); !exists {
+			return errors.New("discovery start requires --wayfinder-file")
+		}
+	} else if len(acceptance) == 0 || len(checks) == 0 || len(paths) == 0 {
 		return errors.New("simple start requires explicit --accept, --check, and --path")
 	}
 	seal, err := gitcandidate.CaptureContext(repo)
@@ -64,14 +99,71 @@ func workflowStart(store *workflow.SQLiteStore, repo string, args []string, out 
 		override = &orchestration.RouteOverride{Route: workflow.Route(route), Actor: actor, Reason: reason, At: time.Now().UTC()}
 	}
 	engine := orchestration.NewEngine(store)
-	decision, err := engine.Begin(id, orchestration.RouteInput{Clear: true, EstimatedSlices: 1}, override)
+	estimated := 1
+	if routeValue == workflow.RoutePlanned {
+		estimated = len(planned.Slices)
+	}
+	decision, err := engine.Begin(id, orchestration.RouteInput{Clear: routeValue != workflow.RouteDiscovery, EstimatedSlices: estimated, BlockingUncertainty: func() []string {
+		if routeValue == workflow.RouteDiscovery {
+			return []string{"discovery required"}
+		}
+		return nil
+	}()}, override)
 	if err != nil {
 		return err
 	}
-	if decision.Route != workflow.RouteSimple {
-		return fmt.Errorf("route %s requires discovery/planning support not available in workflow start", decision.Route)
+	if decision.Route == workflow.RouteDiscovery {
+		file, _ := flagValue(args, "--wayfinder-file")
+		raw, e := os.ReadFile(file)
+		if e != nil {
+			return e
+		}
+		var graph orchestration.WayfinderGraph
+		if json.Unmarshal(raw, &graph) != nil {
+			return errors.New("invalid wayfinder file")
+		}
+		graph.WorkflowID = id
+		graph.Version = 2
+		if e = orchestration.ValidateWayfinder(graph); e != nil {
+			return e
+		}
+		encoded, _ := json.Marshal(graph)
+		if _, e = store.Database().Exec(`INSERT INTO wayfinder_graphs(workflow_id,version,graph) VALUES(?,?,?)`, id, graph.Version, encoded); e != nil {
+			return e
+		}
+		input := workflowRunInput{Request: request, Model: valueOrEmpty(args, "--model"), Agent: valueOrEmpty(args, "--agent"), Executable: valueOrEmpty(args, "--opencode"), Timeout: 10 * time.Minute, Seal: seal}
+		data, _ := json.Marshal(input)
+		_, e = store.Database().Exec(`INSERT INTO workflow_run_inputs(workflow_id,input) VALUES(?,?)`, id, data)
+		if e != nil {
+			return e
+		}
+		fmt.Fprintf(out, "%s\t%s\t%s\n", id, workflow.StateDiscovering, decision.Route)
+		return nil
 	}
-	graph := orchestration.ExecutionGraph{WorkflowID: id, Version: 1, Slices: []orchestration.Slice{{ID: "slice_main", Title: request, AcceptanceCriteria: acceptance}}}
+	graph := orchestration.ExecutionGraph{WorkflowID: id, Version: 1}
+	configs := map[string]sliceRunConfig{}
+	if decision.Route == workflow.RoutePlanned {
+		checks = nil
+		paths = nil
+		for _, s := range planned.Slices {
+			graph.Slices = append(graph.Slices, orchestration.Slice{ID: s.ID, Title: s.Title, AcceptanceCriteria: s.AcceptanceCriteria, Dependencies: s.Dependencies})
+			if len(s.Paths) == 0 || len(s.Checks) == 0 {
+				return errors.New("planned slices require paths and checks")
+			}
+			configs[s.ID] = sliceRunConfig{Paths: s.Paths, Checks: s.Checks}
+			checks = append(checks, s.Checks...)
+			paths = append(paths, s.Paths...)
+		}
+	} else {
+		graph.Slices = []orchestration.Slice{{ID: "slice_main", Title: request, AcceptanceCriteria: acceptance}}
+		configs["slice_main"] = sliceRunConfig{Paths: paths, Checks: checks}
+	}
+	if decision.Route == workflow.RoutePlanned {
+		acceptance = nil
+		for _, s := range planned.Slices {
+			acceptance = append(acceptance, s.AcceptanceCriteria...)
+		}
+	}
 	contract := orchestration.ExecutableContract{Destination: request, AcceptanceCriteria: acceptance}
 	if err = engine.Close(id, orchestration.WayfinderGraph{WorkflowID: id, Version: 1}, contract, graph); err != nil {
 		return err
@@ -83,7 +175,7 @@ func workflowStart(store *workflow.SQLiteStore, repo string, args []string, out 
 			return fmt.Errorf("invalid --timeout: %w", err)
 		}
 	}
-	input := workflowRunInput{Request: request, Acceptance: acceptance, Checks: checks, AllowedPaths: paths, Model: valueOrEmpty(args, "--model"), Agent: valueOrEmpty(args, "--agent"), Executable: valueOrEmpty(args, "--opencode"), Timeout: timeout, Seal: seal}
+	input := workflowRunInput{Request: request, Acceptance: acceptance, Checks: checks, AllowedPaths: paths, Model: valueOrEmpty(args, "--model"), Agent: valueOrEmpty(args, "--agent"), Executable: valueOrEmpty(args, "--opencode"), Timeout: timeout, Seal: seal, SliceConfigs: configs}
 	raw, _ := json.Marshal(input)
 	if _, err = store.Database().Exec(`INSERT INTO workflow_run_inputs(workflow_id,input) VALUES(?,?)`, id, raw); err != nil {
 		return err
@@ -156,7 +248,11 @@ func workflowRun(store *workflow.SQLiteStore, repo string, args []string, out io
 				if tokenErr != nil {
 					return tokenErr
 				}
-				attempt = execution.Attempt{ID: attemptID, WorkflowID: id, SliceID: ready.ID, WorktreeID: seal.WorktreeID, Owner: owner, FencingToken: token, BasisTree: candidate.TreeOID, AllowedPaths: input.AllowedPaths, OperationID: "mutation:" + attemptID}
+				allowed := input.AllowedPaths
+				if config, ok := input.SliceConfigs[ready.ID]; ok {
+					allowed = config.Paths
+				}
+				attempt = execution.Attempt{ID: attemptID, WorkflowID: id, SliceID: ready.ID, WorktreeID: seal.WorktreeID, Owner: owner, FencingToken: token, BasisTree: candidate.TreeOID, AllowedPaths: allowed, OperationID: "mutation:" + attemptID}
 				if err = scheduler.Start(attempt); err != nil {
 					return err
 				}
@@ -168,7 +264,13 @@ func workflowRun(store *workflow.SQLiteStore, repo string, args []string, out io
 				}
 			}
 			adapter := execution.OpenCodeAdapter{Store: store, Options: execution.OpenCodeOptions{Executable: input.Executable, Model: input.Model, Agent: input.Agent, Timeout: input.Timeout}}
-			result, err := adapter.Run(context.Background(), execution.OpenCodeRequest{InvocationID: "invoke:" + attempt.ID, Attempt: attempt, Seal: seal, Prompt: input.Request + "\nAcceptance: " + strings.Join(input.Acceptance, "; ")})
+			criteria := input.Acceptance
+			for _, slice := range graph.Slices {
+				if slice.ID == attempt.SliceID {
+					criteria = slice.AcceptanceCriteria
+				}
+			}
+			result, err := adapter.Run(context.Background(), execution.OpenCodeRequest{InvocationID: "invoke:" + attempt.ID, Attempt: attempt, Seal: seal, Prompt: input.Request + "\nAcceptance: " + strings.Join(criteria, "; ")})
 			if err != nil {
 				return err
 			}
@@ -178,6 +280,7 @@ func workflowRun(store *workflow.SQLiteStore, repo string, args []string, out io
 			if err = scheduler.Complete(id, attempt.SliceID); err != nil {
 				return err
 			}
+			_, _ = store.Database().Exec(`DELETE FROM leases WHERE resource=? AND owner=? AND fencing_token=?`, "worktree:"+seal.WorktreeID, attempt.Owner, attempt.FencingToken)
 		}
 	}
 	w, err = store.Get(id)
@@ -251,12 +354,21 @@ func workflowApprove(store *workflow.SQLiteStore, args []string, out io.Writer) 
 		return errors.New("approve requires --reason")
 	}
 	var raw []byte
-	if err := store.Database().QueryRow(`SELECT result FROM verification_runs WHERE workflow_id=?`, id).Scan(&raw); err != nil {
-		return err
-	}
-	var verified struct{ Record review.CandidateRecord }
-	if err := json.Unmarshal(raw, &verified); err != nil {
-		return err
+	var basis, policy string
+	if err := store.Database().QueryRow(`SELECT result FROM verification_runs WHERE workflow_id=?`, id).Scan(&raw); err == nil {
+		var verified struct{ Record review.CandidateRecord }
+		if err = json.Unmarshal(raw, &verified); err != nil {
+			return err
+		}
+		basis = verified.Record.TreeOID
+		policy = verified.Record.PolicyHash
+	} else {
+		if err = store.Database().QueryRow(`SELECT graph FROM wayfinder_graphs WHERE workflow_id=? ORDER BY version DESC LIMIT 1`, id).Scan(&raw); err != nil {
+			return err
+		}
+		sum := sha256.Sum256(raw)
+		basis = hex.EncodeToString(sum[:])
+		policy = "discovery:v1"
 	}
 	expires := time.Now().Add(time.Hour)
 	if value, exists := flagValue(args, "--expires"); exists {
@@ -266,7 +378,7 @@ func workflowApprove(store *workflow.SQLiteStore, args []string, out io.Writer) 
 		}
 		expires = time.Now().Add(duration)
 	}
-	artifact, err := approval.Issue(store.Database(), approval.Artifact{Actor: actor, AuthSource: "cli", WorkflowID: id, Action: action, BasisGraphOrCandidate: verified.Record.TreeOID, PolicyHash: verified.Record.PolicyHash, Rationale: reason, IssuedAt: time.Now(), ExpiresAt: expires})
+	artifact, err := approval.Issue(store.Database(), approval.Artifact{Actor: actor, AuthSource: "cli", WorkflowID: id, Action: action, BasisGraphOrCandidate: basis, PolicyHash: policy, Rationale: reason, IssuedAt: time.Now(), ExpiresAt: expires})
 	if err != nil {
 		return err
 	}
@@ -295,6 +407,132 @@ func workflowRevokeApproval(store *workflow.SQLiteStore, args []string, out io.W
 		return err
 	}
 	fmt.Fprintf(out, "%s\t%s\trevoked\n", id, action)
+	return nil
+}
+
+func latestWayfinder(store *workflow.SQLiteStore, id string) (orchestration.WayfinderGraph, []byte, error) {
+	var raw []byte
+	var g orchestration.WayfinderGraph
+	err := store.Database().QueryRow(`SELECT graph FROM wayfinder_graphs WHERE workflow_id=? ORDER BY version DESC LIMIT 1`, id).Scan(&raw)
+	if err == nil {
+		err = json.Unmarshal(raw, &g)
+	}
+	return g, raw, err
+}
+func workflowFrontier(store *workflow.SQLiteStore, args []string, out io.Writer) error {
+	id, ok := flagValue(args, "--id")
+	if !ok {
+		id, _ = requiredWorkflowID(args)
+	}
+	g, _, err := latestWayfinder(store, id)
+	if err != nil {
+		return err
+	}
+	node, err := g.Frontier()
+	if err != nil {
+		return err
+	}
+	if node == nil {
+		fmt.Fprintln(out, "no blocking frontier")
+		return nil
+	}
+	return writeJSON(out, node)
+}
+func workflowAnswer(store *workflow.SQLiteStore, args []string, out io.Writer) error {
+	id, _ := flagValue(args, "--id")
+	nodeID, _ := flagValue(args, "--node")
+	answer, _ := flagValue(args, "--answer")
+	actor, _ := flagValue(args, "--actor")
+	if id == "" || nodeID == "" || answer == "" || actor == "" {
+		return errors.New("answer requires --id --node --answer --actor")
+	}
+	g, raw, err := latestWayfinder(store, id)
+	if err != nil {
+		return err
+	}
+	found := false
+	for i := range g.Nodes {
+		if g.Nodes[i].ID != nodeID {
+			continue
+		}
+		found = true
+		if g.Nodes[i].Resolved {
+			return errors.New("node already resolved")
+		}
+		if g.Nodes[i].Type == orchestration.NodePrototype {
+			sum := sha256.Sum256(raw)
+			if _, err = approval.Require(store.Database(), id, "prototype:"+nodeID, hex.EncodeToString(sum[:]), "discovery:v1", time.Now()); err != nil {
+				return err
+			}
+			validation, _ := json.Marshal(approval.PrototypeValidation{ID: "prototype-validation:" + id + ":" + nodeID, WorkflowID: id, PrototypeID: nodeID, Validator: actor, Outcome: answer, EvidenceDigest: hex.EncodeToString(sum[:]), ValidatedAt: time.Now()})
+			if _, err = store.Database().Exec(`INSERT OR IGNORE INTO prototype_validations(id,workflow_id,artifact) VALUES(?,?,?)`, "prototype-validation:"+id+":"+nodeID, id, validation); err != nil {
+				return err
+			}
+		}
+		g.Nodes[i].Resolved = true
+		g.Nodes[i].Answer = answer
+		g.Nodes[i].Actor = actor
+	}
+	if !found {
+		return errors.New("unknown wayfinder node")
+	}
+	g.Version++
+	encoded, _ := json.Marshal(g)
+	if _, err = store.Database().Exec(`INSERT INTO wayfinder_graphs(workflow_id,version,graph) VALUES(?,?,?)`, id, g.Version, encoded); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "%s\t%s\tanswered\n", id, nodeID)
+	return nil
+}
+func workflowCloseDiscovery(store *workflow.SQLiteStore, args []string, out io.Writer) error {
+	id, _ := flagValue(args, "--id")
+	file, _ := flagValue(args, "--plan-file")
+	if id == "" || file == "" {
+		return errors.New("close-discovery requires --id --plan-file")
+	}
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		return err
+	}
+	var plan planFile
+	if json.Unmarshal(raw, &plan) != nil {
+		return errors.New("invalid plan file")
+	}
+	g, _, err := latestWayfinder(store, id)
+	if err != nil {
+		return err
+	}
+	graph := orchestration.ExecutionGraph{WorkflowID: id, Version: 1}
+	contract := orchestration.ExecutableContract{Destination: "discovery contract"}
+	configs := map[string]sliceRunConfig{}
+	var checks, paths []string
+	for _, s := range plan.Slices {
+		if len(s.Paths) == 0 || len(s.Checks) == 0 {
+			return errors.New("planned slices require paths and checks")
+		}
+		graph.Slices = append(graph.Slices, orchestration.Slice{ID: s.ID, Title: s.Title, AcceptanceCriteria: s.AcceptanceCriteria, Dependencies: s.Dependencies})
+		contract.AcceptanceCriteria = append(contract.AcceptanceCriteria, s.AcceptanceCriteria...)
+		configs[s.ID] = sliceRunConfig{Paths: s.Paths, Checks: s.Checks}
+		checks = append(checks, s.Checks...)
+		paths = append(paths, s.Paths...)
+	}
+	if err = orchestration.NewEngine(store).Close(id, g, contract, graph); err != nil {
+		return err
+	}
+	var inputRaw []byte
+	_ = store.Database().QueryRow(`SELECT input FROM workflow_run_inputs WHERE workflow_id=?`, id).Scan(&inputRaw)
+	var input workflowRunInput
+	_ = json.Unmarshal(inputRaw, &input)
+	input.SliceConfigs = configs
+	input.Checks = checks
+	input.AllowedPaths = paths
+	input.Acceptance = contract.AcceptanceCriteria
+	updated, _ := json.Marshal(input)
+	_, err = store.Database().Exec(`UPDATE workflow_run_inputs SET input=? WHERE workflow_id=?`, updated, id)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "%s\t%s\n", id, workflow.StateReady)
 	return nil
 }
 

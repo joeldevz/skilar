@@ -39,6 +39,8 @@ type WayfinderNode struct {
 	Blocking bool     `json:"blocking"`
 	Resolved bool     `json:"resolved"`
 	Unlocks  []string `json:"unlocks,omitempty"`
+	Answer   string   `json:"answer,omitempty"`
+	Actor    string   `json:"actor,omitempty"`
 }
 type Relation struct {
 	From, To string

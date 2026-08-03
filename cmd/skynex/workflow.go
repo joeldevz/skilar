@@ -55,6 +55,12 @@ func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
 		return workflowApprove(store, args[1:], out)
 	case "revoke-approval":
 		return workflowRevokeApproval(store, args[1:], out)
+	case "frontier":
+		return workflowFrontier(store, args[1:], out)
+	case "answer":
+		return workflowAnswer(store, args[1:], out)
+	case "close-discovery":
+		return workflowCloseDiscovery(store, args[1:], out)
 	case "status":
 		return workflowStatus(store, args[1:], out)
 	case "inspect":

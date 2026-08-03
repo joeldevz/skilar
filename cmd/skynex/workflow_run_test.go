@@ -411,3 +411,78 @@ func TestWorkflowAbortCancelsOpenCodeAndRejectsLateResult(t *testing.T) {
 		t.Fatal("late result was not audited")
 	}
 }
+
+func TestWorkflowPlannedMultiSliceDependencies(t *testing.T) {
+	repo, store := cliWorkflowRepo(t)
+	defer store.Close()
+	planPath := filepath.Join(t.TempDir(), "plan.json")
+	plan := `{"slices":[{"id":"slice_one","title":"one","acceptance_criteria":["test \"$(cat a.txt)\" = one"],"paths":["a.txt"],"checks":["true"]},{"id":"slice_two","title":"two","acceptance_criteria":["test \"$(cat b.txt)\" = two"],"dependencies":["slice_one"],"paths":["b.txt"],"checks":["true"]}]}`
+	_ = os.WriteFile(planPath, []byte(plan), 0o600)
+	counter := filepath.Join(t.TempDir(), "count")
+	fake := filepath.Join(t.TempDir(), "opencode")
+	script := `#!/bin/sh
+tree=$(git write-tree)
+if [ ! -f '` + counter + `' ]; then touch '` + counter + `'; node=slice_one; path=a.txt; data=b25lCg==; else test "$(cat a.txt)" = one || exit 9; node=slice_two; path=b.txt; data=dHdvCg==; fi
+printf '{"envelope":{"WorkflowID":"wf","NodeID":"%s","AttemptID":"wf:%s","BaseCandidateOID":"%s","Status":"completed"},"patch":{"Operations":[{"Path":"%s","Data":"%s","Mode":384}]}}' "$node" "$node" "$tree" "$path" "$data" > "$SKYNEX_RESULT_FILE"`
+	_ = os.WriteFile(fake, []byte(script), 0o700)
+	args := []string{"--id", "wf", "--request", "planned", "--route", "planned", "--override-actor", "tester", "--override-reason", "explicit plan", "--plan-file", planPath, "--opencode", fake, "--timeout", "2s"}
+	if err := workflowStart(store, repo, args, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := workflowRun(store, repo, []string{"wf"}, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if raw, _ := os.ReadFile(filepath.Join(repo, "b.txt")); string(raw) != "two\n" {
+		t.Fatalf("b=%q", raw)
+	}
+}
+
+func TestWorkflowDiscoveryFrontierPrototypeAndClose(t *testing.T) {
+	repo, store := cliWorkflowRepo(t)
+	defer store.Close()
+	way := filepath.Join(t.TempDir(), "way.json")
+	raw := `{"nodes":[{"id":"wfnode_question","type":"grill","question":"Choose?","blocking":true,"unlocks":["a","b"]},{"id":"wfnode_proto","type":"prototype","question":"Validate?","blocking":true}]}`
+	_ = os.WriteFile(way, []byte(raw), 0o600)
+	args := []string{"--id", "wf", "--request", "discover", "--route", "discovery", "--override-actor", "tester", "--override-reason", "uncertain", "--wayfinder-file", way}
+	if err := workflowStart(store, repo, args, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := workflowFrontier(store, []string{"--id", "wf"}, &out); err != nil || !strings.Contains(out.String(), "wfnode_question") {
+		t.Fatalf("frontier=%q err=%v", out.String(), err)
+	}
+	if err := workflowAnswer(store, []string{"--id", "wf", "--node", "wfnode_question", "--answer", "yes", "--actor", "tester"}, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := workflowApprove(store, []string{"--id", "wf", "--action", "prototype:wfnode_proto", "--actor", "tester", "--reason", "validate"}, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := workflowAnswer(store, []string{"--id", "wf", "--node", "wfnode_proto", "--answer", "valid", "--actor", "tester"}, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	var validations int
+	_ = store.Database().QueryRow(`SELECT COUNT(*) FROM prototype_validations WHERE workflow_id='wf'`).Scan(&validations)
+	if validations != 1 {
+		t.Fatalf("validations=%d", validations)
+	}
+	plan := filepath.Join(t.TempDir(), "plan.json")
+	_ = os.WriteFile(plan, []byte(`{"slices":[{"id":"slice_after","title":"after","acceptance_criteria":["true"],"paths":["a.txt"],"checks":["true"]}]}`), 0o600)
+	if err := workflowCloseDiscovery(store, []string{"--id", "wf", "--plan-file", plan}, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	w, _ := store.Get("wf")
+	if w.State != workflow.StateReady {
+		t.Fatalf("state=%s", w.State)
+	}
+}
+
+func TestWorkflowPlannedRejectsInvalidDAG(t *testing.T) {
+	repo, store := cliWorkflowRepo(t)
+	defer store.Close()
+	plan := filepath.Join(t.TempDir(), "bad.json")
+	_ = os.WriteFile(plan, []byte(`{"slices":[{"id":"slice_a","title":"a","acceptance_criteria":["true"],"dependencies":["slice_b"],"paths":["a.txt"],"checks":["true"]},{"id":"slice_b","title":"b","acceptance_criteria":["true"],"dependencies":["slice_a"],"paths":["b.txt"],"checks":["true"]}]}`), 0o600)
+	err := workflowStart(store, repo, []string{"--id", "wf", "--request", "bad", "--route", "planned", "--override-actor", "t", "--override-reason", "test", "--plan-file", plan}, &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("cycle accepted")
+	}
+}

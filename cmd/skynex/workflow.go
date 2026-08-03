@@ -62,7 +62,13 @@ func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
 			return fmt.Errorf("workflow database not found at %s", path)
 		}
 	}
-	store, err := workflow.OpenRepositorySQLite(cwd)
+	readOnly := args[0] == "status" || args[0] == "inspect" || args[0] == "receipt" || args[0] == "export"
+	var store *workflow.SQLiteStore
+	if readOnly {
+		store, err = workflow.OpenRepositorySQLiteReadOnly(cwd)
+	} else {
+		store, err = workflow.OpenRepositorySQLite(cwd)
+	}
 	if err != nil {
 		return err
 	}

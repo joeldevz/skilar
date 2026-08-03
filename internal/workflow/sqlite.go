@@ -48,6 +48,65 @@ func OpenRepositorySQLite(repoDir string) (*SQLiteStore, error) {
 	return OpenSQLite(path)
 }
 
+// OpenSQLiteReadOnly opens an existing, current workflow database without
+// migrating it, changing permissions, or creating SQLite journal sidecars.
+func OpenSQLiteReadOnly(path string) (*SQLiteStore, error) {
+	if err := validateExistingDatabasePath(path); err != nil {
+		return nil, err
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := os.Lstat(path + suffix); err == nil {
+			return nil, fmt.Errorf("workflow database has active SQLite sidecar %q", path+suffix)
+		} else if !os.IsNotExist(err) {
+			return nil, err
+		}
+	}
+	// immutable=1 is safe after the sidecar check above and prevents SQLite's
+	// read-only WAL implementation from creating -wal/-shm bookkeeping files.
+	dsn := "file:" + filepath.ToSlash(path) + "?mode=ro&immutable=1&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=query_only(1)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	s := &SQLiteStore{db: db, path: path, now: time.Now}
+	var version int
+	if err = db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if version != 11 {
+		db.Close()
+		return nil, fmt.Errorf("workflow database schema %d requires writable migration to schema 11", version)
+	}
+	return s, nil
+}
+
+func OpenRepositorySQLiteReadOnly(repoDir string) (*SQLiteStore, error) {
+	path, err := CanonicalDatabasePath(repoDir)
+	if err != nil {
+		return nil, err
+	}
+	return OpenSQLiteReadOnly(path)
+}
+
+func validateExistingDatabasePath(path string) error {
+	if err := rejectSymlinkComponents(filepath.Dir(path)); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || fileHasMultipleLinks(info) {
+		return fmt.Errorf("unsafe workflow database %q", path)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("workflow database permissions are too broad: %o", info.Mode().Perm())
+	}
+	return nil
+}
+
 func (s *SQLiteStore) Close() error      { return s.db.Close() }
 func (s *SQLiteStore) Path() string      { return s.path }
 func (s *SQLiteStore) Database() *sql.DB { return s.db }

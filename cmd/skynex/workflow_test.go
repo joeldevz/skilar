@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/joeldevz/skynex/internal/review"
 	"github.com/joeldevz/skynex/internal/workflow"
@@ -137,6 +138,55 @@ func TestWorkflowStatusAbsentDatabaseIsReadOnly(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(repo, ".git", "skynex")); !os.IsNotExist(err) {
 			t.Fatalf("%s created database directory", command)
 		}
+	}
+}
+
+func TestWorkflowDiagnosticCommandsDoNotTouchExistingDatabaseDirectory(t *testing.T) {
+	repo := workflowRepo(t)
+	createCLIWorkflow(t, repo, "wf-read-only", workflow.StateDiscovering)
+	databasePath, err := workflow.CanonicalDatabasePath(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	databaseDir := filepath.Dir(databasePath)
+	fixedTime := time.Unix(1_700_000_000, 0)
+
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "status", args: []string{"status"}},
+		{name: "inspect", args: []string{"inspect", "wf-read-only"}},
+		{name: "receipt", args: []string{"receipt", "wf-read-only"}},
+		{name: "export", args: []string{"export", "wf-read-only", "--out", filepath.Join(repo, "export.json")}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for _, suffix := range []string{"-wal", "-shm"} {
+				if err := os.Remove(databasePath + suffix); err != nil && !os.IsNotExist(err) {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Chtimes(databaseDir, fixedTime, fixedTime); err != nil {
+				t.Fatal(err)
+			}
+			err := runWorkflowCLI(test.args, repo, &bytes.Buffer{})
+			if test.name != "receipt" && err != nil {
+				t.Fatal(err)
+			}
+			for _, suffix := range []string{"-wal", "-shm"} {
+				if _, statErr := os.Stat(databasePath + suffix); !os.IsNotExist(statErr) {
+					t.Fatalf("diagnostic command left SQLite sidecar %s: %v", suffix, statErr)
+				}
+			}
+			info, statErr := os.Stat(databaseDir)
+			if statErr != nil {
+				t.Fatal(statErr)
+			}
+			if !info.ModTime().Equal(fixedTime) {
+				t.Fatalf("diagnostic command changed database directory mtime: got %s want %s", info.ModTime(), fixedTime)
+			}
+		})
 	}
 }
 

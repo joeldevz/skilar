@@ -57,10 +57,10 @@ func (s *SQLiteStore) migrate() error {
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		return err
 	}
-	if version > 5 {
-		return fmt.Errorf("workflow database schema %d is newer than supported schema 5", version)
+	if version > 6 {
+		return fmt.Errorf("workflow database schema %d is newer than supported schema 6", version)
 	}
-	if version == 5 {
+	if version == 6 {
 		return nil
 	}
 	if version == 0 {
@@ -133,7 +133,8 @@ COMMIT;`
 			return err
 		}
 	}
-	const schemaV5 = `BEGIN IMMEDIATE;
+	if version < 5 {
+		const schemaV5 = `BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS execution_slice_state (workflow_id TEXT NOT NULL, slice_id TEXT NOT NULL, status TEXT NOT NULL, PRIMARY KEY(workflow_id,slice_id));
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_mutation ON execution_slice_state(workflow_id) WHERE status='active';
 CREATE TABLE IF NOT EXISTS mutation_attempts (attempt_id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, slice_id TEXT NOT NULL, worktree_id TEXT NOT NULL, owner TEXT NOT NULL, fencing_token TEXT NOT NULL, basis_tree TEXT NOT NULL, allowed_paths BLOB NOT NULL, operation_id TEXT NOT NULL UNIQUE, live INTEGER NOT NULL);
@@ -141,7 +142,16 @@ CREATE TABLE IF NOT EXISTS mutation_operations (operation_id TEXT PRIMARY KEY, w
 CREATE TABLE IF NOT EXISTS stale_result_audit (sequence INTEGER PRIMARY KEY AUTOINCREMENT, attempt_id TEXT NOT NULL, reason TEXT NOT NULL, envelope BLOB NOT NULL, occurred_at TEXT NOT NULL);
 PRAGMA user_version=5;
 COMMIT;`
-	_, err := s.db.Exec(schemaV5)
+		if _, err := s.db.Exec(schemaV5); err != nil {
+			return err
+		}
+	}
+	const schemaV6 = `BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS verification_evidence (id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, candidate_tree TEXT NOT NULL, kind TEXT NOT NULL, evidence BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS verification_runs (workflow_id TEXT PRIMARY KEY, candidate_tree TEXT NOT NULL, result BLOB NOT NULL);
+PRAGMA user_version=6;
+COMMIT;`
+	_, err := s.db.Exec(schemaV6)
 	return err
 }
 

@@ -14,6 +14,18 @@ import (
 	"github.com/joeldevz/skynex/internal/workflow"
 )
 
+func TestWorkflowHelpDoesNotRequireGitRepository(t *testing.T) {
+	var out bytes.Buffer
+	if err := runWorkflowCLI([]string{"--help"}, t.TempDir(), &out); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range []string{"start", "run", "review", "deliver", "status", "inspect", "receipt", "approve", "abort"} {
+		if !strings.Contains(out.String(), command) {
+			t.Fatalf("help missing %q:\n%s", command, out.String())
+		}
+	}
+}
+
 func workflowRepo(t *testing.T) string {
 	t.Helper()
 	repo := filepath.Join(t.TempDir(), "repo")

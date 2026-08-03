@@ -27,7 +27,11 @@ type workflowInspection struct {
 
 func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: skynex workflow start|run|review|deliver|status|inspect|resume|abort|export|receipt")
+		return errors.New("usage: skynex workflow <command>; run `skynex workflow --help` for details")
+	}
+	if args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
+		printWorkflowUsage(out)
+		return nil
 	}
 	if cwd == "" {
 		var err error
@@ -80,6 +84,29 @@ func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
 	default:
 		return fmt.Errorf("unknown workflow command %q", args[0])
 	}
+}
+
+func printWorkflowUsage(out io.Writer) {
+	fmt.Fprintln(out, `Usage: skynex workflow <command> [options]
+
+Commands:
+  start               Create a simple, planned, or discovery workflow
+  run                 Execute ready slices with OpenCode and verify the result
+  review              Review a frozen candidate and issue its receipt
+  deliver             Commit the exact receipt-authorized candidate tree
+  status              List workflows or show one workflow
+  inspect             Show workflow events, inputs, approvals, and authority
+  receipt             Show the current or a historical receipt
+  approve             Approve an exact high-risk action basis
+  revoke-approval     Revoke a current approval
+  abort               Stop work and revoke attempts, leases, and approvals
+  resume              Reconcile and resume a blocked workflow
+  export              Export a workflow summary or receipt
+  frontier            Show the next blocking discovery question
+  answer              Record an attributed discovery answer
+  close-discovery     Close discovery with an explicit execution plan
+
+Run skynex workflow <command> --help for command-specific options.`)
 }
 
 func workflowStatus(store *workflow.SQLiteStore, args []string, out io.Writer) error {

@@ -9,12 +9,12 @@ Use the Go binary instead:
 
 - **macOS/Linux**: 
   ```bash
-  curl -fsSL https://raw.githubusercontent.com/joeldevz/skills/main/scripts/install.sh | bash
+  Descarga el script de un release etiquetado, verifica su firma y ejecútalo localmente.
   ```
 
 - **Windows (PowerShell)**:
   ```powershell
-  irm https://raw.githubusercontent.com/joeldevz/skills/main/scripts/install.ps1 | iex
+  Descarga install.ps1 de un release etiquetado, verifica su firma y ejecútalo localmente.
   ```
 
 - **Homebrew** (when available):
@@ -36,4 +36,4 @@ The new Go binary:
 
 The old Python code in this directory is provided for reference:
 - `clasing_skill/` — Python package (deprecated)
-- `../../../scripts/install_claude_assets.py` — Claude assets installer (superseded by `adapters/claude.go`)
+- Claude assets are installed by the Go adapter (`internal/adapters/claude.go`).

@@ -134,17 +134,20 @@ class SkillsRepoInstaller:
         )
 
     def _install_claude_windows(self, checkout_dir: Path) -> None:
-        """Run the Claude asset installer natively on Windows."""
-        script = checkout_dir / "scripts" / "install_claude_assets.py"
-        if not script.exists():
-            raise FileNotFoundError(f"Claude asset installer not found at {script}")
-        subprocess.run(
-            [sys.executable, str(script)],
-            cwd=checkout_dir,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        """Materialize the source assets without executing repository code."""
+        source_dir = checkout_dir / "opencode" / "skills"
+        claude_source = checkout_dir / "claude-code"
+        target_dir = Path.home() / ".claude"
+        if not source_dir.exists() or not claude_source.exists():
+            raise FileNotFoundError("Claude source assets are missing")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_skills = target_dir / "skills"
+        if target_skills.exists():
+            shutil.rmtree(target_skills)
+        shutil.copytree(source_dir, target_skills)
+        claude_md = claude_source / "CLAUDE.md"
+        if claude_md.exists():
+            shutil.copy2(claude_md, target_dir / "CLAUDE.md")
 
     def _install_opencode(self, setup_script: Path) -> None:
         """Run setup.sh --opencode.

@@ -30,6 +30,9 @@ archives:
         formats:
           - zip
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    extra_files:
+      - glob: scripts/install.sh
+      - glob: scripts/install.ps1
 
 checksum:
   name_template: "checksums.txt"
@@ -56,12 +59,18 @@ release:
     ### Install
     **macOS / Linux:**
     ```bash
-    curl -fsSL https://raw.githubusercontent.com/joeldevz/skynex/main/scripts/install.sh | bash
+    Download install.sh and install.sh.sig from this tagged release, verify the
+    detached signature with release/trust/skynex-release-signing-key.pub, then
+    run the local script.
     ```
     **Windows (PowerShell):**
     ```powershell
-    irm https://raw.githubusercontent.com/joeldevz/skynex/main/scripts/install.ps1 | iex
+    Download install.ps1 and install.ps1.sig from this tagged release, verify
+    the detached signature with the release public key, then run the local file.
     ```
+  extra_files:
+    - glob: scripts/install.sh
+    - glob: scripts/install.ps1
 
 brews:
   - repository:

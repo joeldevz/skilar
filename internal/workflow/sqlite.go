@@ -48,21 +48,23 @@ func OpenRepositorySQLite(repoDir string) (*SQLiteStore, error) {
 	return OpenSQLite(path)
 }
 
-func (s *SQLiteStore) Close() error { return s.db.Close() }
-func (s *SQLiteStore) Path() string { return s.path }
+func (s *SQLiteStore) Close() error      { return s.db.Close() }
+func (s *SQLiteStore) Path() string      { return s.path }
+func (s *SQLiteStore) Database() *sql.DB { return s.db }
 
 func (s *SQLiteStore) migrate() error {
 	var version int
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		return err
 	}
-	if version > 1 {
-		return fmt.Errorf("workflow database schema %d is newer than supported schema 1", version)
+	if version > 2 {
+		return fmt.Errorf("workflow database schema %d is newer than supported schema 2", version)
 	}
-	if version == 1 {
+	if version == 2 {
 		return nil
 	}
-	const schema = `
+	if version == 0 {
+		const schemaV1 = `
 PRAGMA journal_mode=WAL;
 PRAGMA busy_timeout=5000;
 PRAGMA foreign_keys=ON;
@@ -91,7 +93,21 @@ CREATE TABLE IF NOT EXISTS leases (
  resource TEXT PRIMARY KEY, owner TEXT NOT NULL, fencing_token TEXT NOT NULL, expires_at INTEGER NOT NULL
 );
 PRAGMA user_version=1;`
-	_, err := s.db.Exec(schema)
+		if _, err := s.db.Exec(schemaV1); err != nil {
+			return err
+		}
+	}
+	const schemaV2 = `BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS review_candidates (id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, tree_oid TEXT NOT NULL, policy_hash TEXT NOT NULL, record BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS semantic_assessments (candidate_record_id TEXT PRIMARY KEY REFERENCES review_candidates(id), assessment BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS review_evidence (id TEXT PRIMARY KEY, candidate_record_id TEXT NOT NULL REFERENCES review_candidates(id), evidence BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS receipts (id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, candidate_record_id TEXT NOT NULL UNIQUE REFERENCES review_candidates(id), receipt BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS receipt_authority (workflow_id TEXT PRIMARY KEY, receipt_id TEXT NOT NULL REFERENCES receipts(id));
+CREATE TABLE IF NOT EXISTS receipt_invalidations (sequence INTEGER PRIMARY KEY AUTOINCREMENT, workflow_id TEXT NOT NULL, candidate_record_id TEXT NOT NULL, reason TEXT NOT NULL, occurred_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS delivery_intents (workflow_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, intent BLOB NOT NULL, PRIMARY KEY(workflow_id,idempotency_key));
+PRAGMA user_version=2;
+COMMIT;`
+	_, err := s.db.Exec(schemaV2)
 	return err
 }
 

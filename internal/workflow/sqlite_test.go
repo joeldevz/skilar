@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"database/sql"
 	"errors"
 	"os"
 	"os/exec"
@@ -198,6 +199,39 @@ func TestOpenSQLiteRejectsSymlinkAndHardlink(t *testing.T) {
 	}
 	if _, err := OpenSQLite(filepath.Join(realDir, "db")); err == nil {
 		t.Fatal("accepted hard-linked database")
+	}
+}
+
+func TestSQLiteMigratesExistingV1SchemaToV2(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state", "workflows.db")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = raw.Exec(`PRAGMA user_version=1`); err != nil {
+		t.Fatal(err)
+	}
+	if err = raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var version int
+	if err = store.Database().QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 2 {
+		t.Fatalf("version=%d err=%v", version, err)
+	}
+	var table string
+	if err = store.Database().QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='receipt_authority'`).Scan(&table); err != nil || table != "receipt_authority" {
+		t.Fatalf("table=%q err=%v", table, err)
 	}
 }
 

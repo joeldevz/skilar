@@ -20,6 +20,7 @@ type Receipt struct {
 	Lens              Lens
 	EvidenceIDs       []string
 	EvidenceSetDigest string
+	AssessmentDigest  string
 	IssuedAt          time.Time
 }
 type IssueRequest struct {
@@ -114,15 +115,20 @@ func (s *MemoryStore) Issue(req IssueRequest) (Receipt, error) {
 	}
 	raw, _ := json.Marshal(evidence)
 	evidenceDigest := digest(raw)
+	assessmentForDigest := a
+	assessmentForDigest.AssessedAt = time.Time{}
+	assessmentRaw, _ := json.Marshal(assessmentForDigest)
+	assessmentDigest := digest(assessmentRaw)
 	basis := struct {
 		CandidateID, Tree, Policy, Engine string
 		Risk                              Risk
 		Depth                             Depth
 		Lens                              Lens
 		EvidenceDigest                    string
-	}{c.ID, c.TreeOID, c.PolicyHash, c.EngineVersion, a.EffectiveRisk, a.SelectedDepth, a.SelectedLens, evidenceDigest}
+		AssessmentDigest                  string
+	}{c.ID, c.TreeOID, c.PolicyHash, c.EngineVersion, a.EffectiveRisk, a.SelectedDepth, a.SelectedLens, evidenceDigest, assessmentDigest}
 	basisJSON, _ := json.Marshal(basis)
-	receipt := Receipt{ID: "rcpt_" + digest(basisJSON), WorkflowID: c.WorkflowID, CandidateRecordID: c.ID, CandidateTreeOID: c.TreeOID, PolicyHash: c.PolicyHash, EngineVersion: c.EngineVersion, EffectiveRisk: a.EffectiveRisk, Depth: a.SelectedDepth, Lens: a.SelectedLens, EvidenceIDs: ids, EvidenceSetDigest: evidenceDigest, IssuedAt: req.IssuedAt.UTC()}
+	receipt := Receipt{ID: "rcpt_" + digest(basisJSON), WorkflowID: c.WorkflowID, CandidateRecordID: c.ID, CandidateTreeOID: c.TreeOID, PolicyHash: c.PolicyHash, EngineVersion: c.EngineVersion, EffectiveRisk: a.EffectiveRisk, Depth: a.SelectedDepth, Lens: a.SelectedLens, EvidenceIDs: ids, EvidenceSetDigest: evidenceDigest, AssessmentDigest: assessmentDigest, IssuedAt: req.IssuedAt.UTC()}
 	if existingID, ok := s.byCandidate[c.ID]; ok {
 		existing := s.receipts[existingID]
 		if existing.ID == receipt.ID {

@@ -83,7 +83,8 @@ type Gate struct {
 	Intents   IntentStore
 	// AfterGateCheck is a test/integration seam invoked after the exact commit and
 	// intent exist but before ref CAS. The commit never rereads the worktree.
-	AfterGateCheck func()
+	AfterGateCheck  func()
+	BeforeRefUpdate func() error
 }
 
 func (g *Gate) Commit(ctx context.Context, req Request) (Result, error) {
@@ -134,6 +135,11 @@ func (g *Gate) Commit(ctx context.Context, req Request) (Result, error) {
 	}
 	if g.AfterGateCheck != nil {
 		g.AfterGateCheck()
+	}
+	if g.BeforeRefUpdate != nil {
+		if err := g.BeforeRefUpdate(); err != nil {
+			return Result{}, err
+		}
 	}
 	if err := updateRef(ctx, seal.RepositoryRoot, intent); err != nil {
 		return Result{}, err

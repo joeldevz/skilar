@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/joeldevz/skynex/internal/delivery"
 	"github.com/joeldevz/skynex/internal/execution"
 	"github.com/joeldevz/skynex/internal/gitcandidate"
 	"github.com/joeldevz/skynex/internal/orchestration"
@@ -228,6 +229,68 @@ func workflowReview(store *workflow.SQLiteStore, args []string, out io.Writer) e
 		return err
 	}
 	fmt.Fprintf(out, "%s\t%s\t%s\n", id, workflow.StateReceipted, receipt.ID)
+	return nil
+}
+
+func workflowDeliver(store *workflow.SQLiteStore, args []string, out io.Writer, afterCommit func() error) error {
+	id, ok := flagValue(args, "--id")
+	if !ok || id == "" {
+		return errors.New("deliver requires --id")
+	}
+	message, ok := flagValue(args, "--message")
+	if !ok || strings.TrimSpace(message) == "" {
+		return errors.New("deliver requires --message")
+	}
+	key, ok := flagValue(args, "--idempotency-key")
+	if !ok || key == "" {
+		return errors.New("deliver requires --idempotency-key")
+	}
+	authorName, hasName := flagValue(args, "--author-name")
+	authorEmail, hasEmail := flagValue(args, "--author-email")
+	if hasName != hasEmail || (hasName && (authorName == "" || authorEmail == "")) {
+		return errors.New("deliver author requires both --author-name and --author-email")
+	}
+	w, err := store.Get(id)
+	if err != nil {
+		return err
+	}
+	if w.State != workflow.StateReceipted {
+		return fmt.Errorf("deliver requires receipted state, got %s", w.State)
+	}
+	reviews := review.NewSQLiteStore(store.Database())
+	authority, err := reviews.Authority(id)
+	if err != nil {
+		return err
+	}
+	var raw []byte
+	if err = store.Database().QueryRow(`SELECT result FROM verification_runs WHERE workflow_id=?`, id).Scan(&raw); err != nil {
+		return err
+	}
+	var verified struct {
+		Record review.CandidateRecord
+	}
+	if err = json.Unmarshal(raw, &verified); err != nil {
+		return err
+	}
+	gate := delivery.Gate{Authority: reviews, Intents: delivery.NewSQLiteIntentStore(store.Database())}
+	result, err := gate.Commit(context.Background(), delivery.Request{WorkflowID: id, Candidate: verified.Record, CandidatePolicy: gitcandidate.Policy{}, ExpectedReceiptID: authority.ID, ExpectedPolicyHash: authority.PolicyHash, CompatibleEngineVersion: verified.Record.EngineVersion, Message: message, IdempotencyKey: key, AuthorName: authorName, AuthorEmail: authorEmail})
+	if err != nil {
+		return err
+	}
+	if afterCommit != nil {
+		if err = afterCommit(); err != nil {
+			return err
+		}
+	}
+	w, err = store.Get(id)
+	if err != nil {
+		return err
+	}
+	updated, err := store.Transition(workflow.Transition{WorkflowID: id, ExpectedState: workflow.StateReceipted, ExpectedVersion: w.StateVersion, NextState: workflow.StateDelivered, IdempotencyKey: "delivery:" + key, ArtifactIDs: []string{result.CommitOID, result.ReceiptID}})
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "%s\t%s\t%s\t%s\n", id, updated.State, result.CommitOID, result.Ref)
 	return nil
 }
 

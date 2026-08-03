@@ -239,3 +239,103 @@ func TestWorkflowOpenCodeReviewRejectsBadResultsAndDrift(t *testing.T) {
 		})
 	}
 }
+
+func prepareReceiptedWorkflow(t *testing.T) (string, *workflow.SQLiteStore) {
+	t.Helper()
+	repo, store := cliWorkflowRepo(t)
+	fake := filepath.Join(t.TempDir(), "opencode")
+	body := `#!/bin/sh
+set -eu
+case "$*" in
+  *"Assess risk"*) printf '{"requested_risk":"low","justification":"low"}' > "$SKYNEX_RESULT_FILE"; exit 0 ;;
+esac
+tree=$(git write-tree)
+printf '{"envelope":{"WorkflowID":"wf","NodeID":"slice_main","AttemptID":"wf:slice_main","BaseCandidateOID":"%s","Status":"completed"},"patch":{"Operations":[{"Path":"a.txt","Data":"bmV3Cg==","Mode":384}]}}' "$tree" > "$SKYNEX_RESULT_FILE"
+`
+	if err := os.WriteFile(fake, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"--id", "wf", "--request", "change a", "--accept", "true", "--check", "true", "--path", "a.txt", "--opencode", fake, "--model", "fake", "--timeout", "2s"}
+	if err := workflowStart(store, repo, args, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := workflowRun(store, repo, []string{"wf"}, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := workflowReview(store, []string{"--id", "wf"}, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	return repo, store
+}
+
+func TestWorkflowDeliverExactTreeAndCrashReplay(t *testing.T) {
+	repo, store := prepareReceiptedWorkflow(t)
+	defer store.Close()
+	crash := errors.New("crash after ref update")
+	args := []string{"--id", "wf", "--message", "deliver exact tree", "--idempotency-key", "delivery-1", "--author-name", "Test Author", "--author-email", "author@example.com"}
+	if err := workflowDeliver(store, args, &bytes.Buffer{}, func() error { return crash }); !errors.Is(err, crash) {
+		t.Fatalf("crash=%v", err)
+	}
+	first, _ := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+	w, _ := store.Get("wf")
+	if w.State != workflow.StateReceipted {
+		t.Fatalf("state after crash=%s", w.State)
+	}
+	if err := workflowDeliver(store, args, &bytes.Buffer{}, nil); err != nil {
+		t.Fatalf("replay=%v", err)
+	}
+	second, _ := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+	if string(first) != string(second) {
+		t.Fatalf("second commit created: %s != %s", first, second)
+	}
+	var candidateTree string
+	if err := store.Database().QueryRow(`SELECT tree_oid FROM review_candidates WHERE workflow_id='wf'`).Scan(&candidateTree); err != nil {
+		t.Fatal(err)
+	}
+	commitTree, _ := exec.Command("git", "-C", repo, "rev-parse", "HEAD^{tree}").Output()
+	if strings.TrimSpace(string(commitTree)) != candidateTree {
+		t.Fatalf("commit tree=%s candidate=%s", commitTree, candidateTree)
+	}
+	w, _ = store.Get("wf")
+	if w.State != workflow.StateDelivered {
+		t.Fatalf("state=%s", w.State)
+	}
+}
+
+func TestWorkflowDeliverRejectsInvalidAuthorityAndDrift(t *testing.T) {
+	t.Run("authority", func(t *testing.T) {
+		_, store := prepareReceiptedWorkflow(t)
+		defer store.Close()
+		if _, err := store.Database().Exec(`DELETE FROM receipt_authority WHERE workflow_id='wf'`); err != nil {
+			t.Fatal(err)
+		}
+		if err := workflowDeliver(store, []string{"--id", "wf", "--message", "x", "--idempotency-key", "k"}, &bytes.Buffer{}, nil); err == nil {
+			t.Fatal("invalid authority accepted")
+		}
+	})
+	t.Run("drift", func(t *testing.T) {
+		repo, store := prepareReceiptedWorkflow(t)
+		defer store.Close()
+		if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte("drift\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := workflowDeliver(store, []string{"--id", "wf", "--message", "x", "--idempotency-key", "k"}, &bytes.Buffer{}, nil); err == nil {
+			t.Fatal("drift accepted")
+		}
+	})
+	t.Run("base-ref-moved", func(t *testing.T) {
+		repo, store := prepareReceiptedWorkflow(t)
+		defer store.Close()
+		if err := os.WriteFile(filepath.Join(repo, "other.txt"), []byte("move\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		for _, args := range [][]string{{"-C", repo, "add", "other.txt"}, {"-C", repo, "commit", "-m", "move base ref"}} {
+			if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+				t.Fatalf("git %v: %v %s", args, err, out)
+			}
+		}
+		if err := workflowDeliver(store, []string{"--id", "wf", "--message", "x", "--idempotency-key", "k"}, &bytes.Buffer{}, nil); err == nil {
+			t.Fatal("moved base ref accepted")
+		}
+	})
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -33,6 +34,8 @@ type Request struct {
 	CompatibleEngineVersion string
 	Message                 string
 	IdempotencyKey          string
+	AuthorName              string
+	AuthorEmail             string
 }
 
 type Result struct {
@@ -43,7 +46,7 @@ type Result struct {
 	Recovered bool
 }
 
-type Intent struct{ WorkflowID, IdempotencyKey, CandidateRecordID, ReceiptID, Ref, OldCommitOID, CommitOID, TreeOID, Message string }
+type Intent struct{ WorkflowID, IdempotencyKey, CandidateRecordID, ReceiptID, Ref, OldCommitOID, CommitOID, TreeOID, Message, AuthorName, AuthorEmail string }
 type IntentStore interface {
 	Get(workflowID, key string) (Intent, bool)
 	Put(Intent) error
@@ -122,14 +125,14 @@ func (g *Gate) Commit(ctx context.Context, req Request) (Result, error) {
 	if drift.Any() {
 		return Result{}, fmt.Errorf("%w: %s", ErrContextDrift, strings.Join(drift.Reasons, ", "))
 	}
-	commitOID, err := commitTree(ctx, seal.RepositoryRoot, req.Candidate.TreeOID, seal.BaseCommitOID, req.Message)
+	commitOID, err := commitTree(ctx, seal.RepositoryRoot, req.Candidate.TreeOID, seal.BaseCommitOID, req.Message, req.AuthorName, req.AuthorEmail)
 	if err != nil {
 		return Result{}, err
 	}
 	if tree, err := gitText(ctx, seal.RepositoryRoot, "rev-parse", commitOID+"^{tree}"); err != nil || tree != req.Candidate.TreeOID {
 		return Result{}, errors.New("delivery: created commit tree mismatch")
 	}
-	intent := Intent{WorkflowID: req.WorkflowID, IdempotencyKey: req.IdempotencyKey, CandidateRecordID: req.Candidate.ID, ReceiptID: authority.ID, Ref: seal.BaseRef, OldCommitOID: seal.BaseCommitOID, CommitOID: commitOID, TreeOID: req.Candidate.TreeOID, Message: req.Message}
+	intent := Intent{WorkflowID: req.WorkflowID, IdempotencyKey: req.IdempotencyKey, CandidateRecordID: req.Candidate.ID, ReceiptID: authority.ID, Ref: seal.BaseRef, OldCommitOID: seal.BaseCommitOID, CommitOID: commitOID, TreeOID: req.Candidate.TreeOID, Message: req.Message, AuthorName: req.AuthorName, AuthorEmail: req.AuthorEmail}
 	if err := g.Intents.Put(intent); err != nil {
 		return Result{}, err
 	}
@@ -148,7 +151,7 @@ func (g *Gate) Commit(ctx context.Context, req Request) (Result, error) {
 }
 
 func (g *Gate) recover(ctx context.Context, req Request, authority review.Receipt, intent Intent) (Result, error) {
-	if intent.CandidateRecordID != req.Candidate.ID || intent.ReceiptID != authority.ID || intent.TreeOID != req.Candidate.TreeOID || intent.Message != req.Message {
+	if intent.CandidateRecordID != req.Candidate.ID || intent.ReceiptID != authority.ID || intent.TreeOID != req.Candidate.TreeOID || intent.Message != req.Message || intent.AuthorName != req.AuthorName || intent.AuthorEmail != req.AuthorEmail {
 		return Result{}, ErrIdempotencyReuse
 	}
 	current, err := gitText(ctx, req.Candidate.Seal.RepositoryRoot, "rev-parse", intent.Ref)
@@ -171,10 +174,17 @@ func (g *Gate) recover(ctx context.Context, req Request, authority review.Receip
 	return Result{CommitOID: intent.CommitOID, TreeOID: intent.TreeOID, Ref: intent.Ref, ReceiptID: intent.ReceiptID, Recovered: true}, nil
 }
 
-func commitTree(ctx context.Context, repo, tree, parent, message string) (string, error) {
+func commitTree(ctx context.Context, repo, tree, parent, message, authorName, authorEmail string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", "commit-tree", tree, "-p", parent)
 	cmd.Dir = repo
 	cmd.Stdin = strings.NewReader(message + "\n")
+	cmd.Env = os.Environ()
+	if authorName != "" {
+		cmd.Env = append(cmd.Env, "GIT_AUTHOR_NAME="+authorName, "GIT_COMMITTER_NAME="+authorName)
+	}
+	if authorEmail != "" {
+		cmd.Env = append(cmd.Env, "GIT_AUTHOR_EMAIL="+authorEmail, "GIT_COMMITTER_EMAIL="+authorEmail)
+	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("git commit-tree: %w: %s", err, strings.TrimSpace(string(out)))

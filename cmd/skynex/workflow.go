@@ -33,11 +33,33 @@ func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
 		printWorkflowUsage(out)
 		return nil
 	}
+	if len(args) > 1 && (args[1] == "--help" || args[1] == "-h") {
+		return printWorkflowCommandUsage(args[0], out)
+	}
+	if !workflowCommandKnown(args[0]) {
+		return fmt.Errorf("unknown workflow command %q", args[0])
+	}
 	if cwd == "" {
 		var err error
 		cwd, err = os.Getwd()
 		if err != nil {
 			return err
+		}
+	}
+	path, err := workflow.CanonicalDatabasePath(cwd)
+	if err != nil {
+		return err
+	}
+	if _, statErr := os.Lstat(path); os.IsNotExist(statErr) {
+		if args[0] == "status" {
+			if len(args) > 1 {
+				return fmt.Errorf("workflow database not found at %s", path)
+			}
+			fmt.Fprintln(out, "WORKFLOW\tSTATE\tVERSION\tROUTE\tRISK")
+			return nil
+		}
+		if args[0] == "inspect" || args[0] == "receipt" {
+			return fmt.Errorf("workflow database not found at %s", path)
 		}
 	}
 	store, err := workflow.OpenRepositorySQLite(cwd)
@@ -84,6 +106,40 @@ func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
 	default:
 		return fmt.Errorf("unknown workflow command %q", args[0])
 	}
+}
+
+func workflowCommandKnown(command string) bool {
+	switch command {
+	case "start", "run", "review", "deliver", "approve", "revoke-approval", "frontier", "answer", "close-discovery", "status", "inspect", "receipt", "abort", "resume", "export":
+		return true
+	}
+	return false
+}
+
+func printWorkflowCommandUsage(command string, out io.Writer) error {
+	usage := map[string]string{
+		"start":           "Usage: skynex workflow start --id ID --request TEXT --path PATH --check COMMAND --accept COMMAND [--route simple|planned|discovery] [--plan-file FILE] [--wayfinder-file FILE] [--override-actor ACTOR --override-reason REASON] [--model MODEL] [--agent AGENT] [--opencode PATH] [--timeout DURATION]\nSimple requires --id, --request, and repeatable --path, --check, --accept. Planned requires --plan-file. Discovery requires --wayfinder-file.",
+		"run":             "Usage: skynex workflow run WORKFLOW_ID",
+		"review":          "Usage: skynex workflow review --id WORKFLOW_ID",
+		"deliver":         "Usage: skynex workflow deliver --id WORKFLOW_ID --message TEXT --idempotency-key KEY [--author-name NAME --author-email EMAIL]",
+		"status":          "Usage: skynex workflow status [WORKFLOW_ID]",
+		"inspect":         "Usage: skynex workflow inspect WORKFLOW_ID",
+		"receipt":         "Usage: skynex workflow receipt WORKFLOW_ID | --id RECEIPT_ID",
+		"approve":         "Usage: skynex workflow approve --id WORKFLOW_ID --action ACTION --actor ACTOR --reason TEXT [--expires DURATION]",
+		"revoke-approval": "Usage: skynex workflow revoke-approval --id WORKFLOW_ID --action ACTION --actor ACTOR --reason TEXT",
+		"abort":           "Usage: skynex workflow abort WORKFLOW_ID --idempotency-key KEY",
+		"resume":          "Usage: skynex workflow resume WORKFLOW_ID --blocker-id ID --idempotency-key KEY",
+		"export":          "Usage: skynex workflow export WORKFLOW_ID --out PATH",
+		"frontier":        "Usage: skynex workflow frontier --id WORKFLOW_ID",
+		"answer":          "Usage: skynex workflow answer --id WORKFLOW_ID --node NODE_ID --answer TEXT --actor ACTOR",
+		"close-discovery": "Usage: skynex workflow close-discovery --id WORKFLOW_ID --plan-file FILE",
+	}
+	value, ok := usage[command]
+	if !ok {
+		return fmt.Errorf("unknown workflow command %q", command)
+	}
+	fmt.Fprintln(out, value)
+	return nil
 }
 
 func printWorkflowUsage(out io.Writer) {

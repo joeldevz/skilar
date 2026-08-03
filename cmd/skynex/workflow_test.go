@@ -96,6 +96,62 @@ func TestWorkflowCLIStatusInspectAndAbortIdempotently(t *testing.T) {
 	}
 }
 
+func TestWorkflowCommandHelpOutsideRepositoryDoesNotCreateDatabase(t *testing.T) {
+	dir := t.TempDir()
+	commands := []string{"start", "run", "review", "deliver", "status", "inspect", "receipt", "approve", "revoke-approval", "abort", "resume", "export", "frontier", "answer", "close-discovery"}
+	for _, command := range commands {
+		t.Run(command, func(t *testing.T) {
+			var out bytes.Buffer
+			if err := runWorkflowCLI([]string{command, "--help"}, dir, &out); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(out.String(), "Usage: skynex workflow "+command) {
+				t.Fatalf("help=%q", out.String())
+			}
+		})
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".git")); !os.IsNotExist(err) {
+		t.Fatalf("help created repository state: %v", err)
+	}
+}
+
+func TestWorkflowStatusAbsentDatabaseIsReadOnly(t *testing.T) {
+	repo := t.TempDir()
+	if out, err := exec.Command("git", "init", repo).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v %s", err, out)
+	}
+	var output bytes.Buffer
+	if err := runWorkflowCLI([]string{"status"}, repo, &output); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != "WORKFLOW\tSTATE\tVERSION\tROUTE\tRISK\n" {
+		t.Fatalf("status=%q", output.String())
+	}
+	if _, err := os.Stat(filepath.Join(repo, ".git", "skynex")); !os.IsNotExist(err) {
+		t.Fatalf("status created database directory: %v", err)
+	}
+	for _, command := range []string{"inspect", "receipt"} {
+		if err := runWorkflowCLI([]string{command, "missing"}, repo, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "database not found") {
+			t.Fatalf("%s err=%v", command, err)
+		}
+		if _, err := os.Stat(filepath.Join(repo, ".git", "skynex")); !os.IsNotExist(err) {
+			t.Fatalf("%s created database directory", command)
+		}
+	}
+}
+
+func TestWorkflowStatusByIDRequiresExistingDatabase(t *testing.T) {
+	repo := t.TempDir()
+	if output, err := exec.Command("git", "init", repo).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v %s", err, output)
+	}
+	var out bytes.Buffer
+	err := runWorkflowCLI([]string{"status", "missing"}, repo, &out)
+	if err == nil || !strings.Contains(err.Error(), "workflow database not found") {
+		t.Fatalf("status error = %v", err)
+	}
+}
+
 func TestWorkflowCLIResumeFailsClosed(t *testing.T) {
 	repo := workflowRepo(t)
 	createCLIWorkflow(t, repo, "wf-blocked", workflow.StateBlocked)

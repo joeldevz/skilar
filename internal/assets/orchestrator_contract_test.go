@@ -10,7 +10,7 @@ import (
 func assertWorkflowOrchestratorContract(t *testing.T, raw []byte) {
 	t.Helper()
 	text := strings.ToLower(string(raw))
-	required := []string{"skynex workflow start", "skynex workflow run", "skynex workflow review", "skynex workflow deliver", "skynex workflow status", "skynex workflow inspect", "skynex workflow receipt", "skynex workflow approve", "skynex workflow abort", "candidate_frozen", "receipted", "depth 0", "depth 1", "depth 4", "neurox"}
+	required := []string{"skynex workflow start", "skynex workflow run", "skynex workflow review", "skynex workflow deliver", "skynex workflow status", "skynex workflow inspect", "skynex workflow receipt", "skynex workflow approve", "skynex workflow abort", "candidate_frozen", "receipted", "depth 0", "depth 1", "depth 4", "neurox", "--id example --request", "--path", "--check", "--accept"}
 	for _, value := range required {
 		if !strings.Contains(text, value) {
 			t.Errorf("orchestrator contract missing %q", value)

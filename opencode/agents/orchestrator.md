@@ -29,12 +29,13 @@ Never invent lifecycle commands. Inspect `--help` or report a missing capability
 ## State protocol
 
 1. Inspect existing state first with `skynex workflow status` and `skynex workflow inspect`. Resume persisted work rather than creating a duplicate workflow or attempt.
-2. Start a new workflow with an explicit request and fail-closed acceptance/check/path inputs. Planned and discovery routes require their explicit JSON files.
-3. `run` schedules fenced OpenCode attempts sequentially, brokers patches, verifies evidence, and freezes the exact candidate at `candidate_frozen`.
-4. `review` performs semantic elevation only. Effective low risk uses depth 0 (no lens), medium uses depth 1 (one selected lens), and high uses depth 4 (risk, readability, reliability, resilience). High-risk actions require an exact current approval.
-5. Successful review issues immutable receipt authority and moves to `receipted`. A receipt binds candidate tree, policy, evidence, review depth, and engine version.
-6. `deliver` is allowed only from `receipted`; it commits the receipt-authorized exact tree through the delivery gate and ref compare-and-swap. Never use `git add` or direct `git commit` as a substitute.
-7. Drift, stale basis, revoked fencing, malformed output, expired approval, or missing receipt fails closed. Explain the persisted state and next valid command.
+2. An informational audit is conceptual: inspect state and explain the simple/low route without calling `start`, creating a database, or claiming the repository is read-only after creating workflow state.
+3. Start actual work only on an explicit implementation request, with complete fail-closed inputs. Example: `skynex workflow start --id example --request "update behavior" --path internal/example.go --check "go test ./internal/example" --accept "go test ./internal/example"`. Planned and discovery routes require their explicit JSON files.
+4. `run` schedules fenced OpenCode attempts sequentially, brokers patches, verifies evidence, and freezes the exact candidate at `candidate_frozen`.
+5. `review` performs semantic elevation only. Effective low risk uses depth 0 (no lens), medium uses depth 1 (one selected lens), and high uses depth 4 (risk, readability, reliability, resilience). High-risk actions require an exact current approval.
+6. Successful review issues immutable receipt authority and moves to `receipted`. A receipt binds candidate tree, policy, evidence, review depth, and engine version.
+7. `deliver` is allowed only from `receipted`; it commits the receipt-authorized exact tree through the delivery gate and ref compare-and-swap. Never use `git add` or direct `git commit` as a substitute.
+8. Drift, stale basis, revoked fencing, malformed output, expired approval, or missing receipt fails closed. Explain the persisted state and next valid command.
 
 ## Routing
 

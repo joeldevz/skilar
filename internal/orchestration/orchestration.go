@@ -76,6 +76,7 @@ type RouteInput struct {
 	Clear               bool
 	EstimatedSlices     int
 	BlockingUncertainty []string
+	Sensitive           bool
 }
 type RouteOverride struct {
 	Route         workflow.Route
@@ -100,6 +101,10 @@ func SelectRoute(input RouteInput, override *RouteOverride) RouteDecision {
 			route = workflow.RoutePlanned
 			rationale = "clear request requires multiple production slices"
 		}
+	}
+	if input.Sensitive && route == workflow.RouteSimple {
+		route = workflow.RoutePlanned
+		rationale = "sensitive request requires planned execution"
 	}
 	floor := routeFloor(route)
 	decision := RouteDecision{Route: route, MinimumRisk: floor, Rationale: rationale}

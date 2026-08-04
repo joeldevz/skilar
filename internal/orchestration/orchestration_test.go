@@ -14,7 +14,7 @@ func TestRouteSelectionAndOverrideCannotLowerRisk(t *testing.T) {
 	tests := []struct {
 		input RouteInput
 		want  workflow.Route
-	}{{RouteInput{Clear: true, EstimatedSlices: 1}, workflow.RouteSimple}, {RouteInput{Clear: true, EstimatedSlices: 3}, workflow.RoutePlanned}, {RouteInput{Clear: false}, workflow.RouteDiscovery}, {RouteInput{Clear: true, EstimatedSlices: 1, BlockingUncertainty: []string{"unknown"}}, workflow.RouteDiscovery}}
+	}{{RouteInput{Clear: true, EstimatedSlices: 1}, workflow.RouteSimple}, {RouteInput{Clear: true, EstimatedSlices: 1, Sensitive: true}, workflow.RoutePlanned}, {RouteInput{Clear: true, EstimatedSlices: 3}, workflow.RoutePlanned}, {RouteInput{Clear: false}, workflow.RouteDiscovery}, {RouteInput{Clear: true, EstimatedSlices: 1, BlockingUncertainty: []string{"unknown"}}, workflow.RouteDiscovery}}
 	for _, tc := range tests {
 		if got := SelectRoute(tc.input, nil); got.Route != tc.want {
 			t.Fatalf("route=%s want=%s", got.Route, tc.want)

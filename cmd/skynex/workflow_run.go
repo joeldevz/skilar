@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/joeldevz/skynex/internal/approval"
 	"github.com/joeldevz/skynex/internal/delivery"
@@ -40,6 +41,26 @@ func workflowAgent(args []string) string {
 	return defaultWorkflowWorkerAgent
 }
 
+func workflowRequestNeedsPlanned(request string) bool {
+	words := strings.FieldsFunc(strings.ToLower(request), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+	sensitiveWord := map[string]bool{
+		"secret": true, "secrets": true, "auth": true, "authentication": true, "oauth": true,
+		"token": true, "tokens": true, "sdk": true, "dependency": true, "dependencies": true,
+		"migration": true, "migrations": true, "payment": true, "payments": true,
+	}
+	for i, word := range words {
+		if sensitiveWord[word] {
+			return true
+		}
+		if word == "api" && i+1 < len(words) && (words[i+1] == "key" || words[i+1] == "keys") {
+			return true
+		}
+	}
+	return false
+}
+
 type sliceRunConfig struct{ Paths, Checks []string }
 type planFile struct {
 	Slices []planFileSlice `json:"slices"`
@@ -65,21 +86,32 @@ func workflowStart(store *workflow.SQLiteStore, repo string, args []string, out 
 	checks := flagValues(args, "--check")
 	paths := flagValues(args, "--path")
 	routeValue := workflow.RouteSimple
+	explicitRoute := false
 	if value, exists := flagValue(args, "--route"); exists {
+		explicitRoute = true
 		routeValue = workflow.Route(value)
+	}
+	inferredPlanned := workflowRequestNeedsPlanned(request)
+	if inferredPlanned && explicitRoute && routeValue == workflow.RouteSimple {
+		return errors.New("sensitive workflow request cannot use simple route; use --route planned or discovery")
+	}
+	if inferredPlanned && !explicitRoute {
+		routeValue = workflow.RoutePlanned
 	}
 	var planned planFile
 	if routeValue == workflow.RoutePlanned {
-		file, exists := flagValue(args, "--plan-file")
-		if !exists {
+		if file, exists := flagValue(args, "--plan-file"); exists {
+			raw, readErr := os.ReadFile(file)
+			if readErr != nil {
+				return readErr
+			}
+			if json.Unmarshal(raw, &planned) != nil || len(planned.Slices) == 0 {
+				return errors.New("invalid plan file")
+			}
+		} else if explicitRoute {
 			return errors.New("planned start requires --plan-file")
-		}
-		raw, readErr := os.ReadFile(file)
-		if readErr != nil {
-			return readErr
-		}
-		if json.Unmarshal(raw, &planned) != nil || len(planned.Slices) == 0 {
-			return errors.New("invalid plan file")
+		} else if len(acceptance) == 0 || len(checks) == 0 || len(paths) == 0 {
+			return errors.New("inferred planned start requires explicit --accept, --check, and --path")
 		}
 	} else if routeValue == workflow.RouteDiscovery {
 		if _, exists := flagValue(args, "--wayfinder-file"); !exists {
@@ -110,10 +142,10 @@ func workflowStart(store *workflow.SQLiteStore, repo string, args []string, out 
 	}
 	engine := orchestration.NewEngine(store)
 	estimated := 1
-	if routeValue == workflow.RoutePlanned {
+	if len(planned.Slices) > 0 {
 		estimated = len(planned.Slices)
 	}
-	decision, err := engine.Begin(id, orchestration.RouteInput{Clear: routeValue != workflow.RouteDiscovery, EstimatedSlices: estimated, BlockingUncertainty: func() []string {
+	decision, err := engine.Begin(id, orchestration.RouteInput{Clear: routeValue != workflow.RouteDiscovery, EstimatedSlices: estimated, Sensitive: inferredPlanned, BlockingUncertainty: func() []string {
 		if routeValue == workflow.RouteDiscovery {
 			return []string{"discovery required"}
 		}
@@ -152,7 +184,7 @@ func workflowStart(store *workflow.SQLiteStore, repo string, args []string, out 
 	}
 	graph := orchestration.ExecutionGraph{WorkflowID: id, Version: 1}
 	configs := map[string]sliceRunConfig{}
-	if decision.Route == workflow.RoutePlanned {
+	if decision.Route == workflow.RoutePlanned && len(planned.Slices) > 0 {
 		checks = nil
 		paths = nil
 		for _, s := range planned.Slices {
@@ -168,7 +200,7 @@ func workflowStart(store *workflow.SQLiteStore, repo string, args []string, out 
 		graph.Slices = []orchestration.Slice{{ID: "slice_main", Title: request, AcceptanceCriteria: acceptance}}
 		configs["slice_main"] = sliceRunConfig{Paths: paths, Checks: checks}
 	}
-	if decision.Route == workflow.RoutePlanned {
+	if decision.Route == workflow.RoutePlanned && len(planned.Slices) > 0 {
 		acceptance = nil
 		for _, s := range planned.Slices {
 			acceptance = append(acceptance, s.AcceptanceCriteria...)

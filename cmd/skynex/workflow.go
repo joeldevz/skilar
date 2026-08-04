@@ -25,6 +25,22 @@ type workflowInspection struct {
 	Approvals         []string                     `json:"current_approvals,omitempty"`
 	Invocations       []invocationInspection       `json:"invocations,omitempty"`
 	ReviewInvocations []reviewInvocationInspection `json:"review_invocations,omitempty"`
+	Jobs              []workflowJobInspection      `json:"jobs,omitempty"`
+}
+
+type workflowJobInspection struct {
+	ID, Operation, State, Error, TerminalState string
+	PID                                        int
+	CreatedAt, HeartbeatAt, FinishedAt         string
+	Attempt, RetriesRemaining                  int
+	NextAction                                 string
+}
+
+func detachedRetryCommand(operation, id string) string {
+	if operation == "review" {
+		return fmt.Sprintf("skynex workflow review --id %s --detach", id)
+	}
+	return fmt.Sprintf("skynex workflow run %s --detach", id)
 }
 
 type reviewInvocationInspection struct {
@@ -227,7 +243,24 @@ func workflowStatus(store *workflow.SQLiteStore, args []string, out io.Writer) e
 		var created, started, heartbeat, finished string
 		err = store.Database().QueryRow(`SELECT id,workflow_id,session_id,operation,state,pid,created_at,started_at,heartbeat_at,finished_at,terminal_state,error FROM workflow_jobs WHERE workflow_id=? ORDER BY created_at DESC LIMIT 1`, w.ID).Scan(&job.ID, &job.WorkflowID, &job.SessionID, &job.Operation, &job.State, &job.PID, &created, &started, &heartbeat, &finished, &job.TerminalState, &job.Error)
 		if err == nil {
-			fmt.Fprintf(out, "JOB\t%s\t%s\toperation=%s\tpid=%d\theartbeat=%s\tterminal=%s\n", job.ID, job.State, job.Operation, job.PID, heartbeat, job.TerminalState)
+			attempts, _ := store.WorkflowJobAttempts(w.ID, job.Operation)
+			remaining := workflow.MaxWorkflowJobAttempts - attempts
+			if remaining < 0 {
+				remaining = 0
+			}
+			next := "wait"
+			if job.State == workflow.JobFailed && w.State == workflow.StateBlocked {
+				if remaining > 0 {
+					next = detachedRetryCommand(job.Operation, w.ID)
+				} else {
+					next = "manual_resolution_required"
+				}
+			}
+			preview := strings.ReplaceAll(strings.TrimSpace(job.Error), "\n", " ")
+			if len(preview) > 500 {
+				preview = preview[:500] + "..."
+			}
+			fmt.Fprintf(out, "JOB\t%s\t%s\toperation=%s\tpid=%d\theartbeat=%s\tterminal=%s\tattempt=%d\tretries_remaining=%d\tnext=%s\terror=%s\n", job.ID, job.State, job.Operation, job.PID, heartbeat, job.TerminalState, attempts, remaining, next, preview)
 		}
 		return nil
 	}
@@ -257,6 +290,29 @@ func workflowInspect(store *workflow.SQLiteStore, reviews *review.SQLiteStore, i
 		return err
 	}
 	inspection := workflowInspection{Workflow: w, Events: events}
+	if rows, e := store.Database().Query(`SELECT id,operation,state,pid,created_at,heartbeat_at,finished_at,terminal_state,error FROM workflow_jobs WHERE workflow_id=? ORDER BY created_at`, id); e == nil {
+		defer rows.Close()
+		attemptByOperation := map[string]int{}
+		for rows.Next() {
+			var j workflowJobInspection
+			if rows.Scan(&j.ID, &j.Operation, &j.State, &j.PID, &j.CreatedAt, &j.HeartbeatAt, &j.FinishedAt, &j.TerminalState, &j.Error) == nil {
+				attemptByOperation[j.Operation]++
+				j.Attempt = attemptByOperation[j.Operation]
+				j.RetriesRemaining = workflow.MaxWorkflowJobAttempts - j.Attempt
+				if j.RetriesRemaining < 0 {
+					j.RetriesRemaining = 0
+				}
+				if j.State == string(workflow.JobFailed) && w.State == workflow.StateBlocked {
+					if j.RetriesRemaining > 0 {
+						j.NextAction = detachedRetryCommand(j.Operation, id)
+					} else {
+						j.NextAction = "manual_resolution_required"
+					}
+				}
+				inspection.Jobs = append(inspection.Jobs, j)
+			}
+		}
+	}
 	var input []byte
 	if e := store.Database().QueryRow(`SELECT input FROM workflow_run_inputs WHERE workflow_id=?`, id).Scan(&input); e == nil {
 		inspection.RunInput = input

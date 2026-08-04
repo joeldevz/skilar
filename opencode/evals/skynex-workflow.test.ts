@@ -36,6 +36,19 @@ test("failure message includes job error and prompt response.error is not acknow
 	assert.equal(acks,0);assert.equal(releases,1)
 })
 
+test("wake prompt inspects state then continues safe managed work without a report-only pause",async()=>{
+	const notice={ID:"n",WorkflowID:"wf",JobID:"j",TerminalState:"candidate_frozen",JobState:"succeeded",Error:"",ClaimToken:"t",ClaimedBy:"s",CreatedAt:""}
+	let options:unknown
+	const client={session:{prompt:async(o:unknown)=>{options=o;return {}}}}
+	await promptSession(client,"s",notice)
+	const prompt=JSON.stringify(options).toLowerCase()
+	assert.match(prompt,/status and inspect/)
+	assert.match(prompt,/automatically continue the next safe managed action/)
+	assert.match(prompt,/completed.*genuine blocker.*human gate.*destructive ambiguity.*retries.*exhausted/)
+	assert.doesNotMatch(prompt,/then report the result/)
+	assert.doesNotMatch(prompt,/do not review or deliver automatically/)
+})
+
 test("session presence heartbeats autonomously until stopped",async()=>{
 	let beats=0
 	const presence=startSessionPresence(async()=>{beats++},5);presence.add("session")

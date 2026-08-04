@@ -131,7 +131,12 @@ func (r *Runner) Run(ctx context.Context, workflowID string, seal gitcandidate.C
 	if after.TreeOID != candidate.TreeOID {
 		passed = false
 	}
-	changes, err := candidateChanges(seal.RepositoryRoot, seal.BaseTreeOID, candidate.TreeOID)
+	// The workflow basis may be an adopted dirty tree captured at start, while
+	// the context seal intentionally remains anchored to the original HEAD for
+	// repository identity and drift checks. Classify only mutations made after
+	// that adopted basis; otherwise a zero-operation workflow would treat the
+	// user's pre-existing files as its own changes.
+	changes, err := candidateChanges(seal.RepositoryRoot, w.BasisTree, candidate.TreeOID)
 	if err != nil {
 		return Result{}, err
 	}

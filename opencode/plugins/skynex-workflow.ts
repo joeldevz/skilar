@@ -68,7 +68,7 @@ export function notificationMessage(notice:Notice):string {
 
 type PromptClient={session:{prompt(options:unknown):Promise<{error?:unknown}>}}
 export async function promptSession(client:PromptClient,sessionID:string,notice:Notice):Promise<void>{
-	const response=await client.session.prompt({path:{id:sessionID},body:{parts:[{type:"text",text:`${notificationMessage(notice)} Run read-only workflow status and inspect, then report the result. Do not review or deliver automatically.`}]},throwOnError:true})
+	const response=await client.session.prompt({path:{id:sessionID},body:{parts:[{type:"text",text:`${notificationMessage(notice)} Run read-only workflow status and inspect, validate the persisted evidence, then automatically continue the next safe managed action under the continuous execution policy. Do not pause merely to report status or ask permission. Continue without notifying the user unless the workflow is completed, has a genuine blocker or unresolved human gate, faces destructive ambiguity, or retries are exhausted. Never auto-approve, auto-deliver, commit, push, or create a PR.`}]},throwOnError:true})
 	if(response.error)throw new Error("OpenCode rejected workflow wake prompt")
 }
 

@@ -135,6 +135,63 @@ func TestFailingCheckReplans(t *testing.T) {
 		t.Fatalf("state=%s", w.State)
 	}
 }
+
+func TestZeroOperationVerificationUsesAdoptedDirtyWorkflowBasis(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	git(t, "", "init", repo)
+	git(t, repo, "config", "user.email", "test@example.com")
+	git(t, repo, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(repo, "file.txt"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, repo, "add", "file.txt")
+	git(t, repo, "commit", "-m", "base")
+	// This pre-existing dirty dependency file is adopted into the workflow basis.
+	// A zero-operation run must not reclassify it as a workflow mutation.
+	if err := os.WriteFile(filepath.Join(repo, "package.json"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	seal, err := gitcandidate.CaptureContext(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adopted, err := gitcandidate.Freeze(seal, gitcandidate.Policy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adopted.TreeOID == seal.BaseTreeOID {
+		t.Fatal("fixture did not create an adopted dirty basis")
+	}
+	store, err := workflow.OpenRepositorySQLite(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	w, err := store.Create(workflow.Workflow{ID: "zero-op", Route: workflow.RouteSimple, MinimumRisk: workflow.RiskLow, BasisTree: adopted.TreeOID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, next := range []workflow.State{workflow.StateDiscovering, workflow.StateReady, workflow.StateExecuting, workflow.StateVerifying} {
+		w, err = store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: next, IdempotencyKey: "to:" + string(next)})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := runner(store).Run(context.Background(), "zero-op", seal, Plan{Checks: []Command{{Name: "sh", Args: []string{"-c", "test -f package.json"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Passed {
+		t.Fatal("zero-operation verification failed")
+	}
+	if result.Candidate.TreeOID != adopted.TreeOID {
+		t.Fatalf("candidate=%s adopted=%s", result.Candidate.TreeOID, adopted.TreeOID)
+	}
+	if result.Floor.Risk != review.RiskLow || len(result.Floor.Reasons) != 0 {
+		t.Fatalf("adopted basis counted as mutation: %#v", result.Floor)
+	}
+}
+
 func TestDriftBetweenVerificationAndFreezeReplans(t *testing.T) {
 	repo, store, seal := verifyFixture(t)
 	defer store.Close()

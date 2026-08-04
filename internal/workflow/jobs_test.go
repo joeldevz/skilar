@@ -1,10 +1,88 @@
 package workflow
 
 import (
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+func executingJobWorkflow(t *testing.T, s *SQLiteStore, id string) Workflow {
+	t.Helper()
+	w, err := s.Create(Workflow{ID: id, Route: RouteSimple, MinimumRisk: RiskLow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, next := range []State{StateDiscovering, StateReady, StateExecuting} {
+		w, err = s.Transition(Transition{WorkflowID: id, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: next, IdempotencyKey: fmt.Sprintf("setup-%d", i)})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return w
+}
+
+func TestFailedDetachedJobAtomicallyBlocksAndCanRetryWithoutRecoveryBasis(t *testing.T) {
+	s, err := OpenSQLite(filepath.Join(t.TempDir(), "workflows.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	executingJobWorkflow(t, s, "wf")
+	if _, err = s.CreateWorkflowJobOperation("job-1", "wf", "run", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.BindWorkflowJobSession("job-1", "session"); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.FinishWorkflowJob("job-1", JobFailed, "executing", "provider timeout", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	w, err := s.Get("wf")
+	if err != nil || w.State != StateBlocked || w.ResumeTarget != StateExecuting {
+		t.Fatalf("workflow=%+v err=%v", w, err)
+	}
+	events, _ := s.Events("wf")
+	last := events[len(events)-1]
+	if last.To != StateBlocked || !strings.Contains(strings.Join(last.ArtifactIDs, ","), "job-blocker:job-1") {
+		t.Fatalf("event=%+v", last)
+	}
+	n, err := s.ClaimWorkflowNotification("session", time.Now())
+	if err != nil || n == nil || n.TerminalState != string(StateBlocked) || n.Error != "provider timeout" {
+		t.Fatalf("notification=%+v err=%v", n, err)
+	}
+	resumed, err := s.RetryTechnicalWorkflowJob("wf", "run", time.Now())
+	if err != nil || resumed.State != StateExecuting || resumed.ResumeTarget != "" {
+		t.Fatalf("resumed=%+v err=%v", resumed, err)
+	}
+}
+
+func TestTechnicalJobRetryIsBoundedToThreeTotalAttempts(t *testing.T) {
+	s, err := OpenSQLite(filepath.Join(t.TempDir(), "workflows.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	executingJobWorkflow(t, s, "wf")
+	for i := 1; i <= MaxWorkflowJobAttempts; i++ {
+		id := fmt.Sprintf("job-%d", i)
+		if _, err = s.CreateWorkflowJobOperation(id, "wf", "run", time.Now().Add(time.Duration(i)*time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+		if err = s.FinishWorkflowJob(id, JobFailed, "", "timeout", time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if i < MaxWorkflowJobAttempts {
+			if _, err = s.RetryTechnicalWorkflowJob("wf", "run", time.Now()); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if _, err = s.RetryTechnicalWorkflowJob("wf", "run", time.Now()); err == nil || !strings.Contains(err.Error(), "retry limit reached") {
+		t.Fatalf("err=%v", err)
+	}
+}
 
 func TestDetachedJobLifecycleAndTerminalNotificationDeduplication(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "workflows.db")

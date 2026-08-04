@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -37,6 +38,7 @@ type WorkflowNotification struct {
 }
 
 const WorkflowSessionPresenceTTL = 20 * time.Second
+const MaxWorkflowJobAttempts = 3
 
 var workflowJobProcessAlive = workflowProcessAlive
 
@@ -197,14 +199,42 @@ func (s *SQLiteStore) FinishWorkflowJob(id string, state JobState, terminal, mes
 		return err
 	}
 	defer tx.Rollback()
-	var workflowID, realTerminal string
-	if err = tx.QueryRow(`SELECT workflow_id FROM workflow_jobs WHERE id=?`, id).Scan(&workflowID); err != nil {
+	var workflowID, operation string
+	var previous JobState
+	if err = tx.QueryRow(`SELECT workflow_id,operation,state FROM workflow_jobs WHERE id=?`, id).Scan(&workflowID, &operation, &previous); err != nil {
 		return err
 	}
+	if previous == JobSucceeded || previous == JobFailed || previous == JobCancelled {
+		return tx.Commit()
+	}
+	var realTerminal State
 	if err = tx.QueryRow(`SELECT state FROM workflows WHERE id=?`, workflowID).Scan(&realTerminal); err != nil {
 		return err
 	}
-	terminal = realTerminal
+	// A detached technical failure is a durable workflow blocker, not merely a
+	// dead side-car process. Keep the source state as the exact resume target so
+	// a bounded retry can continue without fabricating a Git recovery basis.
+	if state == JobFailed {
+		if _, blockable := blockableStates[realTerminal]; blockable {
+			var version uint64
+			if err = tx.QueryRow(`SELECT state_version FROM workflows WHERE id=?`, workflowID).Scan(&version); err != nil {
+				return err
+			}
+			res, updateErr := tx.Exec(`UPDATE workflows SET state=?,state_version=state_version+1,resume_target=? WHERE id=? AND state=? AND state_version=?`, StateBlocked, realTerminal, workflowID, realTerminal, version)
+			if updateErr != nil {
+				return updateErr
+			}
+			if n, _ := res.RowsAffected(); n == 1 {
+				artifacts, _ := json.Marshal([]string{"job-blocker:" + id, "job-evidence:" + id})
+				key := "job-failed:" + id
+				if _, err = tx.Exec(`INSERT INTO transition_events(workflow_id,from_state,to_state,state_version,idempotency_key,artifact_ids,occurred_at) VALUES(?,?,?,?,?,?,?)`, workflowID, realTerminal, StateBlocked, version+1, key, artifacts, dbTime(now)); err != nil {
+					return err
+				}
+				realTerminal = StateBlocked
+			}
+		}
+	}
+	terminal = string(realTerminal)
 	if _, err = tx.Exec(`UPDATE workflow_jobs SET state=?,terminal_state=?,error=?,finished_at=?,heartbeat_at=? WHERE id=? AND state NOT IN (?,?,?)`, state, terminal, message, dbTime(now), dbTime(now), id, JobSucceeded, JobFailed, JobCancelled); err != nil {
 		return err
 	}
@@ -213,6 +243,60 @@ func (s *SQLiteStore) FinishWorkflowJob(id string, state JobState, terminal, mes
 		return err
 	}
 	return tx.Commit()
+}
+
+// RetryTechnicalWorkflowJob resumes the blocker created by the latest failed
+// detached job. It deliberately bypasses candidate recovery reconciliation:
+// the job failure itself did not authorize or claim a candidate tree change.
+// Admission is bounded to three total attempts for each workflow/operation.
+func (s *SQLiteStore) RetryTechnicalWorkflowJob(workflowID, operation string, now time.Time) (Workflow, error) {
+	w, err := s.Get(workflowID)
+	if err != nil {
+		return Workflow{}, err
+	}
+	if w.State != StateBlocked || w.ResumeTarget == "" {
+		return Workflow{}, fmt.Errorf("workflow %s is not blocked by a retryable job", workflowID)
+	}
+	var jobID string
+	var state JobState
+	if err = s.db.QueryRow(`SELECT id,state FROM workflow_jobs WHERE workflow_id=? AND operation=? ORDER BY rowid DESC LIMIT 1`, workflowID, operation).Scan(&jobID, &state); err != nil {
+		return Workflow{}, err
+	}
+	if state != JobFailed {
+		return Workflow{}, fmt.Errorf("workflow %s latest %s job is not failed", workflowID, operation)
+	}
+	var attempts int
+	if err = s.db.QueryRow(`SELECT COUNT(*) FROM workflow_jobs WHERE workflow_id=? AND operation=?`, workflowID, operation).Scan(&attempts); err != nil {
+		return Workflow{}, err
+	}
+	if attempts >= MaxWorkflowJobAttempts {
+		return Workflow{}, fmt.Errorf("workflow %s %s retry limit reached (%d attempts)", workflowID, operation, attempts)
+	}
+	events, err := s.Events(workflowID)
+	if err != nil {
+		return Workflow{}, err
+	}
+	want := "job-blocker:" + jobID
+	matched := false
+	for i := len(events) - 1; i >= 0 && !matched; i-- {
+		if events[i].To != StateBlocked {
+			continue
+		}
+		for _, artifact := range events[i].ArtifactIDs {
+			matched = matched || artifact == want
+		}
+		break
+	}
+	if !matched {
+		return Workflow{}, errors.New("workflow: active blocker is not the latest failed job")
+	}
+	return s.Transition(Transition{WorkflowID: workflowID, ExpectedState: StateBlocked, ExpectedVersion: w.StateVersion, NextState: w.ResumeTarget, IdempotencyKey: "technical-retry:" + jobID})
+}
+
+func (s *SQLiteStore) WorkflowJobAttempts(workflowID, operation string) (int, error) {
+	var attempts int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM workflow_jobs WHERE workflow_id=? AND operation=?`, workflowID, operation).Scan(&attempts)
+	return attempts, err
 }
 
 func (s *SQLiteStore) CancelWorkflowJobs(workflowID string, _ time.Time) ([]WorkflowJob, error) {

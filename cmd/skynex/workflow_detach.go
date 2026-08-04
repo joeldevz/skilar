@@ -30,22 +30,28 @@ func hasFlag(args []string, name string) bool {
 }
 
 func workflowRunDetached(store *workflow.SQLiteStore, repo, id string, out io.Writer) error {
+	if err := store.ReconcileStaleWorkflowJobs(id, time.Now()); err != nil {
+		return err
+	}
 	w, err := store.Get(id)
 	if err != nil {
 		return err
 	}
-	if w.State != workflow.StateReady && w.State != workflow.StateExecuting && w.State != workflow.StateVerifying {
+	if w.State != workflow.StateReady && w.State != workflow.StateExecuting && w.State != workflow.StateVerifying && w.State != workflow.StateBlocked {
 		return fmt.Errorf("workflow %s cannot run from %s", id, w.State)
 	}
 	return workflowQueueDetached(store, repo, id, "run", w, out)
 }
 
 func workflowReviewDetached(store *workflow.SQLiteStore, id string, out io.Writer) error {
+	if err := store.ReconcileStaleWorkflowJobs(id, time.Now()); err != nil {
+		return err
+	}
 	w, err := store.Get(id)
 	if err != nil {
 		return err
 	}
-	if w.State != workflow.StateCandidateFrozen && w.State != workflow.StateReviewing {
+	if w.State != workflow.StateCandidateFrozen && w.State != workflow.StateReviewing && w.State != workflow.StateBlocked {
 		return fmt.Errorf("workflow %s cannot review from %s", id, w.State)
 	}
 	var raw []byte
@@ -68,6 +74,16 @@ func workflowQueueDetached(store *workflow.SQLiteStore, repo, id, operation stri
 	}
 	if err := store.ReconcileStaleWorkflowJobs(id, time.Now()); err != nil {
 		return err
+	}
+	w, err := store.Get(id)
+	if err != nil {
+		return err
+	}
+	if w.State == workflow.StateBlocked {
+		w, err = store.RetryTechnicalWorkflowJob(id, operation, time.Now())
+		if err != nil {
+			return err
+		}
 	}
 	token, err := newFencingToken()
 	if err != nil {

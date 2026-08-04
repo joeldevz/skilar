@@ -32,5 +32,15 @@ func TestWorkflowPluginUsesDocumentedWakeAPIAndNeverDelivers(t *testing.T) {
 				t.Fatalf("%s forbidden %q", name, forbidden)
 			}
 		}
+		for _, required := range []string{"automatically continue the next safe managed action", "genuine blocker", "human gate", "destructive ambiguity", "retries are exhausted"} {
+			if !strings.Contains(text, required) {
+				t.Fatalf("%s wake policy missing %q", name, required)
+			}
+		}
+		for _, forbidden := range []string{"then report the result", "do not review or deliver automatically"} {
+			if strings.Contains(strings.ToLower(text), forbidden) {
+				t.Fatalf("%s contains report-only wake policy %q", name, forbidden)
+			}
+		}
 	}
 }

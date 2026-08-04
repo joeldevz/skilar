@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -80,6 +81,57 @@ func TestWorkflowAgentDefaultsToDedicatedPrimaryAndPreservesExplicitAgent(t *tes
 	}
 	if got := workflowAgent([]string{"--agent", "explicit-primary"}); got != "explicit-primary" {
 		t.Fatalf("explicit agent=%q", got)
+	}
+}
+
+func TestWorkflowStartInfersPlannedMediumForSensitiveRequests(t *testing.T) {
+	requests := []string{
+		"rotate the API keys used by authentication",
+		"install an external payment SDK dependency",
+		"add a database migration for payments",
+	}
+	for i, request := range requests {
+		t.Run(fmt.Sprintf("case-%d", i), func(t *testing.T) {
+			repo, store := cliWorkflowRepo(t)
+			defer store.Close()
+			if err := workflowStart(store, repo, []string{"--id", "wf", "--request", request, "--accept", "true", "--check", "true", "--path", "a.txt"}, &bytes.Buffer{}); err != nil {
+				t.Fatal(err)
+			}
+			w, err := store.Get("wf")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if w.Route != workflow.RoutePlanned || w.MinimumRisk != workflow.RiskMedium {
+				t.Fatalf("route=%s risk=%s", w.Route, w.MinimumRisk)
+			}
+		})
+	}
+}
+
+func TestWorkflowStartSensitiveRequestRejectsExplicitSimpleDowngrade(t *testing.T) {
+	repo, store := cliWorkflowRepo(t)
+	defer store.Close()
+	err := workflowStart(store, repo, []string{"--id", "wf", "--request", "change authentication token handling", "--route", "simple", "--override-actor", "tester", "--override-reason", "force simple", "--accept", "true", "--check", "true", "--path", "a.txt"}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "cannot use simple route") {
+		t.Fatalf("err=%v", err)
+	}
+	if _, getErr := store.Get("wf"); getErr == nil {
+		t.Fatal("rejected downgrade created workflow state")
+	}
+}
+
+func TestWorkflowStartBenignRequestRemainsSimpleLow(t *testing.T) {
+	repo, store := cliWorkflowRepo(t)
+	defer store.Close()
+	if err := workflowStart(store, repo, []string{"--id", "wf", "--request", "rename the local heading", "--accept", "true", "--check", "true", "--path", "a.txt"}, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	w, err := store.Get("wf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Route != workflow.RouteSimple || w.MinimumRisk != workflow.RiskLow {
+		t.Fatalf("route=%s risk=%s", w.Route, w.MinimumRisk)
 	}
 }
 

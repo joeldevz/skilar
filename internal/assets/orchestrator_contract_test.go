@@ -242,7 +242,27 @@ func assertGitRiskPolicy(t *testing.T, root string) {
 			t.Fatal(err)
 		}
 		text := strings.ToLower(string(raw))
-		for _, want := range []string{"read-only git", "git status", "git restore --staged", "stage exact paths", "do not ask the user to run", "do not delegate", "git restore --worktree", "exact paths and impact", "untracked", "commit, push, and pr", "force push", "reset --hard", "clean -fd"} {
+		// Every agent carries the shared baseline; the ladder above it is
+		// proportional to what the role is allowed to mutate.
+		for _, want := range []string{"read-only git", "do not delegate", "untracked", "force push", "reset --hard", "clean -fd"} {
+			if !strings.Contains(text, want) {
+				t.Errorf("%s missing git policy %q", entry.Name(), want)
+			}
+		}
+		if strings.Contains(text, "stricter read-only boundary") {
+			// Roles that inspect an immutable candidate must prohibit every
+			// mutation outright instead of documenting bounded local actions.
+			for _, want := range []string{"do not stage paths", "do not run `git restore`", "commit, push, or open a pr", "prohibited outright"} {
+				if !strings.Contains(text, want) {
+					t.Errorf("%s missing read-only git policy %q", entry.Name(), want)
+				}
+			}
+			if strings.Contains(text, "may be executed directly") {
+				t.Errorf("%s grants bounded mutations despite a read-only boundary", entry.Name())
+			}
+			continue
+		}
+		for _, want := range []string{"git status", "git restore --staged", "stage exact paths", "do not ask the user to run", "git restore --worktree", "exact paths and impact", "commit, push, and pr"} {
 			if !strings.Contains(text, want) {
 				t.Errorf("%s missing git policy %q", entry.Name(), want)
 			}

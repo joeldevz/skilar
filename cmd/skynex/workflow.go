@@ -79,7 +79,7 @@ func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
 		return err
 	}
 	if _, statErr := os.Lstat(path); os.IsNotExist(statErr) {
-		if args[0] == "status" || args[0] == "inspect" {
+		if args[0] == "status" {
 			if len(args) > 1 {
 				return fmt.Errorf("workflow database not found at %s", path)
 			}

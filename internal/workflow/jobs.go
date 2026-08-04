@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -250,7 +251,7 @@ func (s *SQLiteStore) ClaimWorkflowNotificationForActive(consumer string, active
 	return s.claimWorkflowNotification(consumer, activeSessions, true, now)
 }
 
-func (s *SQLiteStore) claimWorkflowNotification(consumer string, _ []string, allowRebind bool, now time.Time) (*WorkflowNotification, error) {
+func (s *SQLiteStore) claimWorkflowNotification(consumer string, activeSessions []string, allowRebind bool, now time.Time) (*WorkflowNotification, error) {
 	if consumer == "" {
 		return nil, errors.New("notification consumer is required")
 	}
@@ -269,7 +270,24 @@ func (s *SQLiteStore) claimWorkflowNotification(consumer string, _ []string, all
 	condition := "j.session_id=?"
 	queryArgs := []any{cutoff, consumer}
 	if allowRebind {
-		condition = "(j.session_id=? OR NOT EXISTS (SELECT 1 FROM workflow_session_presence p WHERE p.session_id=j.session_id AND p.last_seen>=?))"
+		// A caller-declared live session keeps its notification even when its
+		// presence heartbeat has lapsed, so a stalled heartbeat alone cannot
+		// hand a still-live wake prompt to another consumer.
+		var active []any
+		seen := map[string]bool{}
+		for _, session := range activeSessions {
+			if session == "" || session == consumer || seen[session] {
+				continue
+			}
+			seen[session] = true
+			active = append(active, session)
+		}
+		stale := "NOT EXISTS (SELECT 1 FROM workflow_session_presence p WHERE p.session_id=j.session_id AND p.last_seen>=?)"
+		if len(active) > 0 {
+			stale = "j.session_id NOT IN (?" + strings.Repeat(",?", len(active)-1) + ") AND " + stale
+			queryArgs = append(queryArgs, active...)
+		}
+		condition = "(j.session_id=? OR (" + stale + "))"
 		queryArgs = append(queryArgs, dbTime(now.Add(-WorkflowSessionPresenceTTL)))
 	}
 	query := `SELECT n.id,n.workflow_id,n.job_id,n.terminal_state,n.created_at,j.session_id,j.operation,j.state,j.error,j.heartbeat_at FROM workflow_notifications n JOIN workflow_jobs j ON j.id=n.job_id WHERE n.acked_at='' AND (n.claim_token='' OR n.claimed_at<?) AND ` + condition + ` ORDER BY n.created_at,n.id LIMIT 1`

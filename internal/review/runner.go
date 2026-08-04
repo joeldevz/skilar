@@ -293,7 +293,10 @@ func (r *OpenCodeReviewRunner) invoke(parent context.Context, workflowID string,
 	// Recover a result durably written after process completion but before the
 	// caller validated/checkpointed it. Validation still happens in Run.
 	if err := r.Store.Database().QueryRow(`SELECT result_json FROM review_invocations WHERE id=? AND workflow_id=? AND candidate_tree=? AND lens=? AND model=? AND prompt_hash=? AND policy_hash=? AND status='completed' AND length(result_json)>0`, "review:"+workflowID+":"+lens, workflowID, c.TreeOID, lens, r.Options.Model, promptHash, c.PolicyHash).Scan(&cached); err == nil {
-		return cached, nil
+		// review_invocations stores the raw process result; the fresh path
+		// returns it redacted, so a resumed run must produce the same bytes or
+		// the receipt digest would not be reproducible across an interruption.
+		return (&artifactstore.Store{}).Redact(cached), nil
 	}
 	timeout := r.Options.Timeout
 	if timeout <= 0 {

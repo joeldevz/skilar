@@ -248,3 +248,43 @@ func TestNotificationSafelyRebindsOnlyWhenOriginalSessionIsGone(t *testing.T) {
 		t.Fatalf("duplicate claim=%+v err=%v", second, err)
 	}
 }
+
+func TestNotificationKeepsDeclaredActiveSessionAfterHeartbeatLapse(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "workflows.db")
+	s, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err = s.Create(Workflow{ID: "wf", Route: RouteSimple, MinimumRisk: RiskLow}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.CreateWorkflowJob("job", "wf", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.BindWorkflowJobSession("job", "owner-session"); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.FinishWorkflowJob("job", JobSucceeded, "delivered", "", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err = s.HeartbeatWorkflowSession("owner-session", now); err != nil {
+		t.Fatal(err)
+	}
+	lapsed := now.Add(WorkflowSessionPresenceTTL + time.Second)
+	n, err := s.ClaimWorkflowNotificationForActive("other-session", []string{"other-session", "owner-session"}, lapsed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != nil {
+		t.Fatalf("stole notification from a declared-active session: %+v", n)
+	}
+	owned, err := s.ClaimWorkflowNotificationForActive("owner-session", []string{"other-session", "owner-session"}, lapsed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owned == nil || owned.ClaimedBy != "owner-session" {
+		t.Fatalf("owner could not claim its own notification: %+v", owned)
+	}
+}

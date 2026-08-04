@@ -82,3 +82,41 @@ func TestLegacyExactDigestPreservesModified(t *testing.T) {
 		t.Fatal("modified legacy file removed")
 	}
 }
+
+func TestInstallOwnedTreeIgnoresOutOfTreeManifestEntries(t *testing.T) {
+	base := t.TempDir()
+	src := filepath.Join(base, "src")
+	dst := filepath.Join(base, "dst")
+	outside := filepath.Join(base, "secret.txt")
+	_ = os.MkdirAll(src, 0o700)
+	_ = os.MkdirAll(dst, 0o700)
+	_ = os.WriteFile(filepath.Join(src, "managed.md"), []byte("v1"), 0o600)
+	_ = os.WriteFile(outside, []byte("keep"), 0o600)
+	manifest := `{"files":{"../secret.txt":"` + fileDigest([]byte("keep")) + `"}}`
+	_ = os.WriteFile(filepath.Join(dst, inventoryName), []byte(manifest), 0o600)
+	if err := installOwnedTree(src, dst); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(outside); err != nil {
+		t.Fatalf("retired manifest entry escaped the install tree: %v", err)
+	}
+}
+
+func TestInstallOwnedTreeRefusesSymlinkedDestination(t *testing.T) {
+	base := t.TempDir()
+	src := filepath.Join(base, "src")
+	dst := filepath.Join(base, "dst")
+	outside := filepath.Join(base, "outside.md")
+	_ = os.MkdirAll(src, 0o700)
+	_ = os.MkdirAll(dst, 0o700)
+	_ = os.WriteFile(filepath.Join(src, "managed.md"), []byte("v1"), 0o600)
+	if err := os.Symlink(outside, filepath.Join(dst, "managed.md")); err != nil {
+		t.Skip(err)
+	}
+	if err := installOwnedTree(src, dst); err == nil {
+		t.Fatal("wrote managed content through a symlinked destination")
+	}
+	if _, err := os.Stat(outside); err == nil {
+		t.Fatal("symlink target was created outside the install tree")
+	}
+}

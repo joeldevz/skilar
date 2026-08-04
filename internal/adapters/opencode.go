@@ -120,7 +120,7 @@ func InstallOpencodeWithReporterAndOptions(srcDir string, req *models.InstallReq
 			}
 		}
 	}
-	if err := installOwnedTreeExcluding(sourceDir, target, excluded); err != nil {
+	if err := installOwnedTreeExcluding(sourceDir, target, excluded, reporter); err != nil {
 		return fmt.Errorf("copy opencode dir: %w", err)
 	}
 

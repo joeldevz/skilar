@@ -7,7 +7,6 @@ This repository installs a multi-agent system for Claude Code with auto-validati
 | Agent | Role | Model | Invoke as |
 |-------|------|-------|-----------|
 | `orchestrator` | Coordinates the full pipeline | Sonnet (mid-tier) | Main thread |
-| `product-planner` | SPEC.md — what and why (business context) | Haiku (fast) | Task subagent |
 | `tech-planner` | PLAN.md — how (prescriptive steps with How section) | Sonnet (mid-tier) | Task subagent |
 | `coder` | Implements one step at a time | Haiku (fast) | Task subagent |
 | `verifier` | Lint + build + tests after each coder step | Haiku (fast) | Task subagent |
@@ -36,8 +35,8 @@ User gives task
 │   └── 0d. Synthesis + save discovery to Neurox
 │
 ├── Phase 1: PLANNING
-│   ├── Launch product-planner + tech-planner in PARALLEL
-│   └── Produces: SPEC.md + PLAN.md
+│   ├── Launch tech-planner (reads the task, or an existing SPEC when present)
+│   └── Produces: PLAN.md
 │
 ├── Phase 2: EXECUTION (per step)
 │   ├── Launch coder → then verifier

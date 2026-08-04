@@ -89,3 +89,9 @@ while ($true) { $c = $l.GetContext(); if ($c.Request.Url.AbsolutePath -eq '/api/
   Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
   Remove-Item Env:SKYNEX_TEST_MODE,Env:SKYNEX_TEST_ALLOWED_SIGNERS -ErrorAction SilentlyContinue
 }
+
+# The last native command is deliberately expected to fail for the tampered
+# signature case. GitHub Actions' pwsh wrapper propagates that stale native exit
+# code even though every assertion above passed, so explicitly mark the suite's
+# successful completion after cleanup.
+exit 0

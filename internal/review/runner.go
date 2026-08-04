@@ -8,10 +8,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"syscall"
+	"reflect"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/joeldevz/skynex/internal/approval"
@@ -22,9 +27,71 @@ import (
 )
 
 var ErrMalformedReview = errors.New("review: malformed OpenCode result")
+var ErrReviewIdleTimeout = errors.New("review: OpenCode produced no output before idle timeout")
+
+func semanticPrompt() string {
+	return `Assess risk for the immutable candidate. Write exactly one JSON object and nothing else to $SKYNEX_RESULT_FILE. Schema: {"requested_risk":"low|medium|high","selected_lens":"|risk|readability|reliability|resilience","justification":"non-empty string"}. requested_risk is required. selected_lens is required and non-empty only when requested_risk is medium. No Markdown or code fences.`
+}
+
+func lensPrompt(lens Lens) string {
+	return fmt.Sprintf(`Review lens %s only for the immutable candidate. Write exactly one JSON object and nothing else to $SKYNEX_RESULT_FILE. Schema: {"findings":[{"id":"optional string","lens":"optional string","severity":"severe|warning|info","message":"non-empty string","reproducible":true|false,"candidate_caused":true|false,"evidence_ids":["string"]}]}. findings is required (empty array allowed). No Markdown or code fences.`, lens)
+}
+
+func validateSemanticOutput(raw []byte, out *semanticOutput) string {
+	if err := json.Unmarshal(raw, out); err != nil {
+		return "invalid JSON: " + err.Error()
+	}
+	if out.RequestedRisk != RiskLow && out.RequestedRisk != RiskMedium && out.RequestedRisk != RiskHigh {
+		return "missing or invalid requested_risk"
+	}
+	if out.Justification == "" {
+		return "missing justification"
+	}
+	validLens := out.SelectedLens == LensRisk || out.SelectedLens == LensReadability || out.SelectedLens == LensReliability || out.SelectedLens == LensResilience
+	if out.RequestedRisk == RiskMedium && !validLens {
+		return "missing or invalid selected_lens for medium risk"
+	}
+	if out.RequestedRisk != RiskMedium && out.SelectedLens != "" {
+		return "selected_lens must be empty unless requested_risk is medium"
+	}
+	return ""
+}
+
+func validateLensOutput(raw []byte, out *lensOutput) string {
+	if err := json.Unmarshal(raw, out); err != nil {
+		return "invalid JSON: " + err.Error()
+	}
+	var shape map[string]json.RawMessage
+	_ = json.Unmarshal(raw, &shape)
+	if _, ok := shape["findings"]; !ok {
+		return "missing findings"
+	}
+	for i, f := range out.Findings {
+		if f.Message == "" {
+			return fmt.Sprintf("finding %d missing message", i)
+		}
+		if f.Severity != "severe" && f.Severity != "warning" && f.Severity != "info" {
+			return fmt.Sprintf("finding %d invalid severity", i)
+		}
+	}
+	return ""
+}
+
+func (r *OpenCodeReviewRunner) persistMalformed(workflowID, lens string, raw []byte, detail string) {
+	redacted := (&artifactstore.Store{}).Redact(raw)
+	if len(redacted) > 4096 {
+		redacted = redacted[:4096]
+	}
+	preview := detail + ": " + string(redacted)
+	if len(preview) > 4096 {
+		preview = preview[:4096]
+	}
+	_, _ = r.Store.Database().Exec(`UPDATE review_invocations SET status='malformed',error_preview=? WHERE id=?`, preview, "review:"+workflowID+":"+lens)
+}
 
 type Finding struct {
 	ID              string   `json:"id"`
+	SourceID        string   `json:"source_id,omitempty"`
 	Lens            string   `json:"lens"`
 	Severity        string   `json:"severity"`
 	Message         string   `json:"message"`
@@ -44,6 +111,7 @@ type OpenCodeReviewOptions struct {
 	Executable, Model string
 	Timeout           time.Duration
 	MaxOutputBytes    int
+	IdleTimeout       time.Duration
 }
 type OpenCodeReviewRunner struct {
 	Store   *workflow.SQLiteStore
@@ -51,6 +119,7 @@ type OpenCodeReviewRunner struct {
 }
 
 func (r *OpenCodeReviewRunner) Run(ctx context.Context, workflowID string) (Receipt, error) {
+	r.reconcileInterrupted(workflowID)
 	w, err := r.Store.Get(workflowID)
 	if err != nil {
 		return Receipt{}, err
@@ -91,13 +160,17 @@ func (r *OpenCodeReviewRunner) Run(ctx context.Context, workflowID string) (Rece
 		_, _ = r.Store.Transition(workflow.Transition{WorkflowID: workflowID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateReplanRequired, IdempotencyKey: "review:drift:v1"})
 		return Receipt{}, ErrCandidateMismatch
 	}
-	semanticRaw, err := r.invoke(ctx, workflowID, verified.Record, "semantic", "Assess risk. Output requested_risk, selected_lens when medium, and justification.")
+	semanticRaw, err := r.invoke(ctx, workflowID, verified.Record, "semantic", semanticPrompt())
 	if err != nil {
 		return Receipt{}, err
 	}
 	var semantic semanticOutput
-	if json.Unmarshal(semanticRaw, &semantic) != nil || semantic.Justification == "" {
-		return Receipt{}, ErrMalformedReview
+	if detail := validateSemanticOutput(semanticRaw, &semantic); detail != "" {
+		r.persistMalformed(workflowID, "semantic", semanticRaw, detail)
+		return Receipt{}, fmt.Errorf("%w: %s", ErrMalformedReview, detail)
+	}
+	if err = r.persistCheckpoint(workflowID, verified.Record, "semantic", semanticPrompt(), semanticRaw); err != nil {
+		return Receipt{}, err
 	}
 	assessment, err := AssessSemantic(verified.Record, verified.Floor, SemanticInput{RequestedRisk: semantic.RequestedRisk, SelectedLens: semantic.SelectedLens, Justification: semantic.Justification, ModelProvider: "opencode", ModelID: r.Options.Model, PromptTemplateID: "semantic:v1", RenderedRedactedPrompt: "semantic review"}, time.Now())
 	if err != nil {
@@ -121,24 +194,36 @@ func (r *OpenCodeReviewRunner) Run(ctx context.Context, workflowID string) (Rece
 	}
 	severe := false
 	for _, lens := range lenses {
-		lensRaw, invokeErr := r.invoke(ctx, workflowID, verified.Record, string(lens), "Review lens "+string(lens)+". Output structured findings only; do not modify files.")
+		lensRaw, invokeErr := r.invoke(ctx, workflowID, verified.Record, string(lens), lensPrompt(lens))
 		if invokeErr != nil {
 			return Receipt{}, invokeErr
 		}
 		var output lensOutput
-		if json.Unmarshal(lensRaw, &output) != nil {
-			return Receipt{}, ErrMalformedReview
+		if detail := validateLensOutput(lensRaw, &output); detail != "" {
+			r.persistMalformed(workflowID, string(lens), lensRaw, detail)
+			return Receipt{}, fmt.Errorf("%w: %s", ErrMalformedReview, detail)
+		}
+		if err = r.persistCheckpoint(workflowID, verified.Record, string(lens), lensPrompt(lens), lensRaw); err != nil {
+			return Receipt{}, err
 		}
 		evidence = append(evidence, Evidence{ID: "evidence:review:" + workflowID + ":" + string(lens), Kind: EvidenceReview, CandidateRecordID: verified.Record.ID, CandidateTreeOID: verified.Record.TreeOID, PolicyHash: verified.Record.PolicyHash, Digest: hash(lensRaw), Lens: lens})
 		for i := range output.Findings {
 			f := &output.Findings[i]
 			f.Lens = string(lens)
-			if f.ID == "" {
-				f.ID = fmt.Sprintf("finding:%s:%s:%d", workflowID, lens, i)
-			}
+			// Model-provided IDs are untrusted labels, not global authority. Keep
+			// them only as source metadata and assign an engine-owned identity.
+			f.SourceID = f.ID
+			f.ID = fmt.Sprintf("finding:%s:%s:%d", workflowID, lens, i)
 			item, _ := json.Marshal(f)
-			if _, err = r.Store.Database().Exec(`INSERT OR IGNORE INTO review_findings(id,workflow_id,candidate_tree,lens,finding) VALUES(?,?,?,?,?)`, f.ID, workflowID, verified.Record.TreeOID, lens, item); err != nil {
-				return Receipt{}, err
+			var existingWorkflow, existingTree string
+			var existingItem []byte
+			existingErr := r.Store.Database().QueryRow(`SELECT workflow_id,candidate_tree,finding FROM review_findings WHERE id=?`, f.ID).Scan(&existingWorkflow, &existingTree, &existingItem)
+			if existingErr == nil {
+				if existingWorkflow != workflowID || existingTree != verified.Record.TreeOID || !bytes.Equal(existingItem, item) {
+					return Receipt{}, fmt.Errorf("review: authoritative finding identity collision for %s (historical/global ID conflict)", f.ID)
+				}
+			} else if _, err = r.Store.Database().Exec(`INSERT INTO review_findings(id,workflow_id,candidate_tree,lens,finding) VALUES(?,?,?,?,?)`, f.ID, workflowID, verified.Record.TreeOID, lens, item); err != nil {
+				return Receipt{}, fmt.Errorf("review: authoritative finding identity collision for %s (historical/global ID conflict): %w", f.ID, err)
 			}
 			eid := "evidence:" + f.ID
 			evidence = append(evidence, Evidence{ID: eid, Kind: EvidenceReview, CandidateRecordID: verified.Record.ID, CandidateTreeOID: verified.Record.TreeOID, PolicyHash: verified.Record.PolicyHash, Digest: hash(item), Lens: lens})
@@ -199,6 +284,17 @@ func (r *OpenCodeReviewRunner) verificationEvidence(c CandidateRecord) ([]Eviden
 }
 
 func (r *OpenCodeReviewRunner) invoke(parent context.Context, workflowID string, c CandidateRecord, lens, prompt string) ([]byte, error) {
+	promptHash := hash([]byte(prompt))
+	checkpointID := hash([]byte(workflowID + "\x00" + c.TreeOID + "\x00" + c.PolicyHash + "\x00" + lens + "\x00" + r.Options.Model + "\x00" + promptHash))
+	var cached []byte
+	if err := r.Store.Database().QueryRow(`SELECT result_json FROM review_checkpoints WHERE id=? AND workflow_id=? AND candidate_tree=? AND policy_hash=? AND lens=? AND model=? AND prompt_hash=?`, checkpointID, workflowID, c.TreeOID, c.PolicyHash, lens, r.Options.Model, promptHash).Scan(&cached); err == nil {
+		return cached, nil
+	}
+	// Recover a result durably written after process completion but before the
+	// caller validated/checkpointed it. Validation still happens in Run.
+	if err := r.Store.Database().QueryRow(`SELECT result_json FROM review_invocations WHERE id=? AND workflow_id=? AND candidate_tree=? AND lens=? AND model=? AND prompt_hash=? AND policy_hash=? AND status='completed' AND length(result_json)>0`, "review:"+workflowID+":"+lens, workflowID, c.TreeOID, lens, r.Options.Model, promptHash, c.PolicyHash).Scan(&cached); err == nil {
+		return cached, nil
+	}
 	timeout := r.Options.Timeout
 	if timeout <= 0 {
 		timeout = 5 * time.Minute
@@ -220,16 +316,13 @@ func (r *OpenCodeReviewRunner) invoke(parent context.Context, workflowID string,
 	if out, e := gitAt(wt, "read-tree", "--reset", "-u", c.TreeOID); e != nil {
 		return nil, fmt.Errorf("review tree: %w %s", e, out)
 	}
-	_ = filepath.Walk(wt, func(path string, info os.FileInfo, e error) error {
-		if e != nil {
-			return e
-		}
-		mode := os.FileMode(0o400)
-		if info.IsDir() {
-			mode = 0o500
-		}
-		return os.Chmod(path, mode)
-	})
+	if err = makeReviewWorktreeReadOnly(wt); err != nil {
+		return nil, err
+	}
+	immutableBefore, err := snapshotReviewWorktree(wt)
+	if err != nil {
+		return nil, fmt.Errorf("review immutable snapshot: %w", err)
+	}
 	defer filepath.Walk(wt, func(path string, info os.FileInfo, e error) error {
 		if e != nil {
 			return nil
@@ -242,7 +335,7 @@ func (r *OpenCodeReviewRunner) invoke(parent context.Context, workflowID string,
 		return nil
 	})
 	result := filepath.Join(parentDir, "result.json")
-	args := []string{"run", "--format", "json", "--auto", "--dir", wt, "--agent", "plan"}
+	args := []string{"run", "--format", "json", "--auto", "--dir", wt, "--agent", "workflow-reviewer"}
 	if r.Options.Model != "" {
 		args = append(args, "--model", r.Options.Model)
 	}
@@ -251,47 +344,237 @@ func (r *OpenCodeReviewRunner) invoke(parent context.Context, workflowID string,
 	defer cancel()
 	unregister := processregistry.Register(workflowID, "review:"+workflowID+":"+lens, cancel)
 	defer unregister()
-	var output bytes.Buffer
+	idleTimeout := r.Options.IdleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = 2 * time.Minute
+	}
+	activity := make(chan struct{}, 1)
+	output := &reviewRollingBuffer{limit: 4096, onWrite: func(snapshot []byte) {
+		select {
+		case activity <- struct{}{}:
+		default:
+		}
+		preview := (&artifactstore.Store{}).Redact(snapshot)
+		for attempt := 0; attempt < 3; attempt++ {
+			stamp := time.Now().UTC().Format(time.RFC3339Nano)
+			if _, updateErr := r.Store.Database().Exec(`UPDATE review_invocations SET last_activity_at=?,heartbeat_at=?,error_preview=? WHERE id=? AND status='running'`, stamp, stamp, string(preview), "review:"+workflowID+":"+lens); updateErr == nil {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}}
 	cmd := exec.CommandContext(ctx, exe, args...)
 	cmd.Dir = wt
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "SKYNEX_RESULT_FILE=" + result}
-	cmd.Stdout = &output
-	cmd.Stderr = &output
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return os.ErrProcessDone
-		}
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
 	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, err
+	}
+	configureReviewProcess(cmd)
 	start := time.Now().UTC()
-	runErr := cmd.Run()
+	id := "review:" + workflowID + ":" + lens
+	_, err = r.Store.Database().Exec(`INSERT OR REPLACE INTO review_invocations(id,workflow_id,candidate_tree,lens,model,status,output_digest,started_at,finished_at,error_preview,pid,heartbeat_at,last_activity_at,result_json,prompt_hash,policy_hash) VALUES(?,?,?,?,?,'running','',?,'','',0,?,?,'',?,?)`, id, workflowID, c.TreeOID, lens, r.Options.Model, start.Format(time.RFC3339Nano), start.Format(time.RFC3339Nano), start.Format(time.RFC3339Nano), promptHash, c.PolicyHash)
+	if err != nil {
+		return nil, err
+	}
+	runErr := cmd.Start()
+	if runErr == nil {
+		_, _ = r.Store.Database().Exec(`UPDATE review_invocations SET pid=? WHERE id=?`, cmd.Process.Pid, id)
+	}
+	var outputReaders sync.WaitGroup
+	if runErr == nil {
+		outputReaders.Add(2)
+		go func() { defer outputReaders.Done(); _, _ = io.Copy(output, stdoutPipe) }()
+		go func() { defer outputReaders.Done(); _, _ = io.Copy(output, stderrPipe) }()
+	}
+	idleDone := make(chan struct{})
+	var idleFired atomic.Bool
+	var watchdog sync.WaitGroup
+	if runErr == nil {
+		watchdog.Add(1)
+		go func() {
+			defer watchdog.Done()
+			timer := time.NewTimer(idleTimeout)
+			defer timer.Stop()
+			heartbeat := time.NewTicker(100 * time.Millisecond)
+			defer heartbeat.Stop()
+			for {
+				select {
+				case <-idleDone:
+					return
+				case <-activity:
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					timer.Reset(idleTimeout)
+				case now := <-heartbeat.C:
+					preview := (&artifactstore.Store{}).Redact(output.Bytes())
+					_, _ = r.Store.Database().Exec(`UPDATE review_invocations SET heartbeat_at=?,error_preview=? WHERE id=? AND status='running'`, now.UTC().Format(time.RFC3339Nano), string(preview), id)
+				case <-timer.C:
+					idleFired.Store(true)
+					cancel()
+					return
+				}
+			}
+		}()
+	}
+	// Drain both pipes to EOF before Wait closes their descriptors. Waiting
+	// first can race the final stderr bytes and turn a useful redacted failure
+	// preview into an opaque "exit status 1" under race instrumentation.
+	outputReaders.Wait()
+	if runErr == nil {
+		runErr = cmd.Wait()
+	}
+	close(idleDone)
+	watchdog.Wait()
 	end := time.Now().UTC()
 	status := "completed"
 	if runErr != nil {
 		status = "failed"
 	}
-	if ctx.Err() != nil {
+	if idleFired.Load() {
+		status = "idle_timeout"
+	} else if errors.Is(ctx.Err(), context.Canceled) {
+		status = "cancelled"
+	} else if ctx.Err() != nil {
 		status = "timeout"
 	}
 	raw, readErr := os.ReadFile(result)
+	if raw == nil {
+		raw = []byte{}
+	}
+	redactor := artifactstore.Store{}
+	preview := redactor.Redact(output.Bytes())
+	limit := r.Options.MaxOutputBytes
+	if limit <= 0 || limit > 4096 {
+		limit = 4096
+	}
+	if len(preview) > limit {
+		preview = preview[:limit]
+	}
 	digest := hash(output.Bytes())
 	if readErr == nil {
 		digest = hash(raw)
 	}
-	id := "review:" + workflowID + ":" + lens
-	_, _ = r.Store.Database().Exec(`INSERT OR REPLACE INTO review_invocations(id,workflow_id,candidate_tree,lens,model,status,output_digest,started_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?)`, id, workflowID, c.TreeOID, lens, r.Options.Model, status, digest, start.Format(time.RFC3339Nano), end.Format(time.RFC3339Nano))
+	if _, persistErr := r.Store.Database().Exec(`UPDATE review_invocations SET status=?,output_digest=?,finished_at=?,heartbeat_at=?,error_preview=?,result_json=? WHERE id=?`, status, digest, end.Format(time.RFC3339Nano), end.Format(time.RFC3339Nano), string(preview), raw, id); persistErr != nil {
+		return nil, fmt.Errorf("review %s terminal persistence: %w", lens, persistErr)
+	}
+	if immutableErr := verifyReviewWorktreeImmutable(wt, c.TreeOID, immutableBefore); immutableErr != nil {
+		_, _ = r.Store.Database().Exec(`UPDATE review_invocations SET status='failed',error_preview=? WHERE id=?`, immutableErr.Error(), id)
+		return nil, immutableErr
+	}
+	if idleFired.Load() {
+		return nil, fmt.Errorf("review %s invocation: %w", lens, ErrReviewIdleTimeout)
+	}
 	if ctx.Err() != nil {
-		return nil, ctx.Err()
+		if len(preview) == 0 {
+			return nil, fmt.Errorf("review %s invocation: %w", lens, ctx.Err())
+		}
+		return nil, fmt.Errorf("review %s invocation: %w: %s", lens, ctx.Err(), preview)
 	}
 	if runErr != nil {
-		return nil, runErr
+		if len(preview) == 0 {
+			return nil, fmt.Errorf("review %s invocation: %w", lens, runErr)
+		}
+		return nil, fmt.Errorf("review %s invocation: %w: %s", lens, runErr, preview)
 	}
 	if readErr != nil {
 		return nil, ErrMalformedReview
 	}
-	redactor := artifactstore.Store{}
 	return redactor.Redact(raw), nil
+}
+
+func makeReviewWorktreeReadOnly(root string) error {
+	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		mode := os.FileMode(0o400)
+		if info.IsDir() {
+			mode = 0o500
+		} else if info.Mode().Perm()&0o111 != 0 {
+			mode = 0o500
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			return fmt.Errorf("review worktree read-only %s: %w", path, err)
+		}
+		return nil
+	})
+}
+
+type reviewWorktreeEntry struct {
+	Path   string
+	Mode   os.FileMode
+	Digest string
+}
+
+func snapshotReviewWorktree(root string) ([]reviewWorktreeEntry, error) {
+	var entries []reviewWorktreeEntry
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		entry := reviewWorktreeEntry{Path: filepath.ToSlash(rel), Mode: info.Mode()}
+		switch {
+		case info.Mode()&os.ModeSymlink != 0:
+			target, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			entry.Digest = hash([]byte(target))
+		case info.Mode().IsRegular():
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			entry.Digest = hash(raw)
+		}
+		entries = append(entries, entry)
+		return nil
+	})
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
+	return entries, err
+}
+
+func verifyReviewWorktreeImmutable(root, candidateTree string, before []reviewWorktreeEntry) error {
+	after, err := snapshotReviewWorktree(root)
+	if err != nil {
+		return fmt.Errorf("%w: snapshot after review: %v", ErrCandidateMismatch, err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		return fmt.Errorf("%w: review process modified candidate worktree content or mode", ErrCandidateMismatch)
+	}
+	status, err := gitAt(root, "diff", "--no-ext-diff", "--name-status")
+	if err != nil {
+		return fmt.Errorf("%w: inspect review worktree: %v", ErrCandidateMismatch, err)
+	}
+	untracked, err := gitAt(root, "ls-files", "--others", "--exclude-standard")
+	if err != nil {
+		return fmt.Errorf("%w: inspect untracked review files: %v", ErrCandidateMismatch, err)
+	}
+	status += untracked
+	if status != "" {
+		return fmt.Errorf("%w: review process dirtied candidate worktree: %s", ErrCandidateMismatch, strings.TrimSpace(status))
+	}
+	tree, err := gitAt(root, "write-tree")
+	if err != nil {
+		return fmt.Errorf("%w: inspect review index: %v", ErrCandidateMismatch, err)
+	}
+	if strings.TrimSpace(tree) != candidateTree {
+		return fmt.Errorf("%w: review process modified candidate index", ErrCandidateMismatch)
+	}
+	return nil
 }
 func gitAt(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
@@ -300,3 +583,67 @@ func gitAt(dir string, args ...string) (string, error) {
 	return string(out), err
 }
 func hash(raw []byte) string { sum := sha256.Sum256(raw); return hex.EncodeToString(sum[:]) }
+
+type reviewRollingBuffer struct {
+	mu      sync.Mutex
+	buf     bytes.Buffer
+	limit   int
+	onWrite func([]byte)
+}
+
+func (b *reviewRollingBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	_, _ = b.buf.Write(p)
+	if b.limit > 0 && b.buf.Len() > b.limit {
+		all := append([]byte(nil), b.buf.Bytes()...)
+		b.buf.Reset()
+		_, _ = b.buf.Write(all[len(all)-b.limit:])
+	}
+	snapshot := append([]byte(nil), b.buf.Bytes()...)
+	b.mu.Unlock()
+	if len(p) > 0 && b.onWrite != nil {
+		b.onWrite(snapshot)
+	}
+	return len(p), nil
+}
+
+func (b *reviewRollingBuffer) Bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]byte(nil), b.buf.Bytes()...)
+}
+
+func (r *OpenCodeReviewRunner) persistCheckpoint(workflowID string, c CandidateRecord, lens, prompt string, raw []byte) error {
+	promptHash := hash([]byte(prompt))
+	id := hash([]byte(workflowID + "\x00" + c.TreeOID + "\x00" + c.PolicyHash + "\x00" + lens + "\x00" + r.Options.Model + "\x00" + promptHash))
+	_, err := r.Store.Database().Exec(`INSERT OR REPLACE INTO review_checkpoints(id,workflow_id,candidate_tree,policy_hash,lens,model,prompt_hash,result_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, id, workflowID, c.TreeOID, c.PolicyHash, lens, r.Options.Model, promptHash, raw, time.Now().UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+func (r *OpenCodeReviewRunner) reconcileInterrupted(workflowID string) {
+	rows, err := r.Store.Database().Query(`SELECT id,pid FROM review_invocations WHERE workflow_id=? AND status='running'`, workflowID)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	type item struct {
+		id  string
+		pid int
+	}
+	var items []item
+	for rows.Next() {
+		var v item
+		if rows.Scan(&v.id, &v.pid) == nil {
+			items = append(items, v)
+		}
+	}
+	for _, v := range items {
+		alive := false
+		if v.pid > 0 {
+			alive = reviewProcessAlive(v.pid)
+		}
+		if !alive {
+			_, _ = r.Store.Database().Exec(`UPDATE review_invocations SET status='interrupted',finished_at=?,error_preview='review process disappeared before terminal persistence' WHERE id=? AND status='running'`, time.Now().UTC().Format(time.RFC3339Nano), v.id)
+		}
+	}
+}

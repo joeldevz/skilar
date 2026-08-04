@@ -1,6 +1,7 @@
 package assets
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,12 +25,90 @@ func assertWorkflowOrchestratorContract(t *testing.T, raw []byte) {
 	}
 }
 
+func assertPRReviewEvidenceContract(t *testing.T, raw []byte) {
+	t.Helper()
+	text := strings.ToLower(string(raw))
+	required := []string{
+		"evidence gate",
+		"independently executed",
+		"tool-observed",
+		"author-claimed",
+		"hypothesis/unverified",
+		"delegated findings are provisional",
+		"primary verification",
+		"neurox.save",
+		"baseline",
+		"base sha",
+	}
+	for _, value := range required {
+		if !strings.Contains(text, value) {
+			t.Errorf("orchestrator PR review contract missing %q", value)
+		}
+	}
+	assertPRReviewEvidenceStructure(t, text)
+}
+
+func prReviewEvidenceSection(text string) string {
+	const heading = "## pr review evidence gate"
+	start := strings.Index(text, heading)
+	if start < 0 {
+		return ""
+	}
+	section := text[start+len(heading):]
+	if end := strings.Index(section, "\n## "); end >= 0 {
+		section = section[:end]
+	}
+	return section
+}
+
+func validPRReviewEvidenceStructure(text string) bool {
+	section := prReviewEvidenceSection(text)
+	if section == "" {
+		return false
+	}
+	for _, provenance := range []string{"independently executed", "tool-observed", "author-claimed", "hypothesis/unverified"} {
+		if !strings.Contains(section, provenance) {
+			return false
+		}
+	}
+	positions := []int{
+		strings.Index(section, "primary verification"),
+		strings.Index(section, "contradiction resolution"),
+		strings.Index(section, "drafted verdict"),
+		strings.LastIndex(section, "neurox.save"),
+	}
+	for index, position := range positions {
+		if position < 0 || (index > 0 && position <= positions[index-1]) {
+			return false
+		}
+	}
+	return true
+}
+
+func assertPRReviewEvidenceStructure(t *testing.T, text string) {
+	t.Helper()
+	if !validPRReviewEvidenceStructure(text) {
+		t.Error("orchestrator PR review contract must keep all provenance categories inside Evidence Gate and order primary verification, contradiction resolution, drafted verdict, then neurox.save")
+	}
+}
+
+func TestPRReviewEvidenceStructureRejectsGlobalMarkersAndEarlySave(t *testing.T) {
+	text := `independently executed tool-observed author-claimed hypothesis/unverified
+## PR review Evidence Gate
+call neurox.save, then perform primary verification, resolve contradictions, and draft the verdict`
+	if validPRReviewEvidenceStructure(strings.ToLower(text)) {
+		t.Fatal("accepted provenance outside Evidence Gate and neurox.save before verification/synthesis")
+	}
+}
+
 func TestSourceOrchestratorUsesWorkflowV2Contract(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", "opencode", "agents", "orchestrator.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertWorkflowOrchestratorContract(t, raw)
+	assertPRReviewEvidenceContract(t, raw)
+	assertDetachedWorkflowContract(t, raw)
 }
 
 func TestEmbeddedInstallPreservesWorkflowV2Contract(t *testing.T) {
@@ -46,4 +125,171 @@ func TestEmbeddedInstallPreservesWorkflowV2Contract(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertWorkflowOrchestratorContract(t, raw)
+	assertPRReviewEvidenceContract(t, raw)
+	assertDetachedWorkflowContract(t, raw)
+}
+
+func assertDetachedWorkflowContract(t *testing.T, raw []byte) {
+	t.Helper()
+	text := strings.ToLower(string(raw))
+	for _, want := range []string{"workflow run workflow_id --detach", "workflow review --id workflow_id --detach", "never create or delegate a subagent", "shell `&`", "`nohup`", "`tmux`", "keep the chat free", "read-only `workflow status`", "`workflow inspect`"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("orchestrator detached contract missing %q", want)
+		}
+	}
+}
+
+func assertWorkflowWorkerContract(t *testing.T, root string) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(root, "agents", "workflow-worker.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := strings.ToLower(string(raw))
+	for _, required := range []string{"primary agent", "non-interactive", "allowed paths", "checks", "do not commit", "do not push", "do not create a pr", "do not review", "do not deliver", "do not delegate", "skynex_result_file"} {
+		if !strings.Contains(text, required) {
+			t.Errorf("workflow-worker missing %q", required)
+		}
+	}
+	config, err := os.ReadFile(filepath.Join(root, "opencode.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed struct {
+		Agent map[string]struct {
+			Mode   string `json:"mode"`
+			Prompt string `json:"prompt"`
+		} `json:"agent"`
+	}
+	if err := json.Unmarshal(config, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	worker, ok := parsed.Agent["workflow-worker"]
+	if !ok || worker.Mode == "subagent" || !strings.Contains(worker.Prompt, "workflow-worker.md") {
+		t.Fatalf("workflow-worker is not primary: %+v", worker)
+	}
+}
+
+func TestWorkflowWorkerIsPrimaryInSourceAndEmbeddedAssets(t *testing.T) {
+	assertWorkflowWorkerContract(t, filepath.Join("..", "..", "opencode"))
+	sub, err := OpencodeFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest := t.TempDir()
+	if err := ExtractTo(sub, dest); err != nil {
+		t.Fatal(err)
+	}
+	assertWorkflowWorkerContract(t, dest)
+}
+
+func assertWorkflowReviewerContract(t *testing.T, root string) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(root, "agents", "workflow-reviewer.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := strings.ToLower(string(raw))
+	for _, want := range []string{"primary agent", "read", "do not modify", "skynex_result_file", "do not commit", "do not delegate", "exactly one json"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("workflow-reviewer missing %q", want)
+		}
+	}
+	config, err := os.ReadFile(filepath.Join(root, "opencode.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed struct {
+		Agent map[string]struct {
+			Mode   string `json:"mode"`
+			Prompt string `json:"prompt"`
+		} `json:"agent"`
+	}
+	if err := json.Unmarshal(config, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	reviewer, ok := parsed.Agent["workflow-reviewer"]
+	if !ok || reviewer.Mode != "primary" || !strings.Contains(reviewer.Prompt, "workflow-reviewer.md") {
+		t.Fatalf("workflow-reviewer invalid: %+v", reviewer)
+	}
+}
+
+func TestWorkflowReviewerIsPrimaryInSourceAndEmbeddedAssets(t *testing.T) {
+	assertWorkflowReviewerContract(t, filepath.Join("..", "..", "opencode"))
+	sub, err := OpencodeFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest := t.TempDir()
+	if err := ExtractTo(sub, dest); err != nil {
+		t.Fatal(err)
+	}
+	assertWorkflowReviewerContract(t, dest)
+}
+
+func assertGitRiskPolicy(t *testing.T, root string) {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(root, "agents"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(root, "agents", entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := strings.ToLower(string(raw))
+		for _, want := range []string{"read-only git", "git status", "git restore --staged", "stage exact paths", "do not ask the user to run", "do not delegate", "git restore --worktree", "exact paths and impact", "untracked", "commit, push, and pr", "force push", "reset --hard", "clean -fd"} {
+			if !strings.Contains(text, want) {
+				t.Errorf("%s missing git policy %q", entry.Name(), want)
+			}
+		}
+	}
+}
+
+func TestAllSourceAndEmbeddedAgentsUseRiskBasedGitPolicy(t *testing.T) {
+	assertGitRiskPolicy(t, filepath.Join("..", "..", "opencode"))
+	sub, err := OpencodeFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest := t.TempDir()
+	if err := ExtractTo(sub, dest); err != nil {
+		t.Fatal(err)
+	}
+	assertGitRiskPolicy(t, dest)
+}
+
+func assertContinuousWorkflowPolicy(t *testing.T, raw []byte) {
+	t.Helper()
+	text := strings.ToLower(string(raw))
+	for _, want := range []string{"continuous execution", "do not ask", "candidate_frozen", "workflow review --id", "--detach", "replan_required", "verify the evidence", "corrective workflow", "derived", "idempotent", "technical job failure", "retry", "retries are exhausted", "human gate", "destructive", "real ambiguity", "do not auto-approve", "do not auto-deliver", "commit, push, or pr", "receipt-driven development is disabled", "kill switch"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("continuous workflow policy missing %q", want)
+		}
+	}
+}
+
+func TestSourceAndEmbeddedOrchestratorContinueWithoutPermissionLoops(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "opencode", "agents", "orchestrator.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertContinuousWorkflowPolicy(t, raw)
+	sub, err := OpencodeFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest := t.TempDir()
+	if err := ExtractTo(sub, dest); err != nil {
+		t.Fatal(err)
+	}
+	raw, err = os.ReadFile(filepath.Join(dest, "agents", "orchestrator.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertContinuousWorkflowPolicy(t, raw)
 }

@@ -30,6 +30,16 @@ type workflowRunInput struct {
 	Seal                              gitcandidate.ContextSeal
 	SliceConfigs                      map[string]sliceRunConfig
 }
+
+const defaultWorkflowWorkerAgent = "workflow-worker"
+
+func workflowAgent(args []string) string {
+	if value := valueOrEmpty(args, "--agent"); value != "" {
+		return value
+	}
+	return defaultWorkflowWorkerAgent
+}
+
 type sliceRunConfig struct{ Paths, Checks []string }
 type planFile struct {
 	Slices []planFileSlice `json:"slices"`
@@ -131,7 +141,7 @@ func workflowStart(store *workflow.SQLiteStore, repo string, args []string, out 
 		if _, e = store.Database().Exec(`INSERT INTO wayfinder_graphs(workflow_id,version,graph) VALUES(?,?,?)`, id, graph.Version, encoded); e != nil {
 			return e
 		}
-		input := workflowRunInput{Request: request, Model: valueOrEmpty(args, "--model"), Agent: valueOrEmpty(args, "--agent"), Executable: valueOrEmpty(args, "--opencode"), Timeout: 10 * time.Minute, Seal: seal}
+		input := workflowRunInput{Request: request, Model: valueOrEmpty(args, "--model"), Agent: workflowAgent(args), Executable: valueOrEmpty(args, "--opencode"), Timeout: 10 * time.Minute, Seal: seal}
 		data, _ := json.Marshal(input)
 		_, e = store.Database().Exec(`INSERT INTO workflow_run_inputs(workflow_id,input) VALUES(?,?)`, id, data)
 		if e != nil {
@@ -175,7 +185,7 @@ func workflowStart(store *workflow.SQLiteStore, repo string, args []string, out 
 			return fmt.Errorf("invalid --timeout: %w", err)
 		}
 	}
-	input := workflowRunInput{Request: request, Acceptance: acceptance, Checks: checks, AllowedPaths: paths, Model: valueOrEmpty(args, "--model"), Agent: valueOrEmpty(args, "--agent"), Executable: valueOrEmpty(args, "--opencode"), Timeout: timeout, Seal: seal, SliceConfigs: configs}
+	input := workflowRunInput{Request: request, Acceptance: acceptance, Checks: checks, AllowedPaths: paths, Model: valueOrEmpty(args, "--model"), Agent: workflowAgent(args), Executable: valueOrEmpty(args, "--opencode"), Timeout: timeout, Seal: seal, SliceConfigs: configs}
 	raw, _ := json.Marshal(input)
 	if _, err = store.Database().Exec(`INSERT INTO workflow_run_inputs(workflow_id,input) VALUES(?,?)`, id, raw); err != nil {
 		return err
@@ -185,9 +195,16 @@ func workflowStart(store *workflow.SQLiteStore, repo string, args []string, out 
 }
 
 func workflowRun(store *workflow.SQLiteStore, repo string, args []string, out io.Writer) error {
+	return workflowRunContext(context.Background(), store, repo, args, out)
+}
+
+func workflowRunContext(ctx context.Context, store *workflow.SQLiteStore, repo string, args []string, out io.Writer) error {
 	id, err := requiredWorkflowID(args)
 	if err != nil {
 		return err
+	}
+	if hasFlag(args, "--detach") {
+		return workflowRunDetached(store, repo, id, out)
 	}
 	w, err := store.Get(id)
 	if err != nil {
@@ -238,10 +255,6 @@ func workflowRun(store *workflow.SQLiteStore, repo string, args []string, out io
 				if ready == nil {
 					break
 				}
-				candidate, freezeErr := gitcandidate.Freeze(seal, gitcandidate.Policy{})
-				if freezeErr != nil {
-					return freezeErr
-				}
 				attemptID := id + ":" + ready.ID
 				owner := "workflow-cli"
 				token, tokenErr := newFencingToken()
@@ -252,25 +265,40 @@ func workflowRun(store *workflow.SQLiteStore, repo string, args []string, out io
 				if config, ok := input.SliceConfigs[ready.ID]; ok {
 					allowed = config.Paths
 				}
+				if err = waitForWorkflowLease(ctx, store, "worktree:"+seal.WorktreeID, owner, token, input.Timeout+time.Minute); err != nil {
+					return err
+				}
+				candidate, freezeErr := gitcandidate.Freeze(seal, gitcandidate.Policy{})
+				if freezeErr != nil {
+					_, _ = store.Database().Exec(`DELETE FROM leases WHERE resource=? AND owner=? AND fencing_token=?`, "worktree:"+seal.WorktreeID, owner, token)
+					return freezeErr
+				}
 				attempt = execution.Attempt{ID: attemptID, WorkflowID: id, SliceID: ready.ID, WorktreeID: seal.WorktreeID, Owner: owner, FencingToken: token, BasisTree: candidate.TreeOID, AllowedPaths: allowed, OperationID: "mutation:" + attemptID}
 				if err = scheduler.Start(attempt); err != nil {
+					_, _ = store.Database().Exec(`DELETE FROM leases WHERE resource=? AND owner=? AND fencing_token=?`, "worktree:"+seal.WorktreeID, owner, token)
 					return err
 				}
 			}
 			if _, leaseErr := store.AcquireLease("worktree:"+seal.WorktreeID, attempt.Owner, attempt.FencingToken, time.Now(), time.Now().Add(input.Timeout+time.Minute)); leaseErr != nil {
 				_, leaseErr = store.HeartbeatLease("worktree:"+seal.WorktreeID, attempt.Owner, attempt.FencingToken, time.Now(), time.Now().Add(input.Timeout+time.Minute))
 				if leaseErr != nil {
-					return leaseErr
+					if err = waitForWorkflowLease(ctx, store, "worktree:"+seal.WorktreeID, attempt.Owner, attempt.FencingToken, input.Timeout+time.Minute); err != nil {
+						return err
+					}
 				}
 			}
 			adapter := execution.OpenCodeAdapter{Store: store, Options: execution.OpenCodeOptions{Executable: input.Executable, Model: input.Model, Agent: input.Agent, Timeout: input.Timeout}}
 			criteria := input.Acceptance
+			checks := input.Checks
 			for _, slice := range graph.Slices {
 				if slice.ID == attempt.SliceID {
 					criteria = slice.AcceptanceCriteria
+					if config, ok := input.SliceConfigs[slice.ID]; ok {
+						checks = config.Checks
+					}
 				}
 			}
-			result, err := adapter.Run(context.Background(), execution.OpenCodeRequest{InvocationID: "invoke:" + attempt.ID, Attempt: attempt, Seal: seal, Prompt: input.Request + "\nAcceptance: " + strings.Join(criteria, "; ")})
+			result, err := adapter.Run(ctx, execution.OpenCodeRequest{InvocationID: "invoke:" + attempt.ID, Attempt: attempt, Seal: seal, Checks: checks, Prompt: input.Request + "\nAcceptance: " + strings.Join(criteria, "; ")})
 			if err != nil {
 				return err
 			}
@@ -306,6 +334,27 @@ func workflowRun(store *workflow.SQLiteStore, repo string, args []string, out io
 	return nil
 }
 
+func waitForWorkflowLease(ctx context.Context, store *workflow.SQLiteStore, resource, owner, token string, duration time.Duration) error {
+	if duration <= 0 {
+		duration = time.Minute
+	}
+	for {
+		now := time.Now()
+		if _, err := store.AcquireLease(resource, owner, token, now, now.Add(duration)); err == nil {
+			return nil
+		} else if !errors.Is(err, workflow.ErrLeaseConflict) {
+			return err
+		}
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
 func workflowReview(store *workflow.SQLiteStore, args []string, out io.Writer) error {
 	id, ok := flagValue(args, "--id")
 	var err error
@@ -315,25 +364,32 @@ func workflowReview(store *workflow.SQLiteStore, args []string, out io.Writer) e
 			return err
 		}
 	}
-	var raw []byte
-	if err = store.Database().QueryRow(`SELECT input FROM workflow_run_inputs WHERE workflow_id=?`, id).Scan(&raw); err != nil {
+	if hasFlag(args, "--detach") {
+		return workflowReviewDetached(store, id, out)
+	}
+	options, err := reviewOptionsForWorkflow(store, id)
+	if err != nil {
 		return err
 	}
-	var input workflowRunInput
-	if err = json.Unmarshal(raw, &input); err != nil {
-		return err
-	}
-	model := input.Model
-	if model == "" {
-		model = "default"
-	}
-	runner := review.OpenCodeReviewRunner{Store: store, Options: review.OpenCodeReviewOptions{Executable: input.Executable, Model: model, Timeout: input.Timeout}}
+	runner := review.OpenCodeReviewRunner{Store: store, Options: options}
 	receipt, err := runner.Run(context.Background(), id)
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(out, "%s\t%s\t%s\n", id, workflow.StateReceipted, receipt.ID)
 	return nil
+}
+
+func reviewOptionsForWorkflow(store *workflow.SQLiteStore, id string) (review.OpenCodeReviewOptions, error) {
+	var raw []byte
+	if err := store.Database().QueryRow(`SELECT input FROM workflow_run_inputs WHERE workflow_id=?`, id).Scan(&raw); err != nil {
+		return review.OpenCodeReviewOptions{}, err
+	}
+	var input workflowRunInput
+	if err := json.Unmarshal(raw, &input); err != nil {
+		return review.OpenCodeReviewOptions{}, err
+	}
+	return review.OpenCodeReviewOptions{Executable: input.Executable, Model: input.Model, Timeout: input.Timeout}, nil
 }
 
 func workflowApprove(store *workflow.SQLiteStore, args []string, out io.Writer) error {

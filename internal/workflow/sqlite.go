@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -75,9 +76,9 @@ func OpenSQLiteReadOnly(path string) (*SQLiteStore, error) {
 		db.Close()
 		return nil, err
 	}
-	if version != 11 {
+	if version != 17 {
 		db.Close()
-		return nil, fmt.Errorf("workflow database schema %d requires writable migration to schema 11", version)
+		return nil, fmt.Errorf("workflow database schema %d requires writable migration to schema 17", version)
 	}
 	return s, nil
 }
@@ -88,6 +89,64 @@ func OpenRepositorySQLiteReadOnly(repoDir string) (*SQLiteStore, error) {
 		return nil, err
 	}
 	return OpenSQLiteReadOnly(path)
+}
+
+// OpenSQLiteLiveReadOnly permits an already-active WAL database so status can
+// observe a detached worker. It never creates a database or migrates schema;
+// both WAL sidecars must already exist and pass the same ownership/link/mode
+// checks as the database. Other diagnostic commands retain immutable reads.
+func OpenSQLiteLiveReadOnly(path string) (*SQLiteStore, error) {
+	if err := validateExistingDatabasePath(path); err != nil {
+		return nil, err
+	}
+	walExists, shmExists := false, false
+	for _, item := range []struct {
+		suffix string
+		exists *bool
+	}{{"-wal", &walExists}, {"-shm", &shmExists}} {
+		info, err := os.Lstat(path + item.suffix)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		*item.exists = true
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || fileHasMultipleLinks(info) || info.Mode().Perm()&0o077 != 0 {
+			return nil, fmt.Errorf("unsafe sqlite sidecar %q", path+item.suffix)
+		}
+	}
+	if walExists != shmExists {
+		return nil, errors.New("workflow database has incomplete SQLite WAL sidecars")
+	}
+	if !walExists {
+		return OpenSQLiteReadOnly(path)
+	}
+	dsn := "file:" + filepath.ToSlash(path) + "?mode=ro&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=query_only(1)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	s := &SQLiteStore{db: db, path: path, now: time.Now}
+	var version int
+	if err = db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if version != 17 {
+		db.Close()
+		return nil, fmt.Errorf("workflow database schema %d requires writable migration to schema 17", version)
+	}
+	return s, nil
+}
+
+func OpenRepositorySQLiteLiveReadOnly(repoDir string) (*SQLiteStore, error) {
+	path, err := CanonicalDatabasePath(repoDir)
+	if err != nil {
+		return nil, err
+	}
+	return OpenSQLiteLiveReadOnly(path)
 }
 
 func validateExistingDatabasePath(path string) error {
@@ -116,10 +175,10 @@ func (s *SQLiteStore) migrate() error {
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		return err
 	}
-	if version > 11 {
-		return fmt.Errorf("workflow database schema %d is newer than supported schema 11", version)
+	if version > 17 {
+		return fmt.Errorf("workflow database schema %d is newer than supported schema 17", version)
 	}
-	if version == 11 {
+	if version == 17 {
 		return nil
 	}
 	if version == 0 {
@@ -270,7 +329,86 @@ COMMIT;`
 			}
 		}
 		_, err = s.db.Exec(`PRAGMA user_version=11`)
-		return err
+		if err != nil {
+			return err
+		}
+	}
+	if version < 12 {
+		const schemaV12 = `BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS workflow_jobs (id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL REFERENCES workflows(id), session_id TEXT NOT NULL DEFAULT '', state TEXT NOT NULL, pid INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, started_at TEXT NOT NULL DEFAULT '', heartbeat_at TEXT NOT NULL DEFAULT '', finished_at TEXT NOT NULL DEFAULT '', terminal_state TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '');
+CREATE UNIQUE INDEX IF NOT EXISTS one_live_workflow_job ON workflow_jobs(workflow_id) WHERE state IN ('queued','running','cancel_requested');
+CREATE TABLE IF NOT EXISTS workflow_notifications (id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL REFERENCES workflows(id), job_id TEXT NOT NULL UNIQUE REFERENCES workflow_jobs(id), terminal_state TEXT NOT NULL, created_at TEXT NOT NULL, claim_token TEXT NOT NULL DEFAULT '', claimed_by TEXT NOT NULL DEFAULT '', claimed_at TEXT NOT NULL DEFAULT '', acked_at TEXT NOT NULL DEFAULT '');
+PRAGMA user_version=12;
+COMMIT;`
+		if _, err = s.db.Exec(schemaV12); err != nil {
+			return err
+		}
+	}
+	if version < 13 {
+		const schemaV13 = `BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS invocation_runtime (invocation_id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, attempt_id TEXT NOT NULL, status TEXT NOT NULL, pid INTEGER NOT NULL DEFAULT 0, started_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL, finished_at TEXT NOT NULL DEFAULT '', stdout_preview TEXT NOT NULL DEFAULT '', stderr_preview TEXT NOT NULL DEFAULT '');
+PRAGMA user_version=13;
+COMMIT;`
+		if _, err = s.db.Exec(schemaV13); err != nil {
+			return err
+		}
+	}
+	if version < 14 {
+		const schemaV14 = `BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS workflow_session_presence (session_id TEXT PRIMARY KEY, last_seen TEXT NOT NULL);
+PRAGMA user_version=14;
+COMMIT;`
+		if _, err = s.db.Exec(schemaV14); err != nil {
+			return err
+		}
+	}
+	if version < 15 {
+		var count int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('review_invocations') WHERE name='error_preview'`).Scan(&count); err != nil {
+			return err
+		}
+		if count == 0 {
+			if _, err := s.db.Exec(`ALTER TABLE review_invocations ADD COLUMN error_preview TEXT NOT NULL DEFAULT ''`); err != nil {
+				return err
+			}
+		}
+		if _, err := s.db.Exec(`PRAGMA user_version=15`); err != nil {
+			return err
+		}
+	}
+	if version < 16 {
+		for _, column := range []string{"pid INTEGER NOT NULL DEFAULT 0", "heartbeat_at TEXT NOT NULL DEFAULT ''", "last_activity_at TEXT NOT NULL DEFAULT ''", "result_json BLOB NOT NULL DEFAULT ''", "prompt_hash TEXT NOT NULL DEFAULT ''", "policy_hash TEXT NOT NULL DEFAULT ''"} {
+			name := strings.Fields(column)[0]
+			var count int
+			if err := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('review_invocations') WHERE name=?`, name).Scan(&count); err != nil {
+				return err
+			}
+			if count == 0 {
+				if _, err := s.db.Exec(`ALTER TABLE review_invocations ADD COLUMN ` + column); err != nil {
+					return err
+				}
+			}
+		}
+		if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS review_checkpoints (id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, candidate_tree TEXT NOT NULL, policy_hash TEXT NOT NULL, lens TEXT NOT NULL, model TEXT NOT NULL, prompt_hash TEXT NOT NULL, result_json BLOB NOT NULL, created_at TEXT NOT NULL)`); err != nil {
+			return err
+		}
+		if _, err := s.db.Exec(`PRAGMA user_version=16`); err != nil {
+			return err
+		}
+	}
+	if version < 17 {
+		var count int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('workflow_jobs') WHERE name='operation'`).Scan(&count); err != nil {
+			return err
+		}
+		if count == 0 {
+			if _, err := s.db.Exec(`ALTER TABLE workflow_jobs ADD COLUMN operation TEXT NOT NULL DEFAULT 'run'`); err != nil {
+				return err
+			}
+		}
+		if _, err := s.db.Exec(`PRAGMA user_version=17`); err != nil {
+			return err
+		}
 	}
 	return nil
 }

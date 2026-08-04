@@ -18,11 +18,39 @@ import (
 )
 
 type workflowInspection struct {
-	Workflow  workflow.Workflow `json:"workflow"`
-	Events    []workflow.Event  `json:"events"`
-	Receipt   *review.Receipt   `json:"authoritative_receipt,omitempty"`
-	RunInput  json.RawMessage   `json:"run_input,omitempty"`
-	Approvals []string          `json:"current_approvals,omitempty"`
+	Workflow          workflow.Workflow            `json:"workflow"`
+	Events            []workflow.Event             `json:"events"`
+	Receipt           *review.Receipt              `json:"authoritative_receipt,omitempty"`
+	RunInput          json.RawMessage              `json:"run_input,omitempty"`
+	Approvals         []string                     `json:"current_approvals,omitempty"`
+	Invocations       []invocationInspection       `json:"invocations,omitempty"`
+	ReviewInvocations []reviewInvocationInspection `json:"review_invocations,omitempty"`
+}
+
+type reviewInvocationInspection struct {
+	ID             string `json:"id"`
+	CandidateTree  string `json:"candidate_tree"`
+	Lens           string `json:"lens"`
+	Model          string `json:"model"`
+	Status         string `json:"status"`
+	StartedAt      string `json:"started_at"`
+	FinishedAt     string `json:"finished_at"`
+	ErrorPreview   string `json:"error_preview,omitempty"`
+	PID            int    `json:"pid,omitempty"`
+	HeartbeatAt    string `json:"heartbeat_at,omitempty"`
+	LastActivityAt string `json:"last_activity_at,omitempty"`
+}
+
+type invocationInspection struct {
+	InvocationID  string `json:"invocation_id"`
+	AttemptID     string `json:"attempt_id"`
+	Status        string `json:"status"`
+	PID           int    `json:"pid"`
+	StartedAt     string `json:"started_at"`
+	HeartbeatAt   string `json:"heartbeat_at"`
+	FinishedAt    string `json:"finished_at,omitempty"`
+	StdoutPreview string `json:"stdout_preview,omitempty"`
+	StderrPreview string `json:"stderr_preview,omitempty"`
 }
 
 func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
@@ -51,7 +79,7 @@ func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
 		return err
 	}
 	if _, statErr := os.Lstat(path); os.IsNotExist(statErr) {
-		if args[0] == "status" {
+		if args[0] == "status" || args[0] == "inspect" {
 			if len(args) > 1 {
 				return fmt.Errorf("workflow database not found at %s", path)
 			}
@@ -61,11 +89,22 @@ func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
 		if args[0] == "inspect" || args[0] == "receipt" {
 			return fmt.Errorf("workflow database not found at %s", path)
 		}
+		if args[0] == "notifications" && len(args) > 1 && args[1] == "claim" {
+			fmt.Fprintln(out, "null")
+			return nil
+		}
+		if args[0] == "notifications" && len(args) > 1 && args[1] == "presence" {
+			return nil
+		}
 	}
 	readOnly := args[0] == "status" || args[0] == "inspect" || args[0] == "receipt" || args[0] == "export"
 	var store *workflow.SQLiteStore
 	if readOnly {
-		store, err = workflow.OpenRepositorySQLiteReadOnly(cwd)
+		if args[0] == "status" || args[0] == "inspect" {
+			store, err = workflow.OpenRepositorySQLiteLiveReadOnly(cwd)
+		} else {
+			store, err = workflow.OpenRepositorySQLiteReadOnly(cwd)
+		}
 	} else {
 		store, err = workflow.OpenRepositorySQLite(cwd)
 	}
@@ -79,6 +118,10 @@ func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
 		return workflowStart(store, cwd, args[1:], out)
 	case "run":
 		return workflowRun(store, cwd, args[1:], out)
+	case "worker":
+		return workflowWorker(store, cwd, args[1:], out)
+	case "notifications":
+		return workflowNotifications(store, args[1:], out)
 	case "review":
 		return workflowReview(store, args[1:], out)
 	case "deliver":
@@ -116,7 +159,7 @@ func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
 
 func workflowCommandKnown(command string) bool {
 	switch command {
-	case "start", "run", "review", "deliver", "approve", "revoke-approval", "frontier", "answer", "close-discovery", "status", "inspect", "receipt", "abort", "resume", "export":
+	case "start", "run", "worker", "notifications", "review", "deliver", "approve", "revoke-approval", "frontier", "answer", "close-discovery", "status", "inspect", "receipt", "abort", "resume", "export":
 		return true
 	}
 	return false
@@ -125,8 +168,9 @@ func workflowCommandKnown(command string) bool {
 func printWorkflowCommandUsage(command string, out io.Writer) error {
 	usage := map[string]string{
 		"start":           "Usage: skynex workflow start --id ID --request TEXT --path PATH --check COMMAND --accept COMMAND [--route simple|planned|discovery] [--plan-file FILE] [--wayfinder-file FILE] [--override-actor ACTOR --override-reason REASON] [--model MODEL] [--agent AGENT] [--opencode PATH] [--timeout DURATION]\nSimple requires --id, --request, and repeatable --path, --check, --accept. Planned requires --plan-file. Discovery requires --wayfinder-file.",
-		"run":             "Usage: skynex workflow run WORKFLOW_ID",
-		"review":          "Usage: skynex workflow review --id WORKFLOW_ID",
+		"run":             "Usage: skynex workflow run WORKFLOW_ID [--detach]",
+		"notifications":   "Usage: skynex workflow notifications claim --consumer SESSION_ID | ack|release --id ID --claim-token TOKEN",
+		"review":          "Usage: skynex workflow review --id WORKFLOW_ID [--detach]",
 		"deliver":         "Usage: skynex workflow deliver --id WORKFLOW_ID --message TEXT --idempotency-key KEY [--author-name NAME --author-email EMAIL]",
 		"status":          "Usage: skynex workflow status [WORKFLOW_ID]",
 		"inspect":         "Usage: skynex workflow inspect WORKFLOW_ID",
@@ -154,6 +198,7 @@ func printWorkflowUsage(out io.Writer) {
 Commands:
   start               Create a simple, planned, or discovery workflow
   run                 Execute ready slices with OpenCode and verify the result
+  notifications       Claim or acknowledge terminal workflow notifications
   review              Review a frozen candidate and issue its receipt
   deliver             Commit the exact receipt-authorized candidate tree
   status              List workflows or show one workflow
@@ -178,6 +223,12 @@ func workflowStatus(store *workflow.SQLiteStore, args []string, out io.Writer) e
 			return err
 		}
 		fmt.Fprintf(out, "WORKFLOW\tSTATE\tVERSION\tROUTE\tRISK\n%s\t%s\t%d\t%s\t%s\n", w.ID, w.State, w.StateVersion, w.Route, w.MinimumRisk)
+		var job workflow.WorkflowJob
+		var created, started, heartbeat, finished string
+		err = store.Database().QueryRow(`SELECT id,workflow_id,session_id,operation,state,pid,created_at,started_at,heartbeat_at,finished_at,terminal_state,error FROM workflow_jobs WHERE workflow_id=? ORDER BY created_at DESC LIMIT 1`, w.ID).Scan(&job.ID, &job.WorkflowID, &job.SessionID, &job.Operation, &job.State, &job.PID, &created, &started, &heartbeat, &finished, &job.TerminalState, &job.Error)
+		if err == nil {
+			fmt.Fprintf(out, "JOB\t%s\t%s\toperation=%s\tpid=%d\theartbeat=%s\tterminal=%s\n", job.ID, job.State, job.Operation, job.PID, heartbeat, job.TerminalState)
+		}
 		return nil
 	}
 	rows, err := store.Database().Query(`SELECT id,state,state_version,route,minimum_risk FROM workflows ORDER BY id`)
@@ -224,6 +275,24 @@ func workflowInspect(store *workflow.SQLiteStore, reviews *review.SQLiteStore, i
 		inspection.Receipt = &receipt
 	} else if !errors.Is(e, review.ErrNoAuthority) {
 		return e
+	}
+	if rows, e := store.Database().Query(`SELECT invocation_id,attempt_id,status,pid,started_at,heartbeat_at,finished_at,stdout_preview,stderr_preview FROM invocation_runtime WHERE workflow_id=? ORDER BY started_at`, id); e == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var v invocationInspection
+			if rows.Scan(&v.InvocationID, &v.AttemptID, &v.Status, &v.PID, &v.StartedAt, &v.HeartbeatAt, &v.FinishedAt, &v.StdoutPreview, &v.StderrPreview) == nil {
+				inspection.Invocations = append(inspection.Invocations, v)
+			}
+		}
+	}
+	if rows, e := store.Database().Query(`SELECT id,candidate_tree,lens,model,status,started_at,finished_at,error_preview,pid,heartbeat_at,last_activity_at FROM review_invocations WHERE workflow_id=? ORDER BY started_at`, id); e == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var v reviewInvocationInspection
+			if rows.Scan(&v.ID, &v.CandidateTree, &v.Lens, &v.Model, &v.Status, &v.StartedAt, &v.FinishedAt, &v.ErrorPreview, &v.PID, &v.HeartbeatAt, &v.LastActivityAt) == nil {
+				inspection.ReviewInvocations = append(inspection.ReviewInvocations, v)
+			}
+		}
 	}
 	return writeJSON(out, inspection)
 }
@@ -293,6 +362,41 @@ func workflowAbort(store *workflow.SQLiteStore, args []string, out io.Writer) er
 
 func cleanupAbortedWorkflow(store *workflow.SQLiteStore, id string) error {
 	cancelled := processregistry.CancelWorkflow(id)
+	now := time.Now()
+	jobs, jobsErr := store.CancelWorkflowJobs(id, now)
+	if jobsErr != nil {
+		return jobsErr
+	}
+	stamp := now.UTC().Format(time.RFC3339Nano)
+	_, _ = store.Database().Exec(`UPDATE invocation_runtime SET status='cancelled',heartbeat_at=?,finished_at=? WHERE workflow_id=? AND status='running'`, stamp, stamp, id)
+	_, _ = store.Database().Exec(`UPDATE opencode_invocations SET status='cancelled',finished_at=? WHERE workflow_id=? AND status='running'`, stamp, id)
+	if rows, e := store.Database().Query(`SELECT pid,heartbeat_at FROM review_invocations WHERE workflow_id=? AND status='running'`, id); e == nil {
+		for rows.Next() {
+			var pid int
+			var heartbeat string
+			if rows.Scan(&pid, &heartbeat) == nil {
+				seen, _ := time.Parse(time.RFC3339Nano, heartbeat)
+				if pid > 0 && now.Sub(seen) >= 0 && now.Sub(seen) <= 30*time.Second {
+					_ = signalDetachedJob(pid)
+				}
+			}
+		}
+		rows.Close()
+	}
+	_, _ = store.Database().Exec(`UPDATE review_invocations SET status='cancelled',finished_at=?,heartbeat_at=?,error_preview='review cancelled by workflow abort' WHERE workflow_id=? AND status='running'`, stamp, stamp, id)
+	for _, job := range jobs {
+		reference := job.HeartbeatAt
+		if reference.IsZero() {
+			reference = job.CreatedAt
+		}
+		// Refuse to signal a stale PID: it may have been reused by an unrelated
+		// process. A healthy worker heartbeats every two seconds.
+		age := now.Sub(reference)
+		if job.PID > 0 && age >= 0 && age <= 30*time.Second {
+			_ = signalDetachedJob(job.PID)
+		}
+		_ = store.FinishWorkflowJob(job.ID, workflow.JobCancelled, string(workflow.StateAborted), "workflow aborted", now)
+	}
 	_, _ = store.Database().Exec(`UPDATE mutation_attempts SET live=0 WHERE workflow_id=?`, id)
 	_, _ = store.Database().Exec(`DELETE FROM leases WHERE resource IN (SELECT 'worktree:'||worktree_id FROM mutation_attempts WHERE workflow_id=?)`, id)
 	_ = approval.RevokeAll(store.Database(), id, "workflow-abort", "kill switch", time.Now())

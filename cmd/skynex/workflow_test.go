@@ -131,6 +131,22 @@ func TestWorkflowStatusAbsentDatabaseIsReadOnly(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(repo, ".git", "skynex")); !os.IsNotExist(err) {
 		t.Fatalf("status created database directory: %v", err)
 	}
+	output.Reset()
+	if err := runWorkflowCLI([]string{"notifications", "claim", "--consumer", "session-1"}, repo, &output); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != "null\n" {
+		t.Fatalf("notification claim=%q", output.String())
+	}
+	if _, err := os.Stat(filepath.Join(repo, ".git", "skynex")); !os.IsNotExist(err) {
+		t.Fatalf("notification polling created database directory: %v", err)
+	}
+	if err := runWorkflowCLI([]string{"notifications", "presence", "--session", "session-1"}, repo, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(repo, ".git", "skynex")); !os.IsNotExist(err) {
+		t.Fatalf("presence heartbeat created database directory: %v", err)
+	}
 	for _, command := range []string{"inspect", "receipt"} {
 		if err := runWorkflowCLI([]string{command, "missing"}, repo, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "database not found") {
 			t.Fatalf("%s err=%v", command, err)

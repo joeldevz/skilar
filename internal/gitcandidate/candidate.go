@@ -133,8 +133,18 @@ func Freeze(seal ContextSeal, policy Policy) (Candidate, error) {
 		return Candidate{}, err
 	}
 	// Then add eligible untracked files. Generated exports remain out of candidate
-	// scope unless they were already tracked by the base tree.
-	if _, err = gitRun(seal.RepositoryRoot, env, "add", "--all", "--", ".", ":(exclude).skynex/exports/**", ":(exclude).skynex/receipts/**"); err != nil {
+	// scope unless they were already tracked by the base tree. Avoid naming children
+	// of a wholly ignored .skynex directory: Git treats those negative pathspecs as
+	// an explicit request for the ignored parent and rejects the entire add.
+	addArgs := []string{"add", "--all", "--", "."}
+	skIgnore, ignoreErr := pathIgnored(seal.RepositoryRoot, ".skynex")
+	if ignoreErr != nil {
+		return Candidate{}, ignoreErr
+	}
+	if !skIgnore {
+		addArgs = append(addArgs, ":(exclude).skynex/exports/**", ":(exclude).skynex/receipts/**")
+	}
+	if _, err = gitRun(seal.RepositoryRoot, env, addArgs...); err != nil {
 		return Candidate{}, err
 	}
 	for _, path := range policy.IncludeIgnored {
@@ -281,6 +291,21 @@ func gitTextEnv(repo string, env []string, args ...string) (string, error) {
 func gitRun(repo string, env []string, args ...string) ([]byte, error) {
 	return gitBytes(repo, env, args...)
 }
+
+func pathIgnored(repo, path string) (bool, error) {
+	cmd := exec.Command("git", "check-ignore", "-q", "--no-index", "--", path)
+	cmd.Dir = repo
+	err := cmd.Run()
+	if err == nil {
+		return true, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("git check-ignore %s: %w", path, err)
+}
+
 func gitBytes(repo string, env []string, args ...string) ([]byte, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = repo

@@ -6,12 +6,67 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/joeldevz/skynex/internal/gitcandidate"
 	"github.com/joeldevz/skynex/internal/workflow"
 )
+
+func TestOpenCodePromptContainsExactResultContract(t *testing.T) {
+	_, store, seal, attempt := openCodeFixture(t)
+	defer store.Close()
+	captured := filepath.Join(t.TempDir(), "prompt")
+	body := "printf '%s' \"$*\" > '" + captured + "'\nprintf '%s' '" + resultJSON(t, attempt, attempt.BasisTree) + "' > \"$SKYNEX_RESULT_FILE\""
+	a := OpenCodeAdapter{Store: store, Options: OpenCodeOptions{Executable: fakeOpenCode(t, body), Timeout: time.Second}}
+	if _, err := a.Run(context.Background(), OpenCodeRequest{InvocationID: "contract", Attempt: attempt, Seal: seal, Checks: []string{"go test ./..."}, Prompt: "do work"}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(captured)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt := string(raw)
+	for _, want := range []string{`"WorkflowID":"wf"`, `"AttemptID":"a1"`, `"NodeID":"slice_a"`, `"BaseCandidateOID":"` + attempt.BasisTree + `"`, `"Status":"completed"`, `"patch"`, `"Operations"`, `"Path"`, `"Data"`, `base64`, `Mode`, `Allowed paths: a.txt`, `Checks: go test ./...`} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q: %s", want, prompt)
+		}
+	}
+}
+
+func TestOpenCodeInvocationIsObservableWhileRunning(t *testing.T) {
+	_, store, seal, attempt := openCodeFixture(t)
+	defer store.Close()
+	body := "echo incremental-progress\nsleep 2\nprintf '%s' '" + resultJSON(t, attempt, attempt.BasisTree) + "' > \"$SKYNEX_RESULT_FILE\""
+	a := OpenCodeAdapter{Store: store, Options: OpenCodeOptions{Executable: fakeOpenCode(t, body), Timeout: time.Second}}
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.Run(context.Background(), OpenCodeRequest{InvocationID: "observable", Attempt: attempt, Seal: seal})
+		done <- err
+	}()
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		var status, preview string
+		var pid int
+		var heartbeat string
+		err := store.Database().QueryRow(`SELECT status,pid,heartbeat_at,stdout_preview FROM invocation_runtime WHERE invocation_id='observable'`).Scan(&status, &pid, &heartbeat, &preview)
+		if err == nil && status == "running" && pid > 0 && heartbeat != "" && strings.Contains(preview, "incremental-progress") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("runtime not observable status=%q pid=%d heartbeat=%q preview=%q err=%v", status, pid, heartbeat, preview, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := <-done; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err=%v", err)
+	}
+	var status string
+	if err := store.Database().QueryRow(`SELECT status FROM invocation_runtime WHERE invocation_id='observable'`).Scan(&status); err != nil || status != "timeout" {
+		t.Fatalf("terminal=%q err=%v", status, err)
+	}
+}
 
 func openCodeFixture(t *testing.T) (string, *workflow.SQLiteStore, gitcandidate.ContextSeal, Attempt) {
 	t.Helper()
@@ -115,6 +170,10 @@ func TestOpenCodeAdapterRejectsMalformedAndStale(t *testing.T) {
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("err=%v want=%v", err, tc.want)
 			}
+			var status string
+			if err = store.Database().QueryRow(`SELECT status FROM invocation_runtime WHERE invocation_id=?`, tc.name).Scan(&status); err != nil || status != tc.name {
+				t.Fatalf("runtime terminal=%q err=%v", status, err)
+			}
 		})
 	}
 }
@@ -144,5 +203,50 @@ func TestOpenCodeAdapterTimeoutAndCancellation(t *testing.T) {
 				t.Fatalf("err=%v want=%v", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestOpenCodeAdapterRejectsAgentFallback(t *testing.T) {
+	_, store, seal, attempt := openCodeFixture(t)
+	defer store.Close()
+	body := `echo 'agent "research-orchestrator" is a subagent, not a primary agent. Falling back to default agent' >&2
+printf '%s' '` + resultJSON(t, attempt, attempt.BasisTree) + `' > "$SKYNEX_RESULT_FILE"`
+	adapter := OpenCodeAdapter{Store: store, Options: OpenCodeOptions{Executable: fakeOpenCode(t, body), Agent: "research-orchestrator", Timeout: time.Second}}
+	_, err := adapter.Run(context.Background(), OpenCodeRequest{InvocationID: "agent-fallback", Attempt: attempt, Seal: seal})
+	if !errors.Is(err, ErrAgentFallback) {
+		t.Fatalf("err=%v", err)
+	}
+	var status, preview string
+	if err := store.Database().QueryRow(`SELECT status,stderr_preview FROM invocation_runtime WHERE invocation_id='agent-fallback'`).Scan(&status, &preview); err != nil || status != "agent_rejected" || !strings.Contains(preview, "Falling back") {
+		t.Fatalf("status=%q preview=%q err=%v", status, preview, err)
+	}
+}
+
+func TestOpenCodeAdapterIdleProgressTimeout(t *testing.T) {
+	_, store, seal, attempt := openCodeFixture(t)
+	defer store.Close()
+	adapter := OpenCodeAdapter{Store: store, Options: OpenCodeOptions{Executable: fakeOpenCode(t, "echo step_start\nsleep 2"), Timeout: time.Second, IdleTimeout: 60 * time.Millisecond}}
+	started := time.Now()
+	_, err := adapter.Run(context.Background(), OpenCodeRequest{InvocationID: "idle", Attempt: attempt, Seal: seal})
+	if !errors.Is(err, ErrIdleProgressTimeout) {
+		t.Fatalf("err=%v", err)
+	}
+	if time.Since(started) > 500*time.Millisecond {
+		t.Fatalf("idle watchdog was slow: %s", time.Since(started))
+	}
+	var status, preview string
+	if err := store.Database().QueryRow(`SELECT status,stdout_preview FROM invocation_runtime WHERE invocation_id='idle'`).Scan(&status, &preview); err != nil || status != "idle_timeout" || !strings.Contains(preview, "step_start") {
+		t.Fatalf("status=%q preview=%q err=%v", status, preview, err)
+	}
+}
+
+func TestOpenCodeAdapterIdleWatchdogResetsOnRealOutput(t *testing.T) {
+	_, store, seal, attempt := openCodeFixture(t)
+	defer store.Close()
+	body := `for step in 1 2 3 4; do echo "step_$step"; sleep 0.03; done
+printf '%s' '` + resultJSON(t, attempt, attempt.BasisTree) + `' > "$SKYNEX_RESULT_FILE"`
+	adapter := OpenCodeAdapter{Store: store, Options: OpenCodeOptions{Executable: fakeOpenCode(t, body), Timeout: time.Second, IdleTimeout: 55 * time.Millisecond}}
+	if _, err := adapter.Run(context.Background(), OpenCodeRequest{InvocationID: "progressing", Attempt: attempt, Seal: seal}); err != nil {
+		t.Fatalf("real output must reset watchdog: %v", err)
 	}
 }

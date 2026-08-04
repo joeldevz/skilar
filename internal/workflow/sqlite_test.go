@@ -226,12 +226,36 @@ func TestSQLiteMigratesExistingV1SchemaToCurrent(t *testing.T) {
 	}
 	defer store.Close()
 	var version int
-	if err = store.Database().QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 11 {
+	if err = store.Database().QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 17 {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 	var table string
 	if err = store.Database().QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='receipt_authority'`).Scan(&table); err != nil || table != "receipt_authority" {
 		t.Fatalf("table=%q err=%v", table, err)
+	}
+}
+
+func TestLiveReadOnlyCanObserveActiveWALWithoutMutatingSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "workflows.db")
+	writer, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if _, err = writer.Create(Workflow{ID: "wf", Route: RouteSimple, MinimumRisk: RiskLow}); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := OpenSQLiteLiveReadOnly(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	w, err := reader.Get("wf")
+	if err != nil || w.ID != "wf" {
+		t.Fatalf("workflow=%+v err=%v", w, err)
+	}
+	if _, err = reader.Database().Exec(`DELETE FROM workflows`); err == nil {
+		t.Fatal("live read-only connection allowed mutation")
 	}
 }
 

@@ -1,0 +1,12 @@
+name: orchestrator-uses-managed-detached-workflow
+prompt: Run and then review this workflow in the background without blocking our chat.
+must_include:
+  - skynex workflow run
+  - --detach
+  - workflow status
+  - workflow inspect
+  - skynex workflow review --id
+must_not_include:
+  - nohup
+  - tmux
+  - delegate a subagent to keep

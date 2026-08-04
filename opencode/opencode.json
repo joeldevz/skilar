@@ -1,6 +1,26 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "agent": {
+    "workflow-reviewer": {
+      "description": "Primary read-only non-interactive reviewer for one Skynex semantic or lens review.",
+      "mode": "primary",
+      "prompt": "{file:./agents/workflow-reviewer.md}",
+      "tools": {"bash": true, "read": true, "glob": true, "grep": true, "write": false, "edit": false, "task": false}
+    },
+    "workflow-worker": {
+      "description": "Primary non-interactive worker for one fenced Skynex Workflow V2 mutation attempt.",
+      "mode": "primary",
+      "prompt": "{file:./agents/workflow-worker.md}",
+      "tools": {
+        "bash": true,
+        "read": true,
+        "glob": true,
+        "grep": true,
+        "write": false,
+        "edit": false,
+        "task": false
+      }
+    },
     "orchestrator": {
       "description": "Orchestrator \u2014 pure coordination agent. Delegates all work to sub-agents. NEVER writes code. Reads a few files to decide, launches parallel sub-agents, synthesizes results.",
       "mode": "all",

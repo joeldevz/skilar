@@ -17,18 +17,21 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"syscall"
+	"sync/atomic"
 	"time"
 )
 
 var (
 	ErrMalformedWorkerResult   = errors.New("execution: malformed OpenCode worker result")
 	ErrManagedWorktreeMutation = errors.New("execution: OpenCode mutated managed worktree")
+	ErrAgentFallback           = errors.New("execution: OpenCode rejected configured primary agent and fell back")
+	ErrIdleProgressTimeout     = errors.New("execution: OpenCode produced no output before idle timeout")
 )
 
 type OpenCodeOptions struct {
 	Executable, Model, Agent string
 	Timeout                  time.Duration
+	IdleTimeout              time.Duration
 	MaxOutputBytes           int
 }
 type OpenCodeRequest struct {
@@ -38,6 +41,7 @@ type OpenCodeRequest struct {
 	Policy       gitcandidate.Policy
 	ArtifactIDs  []string
 	Artifacts    map[string][]byte
+	Checks       []string
 	Prompt       string
 }
 type invocationOutput struct {
@@ -60,6 +64,10 @@ func (a *OpenCodeAdapter) Run(ctx context.Context, request OpenCodeRequest) (Wor
 	timeout := a.Options.Timeout
 	if timeout <= 0 {
 		timeout = 10 * time.Minute
+	}
+	idleTimeout := a.Options.IdleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = 2 * time.Minute
 	}
 	limit := a.Options.MaxOutputBytes
 	if limit <= 0 {
@@ -110,7 +118,7 @@ func (a *OpenCodeAdapter) Run(ctx context.Context, request OpenCodeRequest) (Wor
 		return WorkerResult{}, err
 	}
 	resultFile := filepath.Join(parent, "result.json")
-	prompt := request.Prompt + "\nImmutable artifact files: " + strings.Join(materialized, ", ") + "\nWrite one JSON object with envelope and patch to $SKYNEX_RESULT_FILE. Do not write the managed worktree."
+	prompt := buildWorkerPrompt(request, materialized)
 	args := []string{"run", "--format", "json", "--auto", "--dir", worktree}
 	if a.Options.Model != "" {
 		args = append(args, "--model", a.Options.Model)
@@ -126,19 +134,69 @@ func (a *OpenCodeAdapter) Run(ctx context.Context, request OpenCodeRequest) (Wor
 	stdout := &boundedBuffer{limit: limit}
 	stderr := &boundedBuffer{limit: limit}
 	cmd := exec.CommandContext(runCtx, executable, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return os.ErrProcessDone
-		}
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	}
+	configureOpenCodeProcess(cmd)
 	cmd.Dir = worktree
 	cmd.Env = sanitizedEnv(resultFile)
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
 	started := time.Now().UTC()
-	runErr := cmd.Run()
+	if err = a.persistInvocationRunning(request, args, started); err != nil {
+		return WorkerResult{}, err
+	}
+	activity := make(chan struct{}, 1)
+	noteActivity := func() {
+		select {
+		case activity <- struct{}{}:
+		default:
+		}
+	}
+	cmd.Stdout = &progressWriter{buffer: stdout, update: func(value []byte) { a.updateInvocationPreview(request.InvocationID, "stdout_preview", value) }, activity: noteActivity}
+	cmd.Stderr = &progressWriter{buffer: stderr, update: func(value []byte) { a.updateInvocationPreview(request.InvocationID, "stderr_preview", value) }, activity: noteActivity}
+	runErr := cmd.Start()
+	if runErr != nil {
+		finished := time.Now().UTC()
+		_ = a.persistInvocation(request, args, -1, stdout.Bytes(), stderr.Bytes(), nil, "start_failed", started, finished)
+		return WorkerResult{}, runErr
+	}
+	_, _ = a.Store.Database().Exec(`UPDATE invocation_runtime SET pid=?,heartbeat_at=? WHERE invocation_id=?`, cmd.Process.Pid, time.Now().UTC().Format(time.RFC3339Nano), request.InvocationID)
+	idleDone := make(chan struct{})
+	var idleFired atomic.Bool
+	go func() {
+		timer := time.NewTimer(idleTimeout)
+		defer timer.Stop()
+		for {
+			select {
+			case <-idleDone:
+				return
+			case <-activity:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(idleTimeout)
+			case <-timer.C:
+				idleFired.Store(true)
+				cancel()
+				return
+			}
+		}
+	}()
+	heartbeatDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-heartbeatDone:
+				return
+			case now := <-ticker.C:
+				_, _ = a.Store.Database().Exec(`UPDATE invocation_runtime SET heartbeat_at=? WHERE invocation_id=? AND status='running'`, now.UTC().Format(time.RFC3339Nano), request.InvocationID)
+			}
+		}
+	}()
+	runErr = cmd.Wait()
+	close(idleDone)
+	close(heartbeatDone)
 	finished := time.Now().UTC()
 	exitCode := 0
 	if runErr != nil {
@@ -149,11 +207,20 @@ func (a *OpenCodeAdapter) Run(ctx context.Context, request OpenCodeRequest) (Wor
 	}
 	after, freezeErr := gitcandidate.Freeze(request.Seal, request.Policy)
 	if freezeErr != nil {
+		_ = a.persistInvocation(request, args, exitCode, stdout.Bytes(), stderr.Bytes(), nil, "failed", started, finished)
 		return WorkerResult{}, freezeErr
 	}
 	if after.TreeOID != before.TreeOID {
 		_ = a.persistInvocation(request, args, exitCode, stdout.Bytes(), stderr.Bytes(), nil, "managed_worktree_mutation", started, finished)
 		return WorkerResult{}, ErrManagedWorktreeMutation
+	}
+	if agentFallbackPattern.Match(stderr.Bytes()) {
+		_ = a.persistInvocation(request, args, exitCode, stdout.Bytes(), stderr.Bytes(), nil, "agent_rejected", started, finished)
+		return WorkerResult{}, fmt.Errorf("%w: configured agent %q", ErrAgentFallback, a.Options.Agent)
+	}
+	if idleFired.Load() {
+		_ = a.persistInvocation(request, args, exitCode, stdout.Bytes(), stderr.Bytes(), nil, "idle_timeout", started, finished)
+		return WorkerResult{}, ErrIdleProgressTimeout
 	}
 	if runErr != nil {
 		status := "failed"
@@ -205,7 +272,54 @@ func (a *OpenCodeAdapter) persistInvocation(r OpenCodeRequest, args []string, ex
 		_ = artifacts.Ref(stderrID, "opencode_invocation", r.InvocationID)
 	}
 	_, err := a.Store.Database().Exec(`INSERT OR REPLACE INTO opencode_invocations(invocation_id,workflow_id,attempt_id,model,command,exit_code,stdout_digest,stderr_digest,evidence_ids,status,started_at,finished_at,stdout_artifact_id,stderr_artifact_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, r.InvocationID, r.Attempt.WorkflowID, r.Attempt.ID, a.Options.Model, command, exit, outDigest, errDigest, evidenceJSON, status, start.Format(time.RFC3339Nano), end.Format(time.RFC3339Nano), stdoutID, stderrID)
+	_, _ = a.Store.Database().Exec(`UPDATE invocation_runtime SET status=?,heartbeat_at=?,finished_at=?,stdout_preview=?,stderr_preview=? WHERE invocation_id=?`, status, end.Format(time.RFC3339Nano), end.Format(time.RFC3339Nano), redactedPreview(stdout), redactedPreview(stderr), r.InvocationID)
 	return err
+}
+
+func buildWorkerPrompt(request OpenCodeRequest, materialized []string) string {
+	contract := map[string]any{"envelope": map[string]any{"WorkflowID": request.Attempt.WorkflowID, "NodeID": request.Attempt.SliceID, "AttemptID": request.Attempt.ID, "BaseCandidateOID": request.Attempt.BasisTree, "Status": "completed", "ArtifactIDs": []string{}, "EvidenceIDs": []string{}}, "patch": map[string]any{"Operations": []map[string]any{{"Path": "relative/path", "Data": "YmFzZTY0", "Mode": 384}}}}
+	raw, _ := json.Marshal(contract)
+	return request.Prompt + "\nAllowed paths: " + strings.Join(request.Attempt.AllowedPaths, ", ") + "\nChecks: " + strings.Join(request.Checks, "; ") + "\nImmutable artifact files: " + strings.Join(materialized, ", ") + "\nWrite exactly one JSON object to $SKYNEX_RESULT_FILE and do not write the managed worktree. Data is base64-encoded file content; Mode is an integer permission mode. Required result contract with exact authority values:\n" + string(raw)
+}
+
+func (a *OpenCodeAdapter) persistInvocationRunning(r OpenCodeRequest, args []string, started time.Time) error {
+	command, _ := json.Marshal(append([]string{"opencode"}, args...))
+	emptyDigest := digestRedacted(nil)
+	command = (&artifact.Store{DB: a.Store.Database()}).Redact(command)
+	if _, err := a.Store.Database().Exec(`INSERT OR REPLACE INTO opencode_invocations(invocation_id,workflow_id,attempt_id,model,command,exit_code,stdout_digest,stderr_digest,evidence_ids,status,started_at,finished_at,stdout_artifact_id,stderr_artifact_id) VALUES(?,?,?,?,?,-1,?,?,?,'running',?,'','','')`, r.InvocationID, r.Attempt.WorkflowID, r.Attempt.ID, a.Options.Model, command, emptyDigest, emptyDigest, []byte("[]"), started.Format(time.RFC3339Nano)); err != nil {
+		return err
+	}
+	_, err := a.Store.Database().Exec(`INSERT OR REPLACE INTO invocation_runtime(invocation_id,workflow_id,attempt_id,status,pid,started_at,heartbeat_at) VALUES(?,?,?,'running',0,?,?)`, r.InvocationID, r.Attempt.WorkflowID, r.Attempt.ID, started.Format(time.RFC3339Nano), started.Format(time.RFC3339Nano))
+	return err
+}
+
+func redactedPreview(value []byte) string {
+	redacted := secretPattern.ReplaceAll(value, []byte("$1=[REDACTED]"))
+	if len(redacted) > 4096 {
+		redacted = redacted[len(redacted)-4096:]
+	}
+	return string(redacted)
+}
+func (a *OpenCodeAdapter) updateInvocationPreview(id, column string, value []byte) {
+	if column != "stdout_preview" && column != "stderr_preview" {
+		return
+	}
+	_, _ = a.Store.Database().Exec(`UPDATE invocation_runtime SET `+column+`=?,heartbeat_at=? WHERE invocation_id=? AND status='running'`, redactedPreview(value), time.Now().UTC().Format(time.RFC3339Nano), id)
+}
+
+type progressWriter struct {
+	buffer   *boundedBuffer
+	update   func([]byte)
+	activity func()
+}
+
+func (w *progressWriter) Write(p []byte) (int, error) {
+	n, err := w.buffer.Write(p)
+	if n > 0 && w.activity != nil {
+		w.activity()
+	}
+	w.update(w.buffer.Bytes())
+	return n, err
 }
 
 type boundedBuffer struct {
@@ -226,6 +340,7 @@ func (b *boundedBuffer) Write(p []byte) (int, error) {
 }
 
 var secretPattern = regexp.MustCompile(`(?i)(token|password|secret|api[_-]?key)[=: ]+[^\s]+`)
+var agentFallbackPattern = regexp.MustCompile(`(?i)(falling back|fallback)\s+to\s+(the\s+)?default\s+agent`)
 
 func digestRedacted(value []byte) string {
 	redacted := secretPattern.ReplaceAll(value, []byte("$1=[REDACTED]"))

@@ -1,12 +1,15 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/joeldevz/skynex/internal/adapters"
@@ -37,6 +40,7 @@ type installDependencies struct {
 	pruneSnapshots       func(string, int) (int, error)
 	chooseBackupCapacity func(string, bool) prompts.BackupCapacityChoice
 	exactCurrent         func(string, string) bool
+	exactRequestCurrent  func(string, string, *models.InstallRequest) bool
 }
 
 func formatSnapshotSize(size int64) string {
@@ -70,7 +74,8 @@ func productionInstallDependencies() installDependencies {
 		chooseBackupCapacity: func(summary string, canPrune bool) prompts.BackupCapacityChoice {
 			return prompts.ChooseBackupCapacity(os.Stdin, os.Stderr, summary, canPrune)
 		},
-		exactCurrent: isExactEmbeddedInstall,
+		exactCurrent:        isExactEmbeddedInstall,
+		exactRequestCurrent: isExactRequestedEmbeddedInstall,
 	}
 }
 
@@ -125,6 +130,9 @@ func runInstall(args *cliArgs, deps installDependencies) error {
 	if deps.exactCurrent == nil {
 		deps.exactCurrent = isExactEmbeddedInstall
 	}
+	if deps.exactRequestCurrent == nil {
+		deps.exactRequestCurrent = isExactRequestedEmbeddedInstall
+	}
 
 	cat, err := deps.loadCatalog()
 	if err != nil {
@@ -169,6 +177,11 @@ func runInstall(args *cliArgs, deps installDependencies) error {
 		return errors.New("resolve install request: wizard returned no request")
 	}
 	request.StateDir, request.TrustSetupScripts = stateDir, args.TrustScripts
+	if !args.Force && !interactive && deps.exactRequestCurrent(stateDir, deps.opencodeDir(), request) {
+		fmt.Fprintln(deps.output, "✓ Skynex is up to date.")
+		fmt.Fprintln(deps.output, "  Nothing changed.")
+		return nil
+	}
 	if args.LegacyVersion {
 		fmt.Fprintln(deps.output, "Warning: install --version PKG=VER is deprecated; use --package-version PKG=VER")
 	}
@@ -190,7 +203,8 @@ func runInstall(args *cliArgs, deps installDependencies) error {
 	if !interactive && !args.NonInteractive && !args.Yes && !prompts.ConfirmPlanWithIO(request, deps.input, deps.output) {
 		return nil
 	}
-	if snapshots, inventoryErr := deps.listSnapshots(stateDir); inventoryErr == nil && len(snapshots) >= 5 {
+	beforeSnapshots, _ := deps.listSnapshots(stateDir)
+	if snapshots := beforeSnapshots; len(snapshots) >= 5 {
 		eligible := 0
 		for _, snapshot := range snapshots {
 			if snapshot.EligibleToPrune {
@@ -247,6 +261,130 @@ func runInstall(args *cliArgs, deps installDependencies) error {
 	}); err != nil {
 		return err
 	}
+	afterSnapshots, _ := deps.listSnapshots(stateDir)
+	return renderInstallSummary(deps.output, request, plan, results, issues, newSnapshot(beforeSnapshots, afterSnapshots))
+}
+
+func newSnapshot(before, after []installer.Snapshot) *installer.Snapshot {
+	known := map[string]bool{}
+	for _, item := range before {
+		known[item.ID] = true
+	}
+	for i := range after {
+		if !known[after[i].ID] {
+			return &after[i]
+		}
+	}
+	return nil
+}
+
+func renderInstallSummary(out io.Writer, request *models.InstallRequest, plan *installer.Plan, results []*models.InstallResult, issues []*models.ValidationIssue, snapshot *installer.Snapshot) error {
+	unchanged := len(results) > 0
+	for _, result := range results {
+		for _, target := range result.Targets {
+			if target.Status != "unchanged" {
+				unchanged = false
+			}
+		}
+	}
+	if unchanged {
+		fmt.Fprintln(out, "✓ Skynex is up to date.\n  Nothing changed.")
+	} else {
+		fmt.Fprintln(out, "✓ Installation complete.")
+	}
+	packages := append([]*models.InstallResult(nil), results...)
+	sort.Slice(packages, func(i, j int) bool { return packages[i].PackageID < packages[j].PackageID })
+	if len(packages) > 0 {
+		fmt.Fprintln(out, "Packages:")
+		for _, item := range packages {
+			version := item.ResolvedVersion
+			if version == "" {
+				version = item.RequestedVersion
+			}
+			fmt.Fprintf(out, "  - %s @ %s\n", item.PackageID, version)
+		}
+	}
+	type targetLine struct {
+		target, destination string
+		artifacts           []string
+	}
+	var targets []targetLine
+	for _, op := range plan.Operations {
+		if op.Kind == installer.InstallTarget {
+			var artifacts []string
+			for _, result := range packages {
+				if result.PackageID == op.PackageID {
+					if tr := result.Targets[op.Target]; tr != nil {
+						artifacts = append(artifacts, tr.Artifacts...)
+					}
+				}
+			}
+			sort.Strings(artifacts)
+			targets = append(targets, targetLine{op.Target, op.Destination, artifacts})
+		}
+	}
+	sort.Slice(targets, func(i, j int) bool {
+		if targets[i].target == targets[j].target {
+			return targets[i].destination < targets[j].destination
+		}
+		return targets[i].target < targets[j].target
+	})
+	if len(targets) > 0 {
+		fmt.Fprintln(out, "Targets:")
+		for _, item := range targets {
+			fmt.Fprintf(out, "  - %s -> %s\n", item.target, item.destination)
+			for _, artifact := range item.artifacts {
+				fmt.Fprintf(out, "      artifact: %s\n", artifact)
+			}
+		}
+	}
+	neurox := "preserved"
+	if request.NeuroxSelectionSet {
+		if request.NeuroxEnabled {
+			neurox = "enabled"
+		} else {
+			neurox = "disabled"
+		}
+	}
+	fmt.Fprintf(out, "Integrations:\n  - Neurox: %s\n", neurox)
+	var stateFiles []string
+	cleanup := false
+	for _, op := range plan.Operations {
+		if op.Kind == installer.WriteState {
+			stateFiles = append(stateFiles, op.Destination)
+		}
+		if op.Kind == installer.CleanupDeprecated {
+			cleanup = true
+		}
+	}
+	sort.Strings(stateFiles)
+	if len(stateFiles) > 0 {
+		fmt.Fprintln(out, "State files:")
+		for _, path := range stateFiles {
+			fmt.Fprintf(out, "  - %s\n", path)
+		}
+	}
+	if cleanup {
+		fmt.Fprintln(out, "Cleanup: applied")
+	} else {
+		fmt.Fprintln(out, "Cleanup: not requested")
+	}
+	var warnings []string
+	for _, issue := range issues {
+		if issue.Level == "warning" {
+			warnings = append(warnings, issue.Message)
+		}
+	}
+	sort.Strings(warnings)
+	if len(warnings) > 0 {
+		fmt.Fprintln(out, "Warnings:")
+		for _, warning := range warnings {
+			fmt.Fprintf(out, "  - %s\n", warning)
+		}
+	}
+	if snapshot != nil {
+		fmt.Fprintf(out, "Recovery snapshot: %s\n", snapshot.ID)
+	}
 	return nil
 }
 
@@ -293,6 +431,114 @@ func isExactEmbeddedInstall(stateDir, opencodeDir string) bool {
 		return false
 	}
 	return lockHasEmbeddedSkills(lock)
+}
+
+func isExactRequestedEmbeddedInstall(stateDir, opencodeDir string, request *models.InstallRequest) bool {
+	if request == nil || request.CleanupDeprecated || request.TrustSetupScripts ||
+		len(request.Packages) != 1 || request.Packages[0] != "skills" ||
+		len(request.Targets) != 1 || request.Targets[0] != "opencode" ||
+		request.Versions["skills"] != "latest" || !isExactEmbeddedInstall(stateDir, opencodeDir) {
+		return false
+	}
+	configData, err := os.ReadFile(filepath.Join(stateDir, "skills.config.json"))
+	if err != nil {
+		return false
+	}
+	var cfg map[string]interface{}
+	if json.Unmarshal(configData, &cfg) != nil {
+		return false
+	}
+	defaults, ok := cfg["defaults"].(map[string]interface{})
+	if !ok || defaults["interactive"] != request.Interactive || !targetsContain(defaults["targets"], "opencode") {
+		return false
+	}
+	if request.NeuroxSelectionSet && defaults["neuroxEnabled"] != request.NeuroxEnabled {
+		return false
+	}
+	return opencodeManagedAssetsCurrent(opencodeDir, request.NeuroxEnabled) && neuroxConfigCurrent(opencodeDir, request.NeuroxEnabled)
+}
+
+func opencodeManagedAssetsCurrent(opencodeDir string, neuroxEnabled bool) bool {
+	bundle, err := assets.OpencodeFS()
+	if err != nil {
+		return false
+	}
+	expected := map[string]string{}
+	if err := fs.WalkDir(bundle, ".", func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		path = filepath.ToSlash(path)
+		if entry.IsDir() && (path == "skills" || path == "node_modules") {
+			return fs.SkipDir
+		}
+		if entry.IsDir() || (!neuroxEnabled && path == "plugins/neurox.ts") {
+			return nil
+		}
+		raw, readErr := fs.ReadFile(bundle, path)
+		if readErr != nil {
+			return readErr
+		}
+		sum := sha256.Sum256(raw)
+		expected[path] = fmt.Sprintf("%x", sum[:])
+		return nil
+	}); err != nil {
+		return false
+	}
+	manifestData, err := os.ReadFile(filepath.Join(opencodeDir, ".skynex-manifest.json"))
+	if err != nil {
+		return false
+	}
+	var manifest struct {
+		Files map[string]string `json:"files"`
+	}
+	if json.Unmarshal(manifestData, &manifest) != nil || len(manifest.Files) != len(expected) {
+		return false
+	}
+	for path, digest := range expected {
+		if manifest.Files[path] != digest {
+			return false
+		}
+		// opencode.json intentionally differs from the embedded source after
+		// provider connections are merged. Its managed Neurox shape is checked
+		// separately without treating user providers as drift.
+		if path == "opencode.json" {
+			continue
+		}
+		raw, readErr := os.ReadFile(filepath.Join(opencodeDir, filepath.FromSlash(path)))
+		if readErr != nil {
+			return false
+		}
+		sum := sha256.Sum256(raw)
+		if fmt.Sprintf("%x", sum[:]) != digest {
+			return false
+		}
+	}
+	return true
+}
+
+func neuroxConfigCurrent(opencodeDir string, enabled bool) bool {
+	raw, err := os.ReadFile(filepath.Join(opencodeDir, "opencode.json"))
+	if err != nil {
+		return false
+	}
+	var config struct {
+		MCP map[string]json.RawMessage `json:"mcp"`
+	}
+	if json.Unmarshal(raw, &config) != nil {
+		return false
+	}
+	entry, exists := config.MCP["neurox"]
+	if !enabled {
+		return !exists
+	}
+	var neurox struct {
+		Command []string `json:"command"`
+		Enabled bool     `json:"enabled"`
+		Type    string   `json:"type"`
+	}
+	return exists && json.Unmarshal(entry, &neurox) == nil && neurox.Enabled && neurox.Type == "local" &&
+		len(neurox.Command) == 2 && neurox.Command[0] == "neurox" && neurox.Command[1] == "mcp"
 }
 
 func findSkillEntry(entries []skillsync.Entry, path string) skillsync.Entry {

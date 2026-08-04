@@ -101,6 +101,26 @@ func TestFreezeUsesTemporaryIndexAndCapturesCandidateScope(t *testing.T) {
 	}
 }
 
+func TestFreezeAllowsCompletelyIgnoredSkynexDirectory(t *testing.T) {
+	repo := newRepo(t, "")
+	write(t, filepath.Join(repo, ".gitignore"), ".skynex/\n", 0o600)
+	git(t, repo, "add", ".gitignore")
+	git(t, repo, "commit", "-m", "ignore skynex project state")
+	write(t, filepath.Join(repo, ".skynex", "project-config.yaml"), "commands: {}\n", 0o600)
+
+	seal, err := CaptureContext(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := Freeze(seal, Policy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := entryMap(candidate.Manifest)[".skynex/project-config.yaml"]; ok {
+		t.Fatal("included ignored Skynex project state")
+	}
+}
+
 func TestDetectDriftWorktreeRefAndHEAD(t *testing.T) {
 	t.Run("worktree", func(t *testing.T) {
 		repo := newRepo(t, "")

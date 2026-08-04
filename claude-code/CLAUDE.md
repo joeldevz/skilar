@@ -14,7 +14,9 @@ This repository installs a multi-agent system for Claude Code with auto-validati
 | `test-reviewer` | Reviews test coherence at end of plan | Haiku (fast) | Task subagent |
 | `security` | Adversarial security judge (launched x2 in parallel) | Haiku (fast) | Task subagent |
 | `skill-validator` | Validates code against project skill registry | Haiku (fast) | Task subagent |
-| `manager` | Executes PLAN.md step by step via coder | Haiku (fast) | Task subagent |
+| `pr-reviewer` | Adversarial PR review judge for one dimension (read-only) | Haiku (fast) | Task subagent |
+| `workflow-worker` | One `skynex workflow` mutation attempt | Haiku (fast) | Non-interactive primary agent |
+| `workflow-reviewer` | Reviews an immutable workflow candidate (read-only) | Haiku (fast) | Non-interactive primary agent |
 
 ## You ARE the Orchestrator
 
@@ -76,12 +78,11 @@ Before ANY planning, the orchestrator MUST:
 - Keep `PLAN.md` as the visible source of truth for progress
 - Save orchestrator state to Neurox after each phase transition
 
-
 ## Installed Skills
 
 **Default behavior**: When the user gives you a task, you ARE the orchestrator — follow the flow above automatically. No special command needed.
 
-Available slash commands: `/commit`, `/docs`, `/linear`, `/pr`, `/review-pr`, `/rollback`, `/setup`, `/skills-scan`.
+Available slash commands: `/commit`, `/docs`, `/pr`, `/review-pr`, `/rollback`, `/setup`, `/skills-scan`.
 
 Shared conventions in `~/.claude/skills/_shared/`:
 - `return-envelope.md` — standard return format for all sub-agents

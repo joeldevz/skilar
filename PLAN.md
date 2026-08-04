@@ -46,5 +46,5 @@ Add the Advisor Strategy pattern to the skills system: a tool that lets worker a
 - `opencode.json` is valid JSON with advisor agent, coder and tech-planner have advisor tool
 - `advisor.ts` compiles (TypeScript syntax valid)
 - `advisor-protocol.md` is consistent with other _shared/ protocols
-- The current Go renderer renders advisor agent to `~/.claude/agents/advisor.md`
+- The Go renderer rendered the advisor agent to `~/.claude/agents/advisor.md` (the advisor has since been retired and is no longer rendered)
 - Schemas validate with example config

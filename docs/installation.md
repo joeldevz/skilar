@@ -65,18 +65,18 @@ modo `0600`.
 2. Copia todo el contenido de `opencode/` a `~/.config/opencode/`
 3. Restaura tu API key de Context7 del backup si la tenias configurada
 4. Ejecuta `bun install --ignore-scripts` (o `npm install --ignore-scripts` como fallback) para dependencias de plugins
-5. Resultado: 11 agentes, 8 commands, skills, templates, evals, y MCPs configurados
+5. Resultado: 10 agentes, 7 commands, skills, templates, evals, y MCPs configurados
 
 #### Para Claude Code
 
 1. Hace backup de `~/.claude/` si ya existe
-2. Renderiza los agentes (`orchestrator`, `coder`, `tech-planner`, `product-planner`, `verifier`, `test-reviewer`, `security`, `skill-validator`) en `~/.claude/agents/`
-3. Convierte los 8 commands de OpenCode en skills de Claude Code en `~/.claude/skills/`
+2. Renderiza los agentes declarados en `opencode.json` (`orchestrator`, `coder`, `tech-planner`, `verifier`, `test-reviewer`, `security`, `skill-validator`, `pr-reviewer`, `workflow-worker`, `workflow-reviewer`) en `~/.claude/agents/`
+3. Convierte los 7 commands de OpenCode en skills de Claude Code en `~/.claude/skills/`
 4. Copia skills compartidas (`grill-me`, `prd`, `security`, `write-a-skill`, `diagnose`, `triage`) a `~/.claude/skills/`
 5. Copia templates a `~/.claude/templates/`
 6. Agrega el bloque del workflow a `~/.claude/CLAUDE.md` (sin borrar contenido existente)
 7. Registra Neurox como MCP server en `~/.claude.json`
-8. Resultado: 11 agentes, 8 skills de comando, skills core (grill-me, prd, security, write-a-skill, diagnose, triage), overlay de CLAUDE.md, y Neurox MCP listo
+8. Resultado: 10 agentes, 7 skills de comando, skills core (grill-me, prd, security, write-a-skill, diagnose, triage), overlay de CLAUDE.md, y Neurox MCP listo
 
 ## Instalacion manual
 
@@ -149,11 +149,11 @@ opencode
 ```bash
 # Verificar agentes
 ls ~/.claude/agents/
-# Deberia mostrar también: orchestrator.md  coder.md  tech-planner.md  product-planner.md  verifier.md  test-reviewer.md  security.md  skill-validator.md
+# Deberia mostrar también: orchestrator.md  coder.md  tech-planner.md  verifier.md  test-reviewer.md  security.md  skill-validator.md  pr-reviewer.md  workflow-worker.md  workflow-reviewer.md
 
 # Verificar skills
 ls ~/.claude/skills/
-# Deberia mostrar: commit/  docs/  linear/  pr/  review-pr/  rollback/  setup/  skills-scan/  grill-me/  prd/  security/  write-a-skill/  diagnose/  triage/
+# Deberia mostrar: commit/  docs/  pr/  review-pr/  rollback/  setup/  skills-scan/  grill-me/  prd/  security/  write-a-skill/  diagnose/  triage/
 
 # Verificar templates
 ls ~/.claude/templates/
@@ -256,14 +256,20 @@ ls -dt ~/.claude.backup.* | head -1
 | Agentes no aparecen en Claude | Verificar que `~/.claude/agents/` tiene los `.md`. Reiniciar Claude Code |
 | `bun: command not found` | Instalar Bun desde su release/package manager verificado o usar npm |
 | Backup no se creo | El backup solo se crea si el directorio destino ya existia |
-# Transaction safety
+
+## Transaction safety
 
 Install transactions retain private recovery snapshots under the configured
 state directory. `node_modules` is never quarantined or included in snapshots,
 so dependency managers update it in place. If dependency installation fails,
 managed configuration and skills are rolled back, but dependencies may require
 rerunning the install. At most five snapshots are retained; when that limit is
-reached, recover or remove one explicitly before starting another transaction.
+reached, the transaction stops until one is removed explicitly. Inspect them
+with `skynex backup list` and remove eligible ones with `skynex backup prune`
+(interactive) or `skynex backup prune --yes --keep N` (automation). Only
+committed or legacy snapshots that are still restorable are eligible; snapshots
+marked `recovery-needed` are never pruned automatically and must be recovered
+first. An interactive install offers the same choice at capacity.
 Deprecated managed entries are reported and preserved. Explicit file cleanup,
 where supported, renames a regular file to a recovery backup and never removes
 directories recursively.

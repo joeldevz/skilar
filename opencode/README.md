@@ -26,19 +26,17 @@ opencode/
 
 ## Agentes
 
-### `planner`
+La lista canónica es la clave `agent` de `opencode.json`, con el prompt de cada
+uno en `opencode/agents/`: `orchestrator`, `tech-planner`, `coder`, `verifier`,
+`test-reviewer`, `security`, `skill-validator`, `pr-reviewer`, `workflow-worker`
+y `workflow-reviewer`.
+
+### `tech-planner`
 
 - corre un **discovery checklist** antes de preguntar: primero inicia memoria con Neurox (`neurox_session_start` + `neurox_context`), luego lee CONVENTIONS.md, package.json, modulos similares, tests, y consulta decisiones previas con `neurox_recall`
 - hace preguntas de negocio y tecnicas en bloques
 - recomienda defaults razonables
 - genera `PLAN.md`
-
-
-- lee `PLAN.md`
-- ejecuta un solo paso por vez
-- delega implementacion a `coder`
-- actualiza estados del plan
-- obliga a revision humana antes de continuar
 
 Estados de `PLAN.md`:
 
@@ -167,19 +165,9 @@ DTOs si pueden usar primitivos porque son la frontera de serializacion.
 
 ## Eval Framework
 
-9 golden tests en `evals/golden/` que validan el comportamiento esperado de los agentes y commands clave:
-
-| Test | Agente       | Valida                                        |
-| ---- | ------------ | --------------------------------------------- |
-| 01   | planner      | Lee CONVENTIONS.md antes de preguntar         |
-| 02   | planner      | Usa template PLAN-crud para tareas CRUD       |
-| 03   | orchestrator | Lee PLAN.md antes de hacer nada               |
-| 04   | orchestrator | Se detiene tras un paso y pide review         |
-| 05   | coder        | Lee codigo existente antes de escribir        |
-| 06   | coder        | Corre verificacion antes de reportar exito    |
-| 07   | orchestrator | /review lee CONVENTIONS.md y git diff         |
-| 08   | coder        | /test lee tests existentes antes de generar   |
-| 09   | orchestrator | /rollback pide confirmacion antes de revertir |
+Los golden tests de `evals/golden/` validan el comportamiento esperado de los
+agentes y commands clave. El inventario canónico vive en
+[`evals/README.md`](evals/README.md).
 
 ```bash
 # Ver los tests y sus checks

@@ -113,6 +113,8 @@ Para instalacion manual, verificacion post-instalacion, y troubleshooting, ver [
 | `skynex status` | Dashboard: paquetes instalados, perfiles, herramientas |
 | `skynex doctor` | Diagnostico del entorno y dependencias |
 | `skynex up [profile]` | Lanza OpenCode con un perfil de modelos |
+| `skynex backup list\|prune` | Inspecciona y purga los snapshots de recuperacion del instalador |
+| `skynex workflow <cmd>` | Inspecciona o controla workflows gestionados ([docs](docs/workflow-commands.md)) |
 
 ### Perfiles de modelos
 
@@ -176,10 +178,20 @@ skynex completion fish > ~/.config/fish/completions/skynex.fish
 
 ## Agentes
 
+La lista canonica es la clave `agent` de `opencode/opencode.json`; cada prompt vive en `opencode/agents/`.
+
 | Agente | Rol | Que hace |
 |--------|-----|----------|
-| `planner` | Discovery y planificacion | Inicia memoria con Neurox, lee convenciones, explora el codebase, hace preguntas, genera `PLAN.md` |
+| `orchestrator` | Coordinacion | Delega todo el trabajo real a sub-agentes y sintetiza resultados |
+| `tech-planner` | Discovery y planificacion | Inicia memoria con Neurox, lee convenciones, explora el codebase, hace preguntas, genera `PLAN.md` |
 | `coder` | Implementacion acotada | Implementa una tarea, sigue patrones locales, consulta Context7 para docs, verifica antes de entregar |
+| `verifier` | Verificacion | Corre lint, build y tests despues de cada paso del coder |
+| `test-reviewer` | Coherencia de tests | Clasifica cada archivo de test como SOUND, WEAK o MISLEADING |
+| `security` | Juez de seguridad | Revision adversarial (se lanza x2 en paralelo) |
+| `skill-validator` | Convenciones | Valida el codigo contra el registro de skills del proyecto |
+| `pr-reviewer` | Review de PR | Juez adversarial de una sola dimension (R0–R4), solo lectura |
+| `workflow-worker` | Ejecucion de slice | Agente primario no interactivo de un intento de mutacion de `skynex workflow` |
+| `workflow-reviewer` | Review de candidate | Agente primario no interactivo que revisa el candidate inmutable, solo lectura |
 
 ### Estados de PLAN.md
 
@@ -255,10 +267,10 @@ skills/
 │   └── CLAUDE.md              # overlay para el orquestador en Claude Code
 ├── opencode/
 │   ├── opencode.json          # configuracion base de agentes y MCPs
-│   ├── commands/              # 8 slash commands reales
+│   ├── commands/              # 7 slash commands reales
 │   ├── skills/                # grill-me, prd, security, write-a-skill, diagnose, triage + _shared
 │   ├── templates/             # convenciones, commits, 5 tipos de plan
-│   ├── evals/                 # 9 golden tests de regresion
+│   ├── evals/                 # 15 golden tests de regresion
 │   └── plugins/
 ├── skills/
 │   └── prd/                   # skill compartida de PRD
@@ -270,34 +282,28 @@ skills/
 
 ### Claude Code
 
-- **8 slash skills** en `~/.claude/skills` con los mismos nombres operativos
+- **7 slash skills** en `~/.claude/skills` con los mismos nombres operativos
 - **Overlay de `CLAUDE.md`** para mantener el mismo workflow
 - **Neurox MCP** configurado en `~/.claude.json`
 
 ### OpenCode
 
-- **11 agentes** con roles claros en `opencode.json`
-- **8 commands** para todo el ciclo
+- **10 agentes** con roles claros en `opencode.json`
+- **7 commands** para todo el ciclo
 - **Neurox + Context7 MCP** como sistemas externos
 - **Templates** para convenciones, commits/PRs, y 5 tipos de plan
 - **Skills** de PRD, TypeScript avanzado, y patrones NestJS DDD+CQRS
-- **Eval framework** con 9 golden tests
+- **Eval framework** con 15 golden tests
 
 ## Eval Framework
 
-9 golden tests en `evals/golden/` que validan el comportamiento de los agentes:
-
-| Test | Agente | Valida |
-|------|--------|--------|
-| 01 | planner | Lee CONVENTIONS.md antes de preguntar |
-| 02 | planner | Usa template PLAN-crud para tareas CRUD |
-| 05 | coder | Lee codigo existente antes de escribir |
-| 06 | coder | Corre verificacion antes de reportar exito |
-| 08 | coder | /test lee tests existentes antes de generar |
+15 golden tests en `opencode/evals/golden/` validan el comportamiento de los
+agentes. El inventario canónico esta en
+[`opencode/evals/README.md`](opencode/evals/README.md).
 
 ```bash
-./evals/run-evals.sh
-./evals/run-evals.sh --agent coder
+./opencode/evals/run-evals.sh
+./opencode/evals/run-evals.sh --agent coder
 ```
 
 ## Documentacion
@@ -305,6 +311,9 @@ skills/
 | Tema | Descripcion |
 |------|-------------|
 | [Instalacion](docs/installation.md) | Guia completa: requisitos, setup automatico/manual, verificacion, troubleshooting |
+| [Workflow commands](docs/workflow-commands.md) | `skynex workflow`: ejecucion detached, recuperacion y gates de entrega |
+| [Modelo de seguridad](docs/security-model.md) | Confianza del instalador: binding de commits firmados y escrituras en filesystem |
+| [Firma de releases](docs/release-signing.md) | Claves, verificacion de firmas y procedimiento del mantenedor |
 | [OpenCode setup](opencode/README.md) | Configuracion detallada de OpenCode |
 | [Claude Code setup](claude-code/CLAUDE.md) | Overlay y reglas para Claude Code |
 

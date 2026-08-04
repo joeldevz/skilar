@@ -1,4 +1,8 @@
 $ErrorActionPreference = 'Stop'
+# This suite invokes the installer expecting non-zero exits, so keep native exit
+# codes as data ($LASTEXITCODE) instead of terminating errors. PowerShell 7.4+
+# would otherwise abort those deliberate-failure cases before they are asserted.
+$PSNativeCommandUseErrorActionPreference = $false
 $root = Split-Path -Parent $PSScriptRoot
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ('skynex-installer-test-' + [IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Path $tmp | Out-Null
@@ -11,10 +15,20 @@ try {
   $allowed = Join-Path $tmp 'allowed_signers'
   "skynex-release $pub fixture" | Set-Content -NoNewline -Encoding ascii $allowed
 
-  Add-Type -TypeDefinition @'
-using System; using System.IO; using System.Diagnostics;
+  # PowerShell 7 dropped `Add-Type -OutputAssembly`/`-OutputType`, so the fake
+  # binary is compiled through Windows PowerShell, which still supports it.
+  $fakeExe = Join-Path $tmp 'skynex.exe'
+  $fakeBuilder = Join-Path $tmp 'build-fake-skynex.ps1'
+  @'
+param([string]$OutputPath)
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @"
+using System; using System.IO;
 class FakeSkynex { public static void Main(string[] a) { if (a.Length == 3 && a[0] == "internal-install-binary") { File.Copy(a[1], a[2], true); return; } } }
-'@ -OutputAssembly (Join-Path $tmp 'skynex.exe') -OutputType ConsoleApplication
+"@ -OutputAssembly $OutputPath -OutputType ConsoleApplication
+'@ | Set-Content -Encoding utf8 $fakeBuilder
+  & powershell -NoProfile -File $fakeBuilder -OutputPath $fakeExe
+  if ($LASTEXITCODE -ne 0 -or -not (Test-Path $fakeExe)) { throw 'could not compile the fake skynex.exe fixture' }
   $archive = Join-Path $release 'skynex_1.2.3_windows_amd64.zip'
   Add-Type -AssemblyName System.IO.Compression.FileSystem
   $zip = [IO.Compression.ZipFile]::Open($archive, [IO.Compression.ZipArchiveMode]::Create)
@@ -46,8 +60,8 @@ while ($true) { $c = $l.GetContext(); if ($c.Request.Url.AbsolutePath -eq '/api/
   if ($LASTEXITCODE -eq 0 -or ($bypassOutput -join "`n") -notmatch 'Invalid checksums\.txt signature' -or (Test-Path $bypassDest)) { throw 'production Windows installer accepted test signer overrides or changed the destination' }
 
   Add-Content -Path (Join-Path $release 'checksums.txt.sig') -Value 'tampered'
-  $failed = $false; try { & powershell -NoProfile -File $installer -Method binary -InstallDir (Join-Path $tmp 'bad') } catch { $failed = $true }
-  if (-not $failed) { throw 'tampered Windows signature was accepted' }
+  & powershell -NoProfile -File $installer -Method binary -InstallDir (Join-Path $tmp 'bad')
+  if ($LASTEXITCODE -eq 0) { throw 'tampered Windows signature was accepted' }
   Write-Output 'Windows installer runtime acceptance passed'
 } finally {
   if ($serverProc) { Stop-Process -Id $serverProc.Id -Force -ErrorAction SilentlyContinue }

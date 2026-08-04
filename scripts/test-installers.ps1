@@ -78,7 +78,9 @@ while ($true) { $c = $l.GetContext(); if ($c.Request.Url.AbsolutePath -eq '/api/
   $bypassOutput = & powershell -NoProfile -File $controlledProduction -Method binary -InstallDir $bypassDest 2>&1
   if ($LASTEXITCODE -eq 0 -or ($bypassOutput -join "`n") -notmatch 'Invalid checksums\.txt signature' -or (Test-Path $bypassDest)) { throw 'production Windows installer accepted test signer overrides or changed the destination' }
 
-  Add-Content -Path (Join-Path $release 'checksums.txt.sig') -Value 'tampered'
+  # Overwrite the armored signature like the Unix suite does: appending to it
+  # only adds trailing text after the END marker, which ssh-keygen ignores.
+  Set-Content -Encoding ascii -Path (Join-Path $release 'checksums.txt.sig') -Value 'tampered'
   & powershell -NoProfile -File $installer -Method binary -InstallDir (Join-Path $tmp 'bad')
   if ($LASTEXITCODE -eq 0) { throw 'tampered Windows signature was accepted' }
   Write-Output 'Windows installer runtime acceptance passed'

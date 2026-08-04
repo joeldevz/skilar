@@ -227,8 +227,25 @@ function Install-ViaBinary {
     $allowedSigners = Join-Path $tmpDir "allowed_signers"
     $signer = "skynex-release ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINUht44Rk/nWIXqcKizh8SWdnECJZOQ5yuPjaxaWxAAF skynex release signing`n"
     Set-Content -Path $allowedSigners -NoNewline -Encoding ascii -Value $signer
-    Get-Content -Raw -Path $checksumsPath | & $sshKeygen.Source -Y verify -f $allowedSigners -I skynex-release -n file -s $signaturePath 2>$null
-    if ($LASTEXITCODE -ne 0) { Stop-WithError "Invalid checksums.txt signature" }
+    # The signature covers checksums.txt byte for byte, so feed the file to
+    # ssh-keygen verbatim. Piping `Get-Content` re-encodes the text and appends
+    # a trailing newline, which makes every valid signature fail to verify.
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $sshKeygen.Source
+    $psi.Arguments = '-Y verify -f "{0}" -I skynex-release -n file -s "{1}"' -f $allowedSigners, $signaturePath
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $verify = [Diagnostics.Process]::Start($psi)
+    $checksumsBytes = [IO.File]::ReadAllBytes($checksumsPath)
+    $verify.StandardInput.BaseStream.Write($checksumsBytes, 0, $checksumsBytes.Length)
+    $verify.StandardInput.BaseStream.Flush()
+    $verify.StandardInput.Close()
+    $verify.StandardOutput.ReadToEnd() | Out-Null
+    $verify.StandardError.ReadToEnd() | Out-Null
+    $verify.WaitForExit()
+    if ($verify.ExitCode -ne 0) { Stop-WithError "Invalid checksums.txt signature" }
     Write-Success "Release signature verified"
     $matches = @(Get-Content $checksumsPath | Where-Object {
       $parts = $_ -split "\s+"

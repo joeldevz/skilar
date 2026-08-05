@@ -360,6 +360,48 @@ func TestSchema18BackfillsResultTransportForInFlightWorkflows(t *testing.T) {
 	}
 }
 
+func TestCurrentSchemaRepairsResultTransportWrittenByOlderProcess(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state", "workflows.db")
+	store, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Create(Workflow{ID: "wf-mixed-version", Route: RouteSimple, MinimumRisk: RiskLow, BasisTree: "tree"}); err != nil {
+		t.Fatal(err)
+	}
+	legacy := []byte(`{"Request":"preserve candidate","ResultTransport":"","AllowedPaths":["src/a.ts"]}`)
+	if _, err = store.Database().Exec(`INSERT INTO workflow_run_inputs(workflow_id,input) VALUES(?,?)`, "wf-mixed-version", legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var raw []byte
+	if err = store.Database().QueryRow(`SELECT input FROM workflow_run_inputs WHERE workflow_id=?`, "wf-mixed-version").Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var input map[string]json.RawMessage
+	if err = json.Unmarshal(raw, &input); err != nil {
+		t.Fatal(err)
+	}
+	var transport string
+	if err = json.Unmarshal(input["ResultTransport"], &transport); err != nil {
+		t.Fatal(err)
+	}
+	if transport != ResultTransportFileV1 {
+		t.Fatalf("transport=%q", transport)
+	}
+	if string(input["Request"]) != `"preserve candidate"` || string(input["AllowedPaths"]) != `["src/a.ts"]` {
+		t.Fatalf("unrelated input changed: %s", raw)
+	}
+}
+
 func runGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)

@@ -34,11 +34,32 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 		db.Close()
 		return nil, err
 	}
+	// A concurrently installed older Skynex binary can still write a legacy
+	// run input after the database has already reached schema 18. Repair that
+	// mixed-version state on every writable open so frozen candidates do not
+	// become permanently unreviewable merely because the one-time migration
+	// has already run.
+	if err := s.repairResultTransport(); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if err := s.tightenFiles(); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return s, nil
+}
+
+func (s *SQLiteStore) repairResultTransport() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err = backfillResultTransport(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func OpenRepositorySQLite(repoDir string) (*SQLiteStore, error) {

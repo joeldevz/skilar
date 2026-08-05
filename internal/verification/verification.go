@@ -150,7 +150,7 @@ func (r *Runner) Run(ctx context.Context, workflowID string, seal gitcandidate.C
 		return Result{}, err
 	}
 	if !passed {
-		_, err = r.Store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateReplanRequired, IdempotencyKey: "verification:failed:v1"})
+		_, err = r.Store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateReplanRequired, IdempotencyKey: "verification:failed:v1", ArtifactIDs: evidenceArtifactIDs(evidence)})
 		return result, err
 	}
 	if r.BeforeTransition != nil {
@@ -169,6 +169,20 @@ func (r *Runner) Run(ctx context.Context, workflowID string, seal gitcandidate.C
 	_, err = r.Store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateCandidateFrozen, IdempotencyKey: "verification:frozen:v1"})
 	return result, err
 }
+
+func evidenceArtifactIDs(evidence []Evidence) []string {
+	ids := make([]string, 0, len(evidence)*2)
+	for _, item := range evidence {
+		if item.ID != "" {
+			ids = append(ids, item.ID)
+		}
+		if item.OutputArtifactID != "" {
+			ids = append(ids, item.OutputArtifactID)
+		}
+	}
+	return ids
+}
+
 func (r *Runner) persist(workflowID string, result Result) error {
 	raw, _ := json.Marshal(result)
 	tx, err := r.Store.Database().Begin()

@@ -112,6 +112,9 @@ type OpenCodeReviewOptions struct {
 	Timeout           time.Duration
 	MaxOutputBytes    int
 	IdleTimeout       time.Duration
+	// Preflight is invoked before the durable candidate_frozen -> reviewing
+	// transition. It must not create review invocations or consume authority.
+	Preflight func(context.Context) error
 }
 type OpenCodeReviewRunner struct {
 	Store   *workflow.SQLiteStore
@@ -126,6 +129,11 @@ func (r *OpenCodeReviewRunner) Run(ctx context.Context, workflowID string) (Rece
 	}
 	if authority, e := NewSQLiteStore(r.Store.Database()).Authority(workflowID); e == nil {
 		return authority, nil
+	}
+	if r.Options.Preflight != nil {
+		if err = r.Options.Preflight(ctx); err != nil {
+			return Receipt{}, err
+		}
 	}
 	if w.State == workflow.StateCandidateFrozen {
 		w, err = r.Store.Transition(workflow.Transition{WorkflowID: workflowID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateReviewing, IdempotencyKey: "review:start:v1"})

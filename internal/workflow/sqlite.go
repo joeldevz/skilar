@@ -76,9 +76,9 @@ func OpenSQLiteReadOnly(path string) (*SQLiteStore, error) {
 		db.Close()
 		return nil, err
 	}
-	if version != 17 {
+	if version != 18 {
 		db.Close()
-		return nil, fmt.Errorf("workflow database schema %d requires writable migration to schema 17", version)
+		return nil, fmt.Errorf("workflow database schema %d requires writable migration to schema 18", version)
 	}
 	return s, nil
 }
@@ -134,9 +134,9 @@ func OpenSQLiteLiveReadOnly(path string) (*SQLiteStore, error) {
 		db.Close()
 		return nil, err
 	}
-	if version != 17 {
+	if version != 18 {
 		db.Close()
-		return nil, fmt.Errorf("workflow database schema %d requires writable migration to schema 17", version)
+		return nil, fmt.Errorf("workflow database schema %d requires writable migration to schema 18", version)
 	}
 	return s, nil
 }
@@ -172,13 +172,14 @@ func (s *SQLiteStore) Database() *sql.DB { return s.db }
 
 func (s *SQLiteStore) migrate() error {
 	var version int
+	var err error
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		return err
 	}
-	if version > 17 {
-		return fmt.Errorf("workflow database schema %d is newer than supported schema 17", version)
+	if version > 18 {
+		return fmt.Errorf("workflow database schema %d is newer than supported schema 18", version)
 	}
-	if version == 17 {
+	if version == 18 {
 		return nil
 	}
 	if version == 0 {
@@ -274,30 +275,36 @@ COMMIT;`
 			return err
 		}
 	}
-	const schemaV7 = `BEGIN IMMEDIATE;
+	if version < 7 {
+		const schemaV7 = `BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS opencode_invocations (invocation_id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, attempt_id TEXT NOT NULL, model TEXT NOT NULL, command BLOB NOT NULL, exit_code INTEGER NOT NULL, stdout_digest TEXT NOT NULL, stderr_digest TEXT NOT NULL, evidence_ids BLOB NOT NULL, status TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT NOT NULL);
 PRAGMA user_version=7;
 COMMIT;`
-	if _, err := s.db.Exec(schemaV7); err != nil {
-		return err
+		if _, err := s.db.Exec(schemaV7); err != nil {
+			return err
+		}
 	}
-	const schemaV8 = `BEGIN IMMEDIATE;
+	if version < 8 {
+		const schemaV8 = `BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS workflow_run_inputs (workflow_id TEXT PRIMARY KEY REFERENCES workflows(id), input BLOB NOT NULL);
 PRAGMA user_version=8;
 COMMIT;`
-	if _, err := s.db.Exec(schemaV8); err != nil {
-		return err
+		if _, err := s.db.Exec(schemaV8); err != nil {
+			return err
+		}
 	}
-	const schemaV9 = `BEGIN IMMEDIATE;
+	if version < 9 {
+		const schemaV9 = `BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS review_invocations (id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, candidate_tree TEXT NOT NULL, lens TEXT NOT NULL, model TEXT NOT NULL, status TEXT NOT NULL, output_digest TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS review_findings (id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, candidate_tree TEXT NOT NULL, lens TEXT NOT NULL, finding BLOB NOT NULL);
 PRAGMA user_version=9;
 COMMIT;`
-	_, err := s.db.Exec(schemaV9)
-	if err != nil {
-		return err
+		if _, err := s.db.Exec(schemaV9); err != nil {
+			return err
+		}
 	}
-	const schemaV10 = `BEGIN IMMEDIATE;
+	if version < 10 {
+		const schemaV10 = `BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, action TEXT NOT NULL, digest TEXT NOT NULL, artifact BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS current_approvals (workflow_id TEXT NOT NULL, action TEXT NOT NULL, approval_id TEXT NOT NULL REFERENCES approvals(id), PRIMARY KEY(workflow_id,action));
 CREATE TABLE IF NOT EXISTS approval_revocations (sequence INTEGER PRIMARY KEY AUTOINCREMENT, workflow_id TEXT NOT NULL, action TEXT NOT NULL, approval_id TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL, occurred_at TEXT NOT NULL);
@@ -305,9 +312,9 @@ CREATE TABLE IF NOT EXISTS abort_cleanup_plans (workflow_id TEXT PRIMARY KEY, pl
 CREATE TABLE IF NOT EXISTS prototype_validations (id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, artifact BLOB NOT NULL);
 PRAGMA user_version=10;
 COMMIT;`
-	_, err = s.db.Exec(schemaV10)
-	if err != nil {
-		return err
+		if _, err := s.db.Exec(schemaV10); err != nil {
+			return err
+		}
 	}
 	if version < 11 {
 		const schemaV11 = `BEGIN IMMEDIATE;
@@ -407,6 +414,38 @@ COMMIT;`
 			}
 		}
 		if _, err := s.db.Exec(`PRAGMA user_version=17`); err != nil {
+			return err
+		}
+	}
+	if version < 18 {
+		const schemaV18 = `BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS verification_run_history (
+  workflow_id TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  candidate_tree TEXT NOT NULL,
+  result BLOB NOT NULL,
+  archived_at TEXT NOT NULL,
+  PRIMARY KEY(workflow_id,revision)
+);
+CREATE TABLE IF NOT EXISTS verification_contract_revisions (
+  workflow_id TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  candidate_tree TEXT NOT NULL,
+  check_id TEXT NOT NULL,
+  previous_command TEXT NOT NULL,
+  replacement_command TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  attempt_id TEXT NOT NULL,
+  fencing_token TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(workflow_id,revision),
+  UNIQUE(workflow_id,idempotency_key)
+);
+PRAGMA user_version=18;
+COMMIT;`
+		if _, err := s.db.Exec(schemaV18); err != nil {
 			return err
 		}
 	}

@@ -75,12 +75,195 @@ func TestWorkflowStartRunToCandidateFrozen(t *testing.T) {
 	}
 }
 
+func TestWorkflowRetryVerificationReplacesOnlyFailedCheckAndPreservesCandidate(t *testing.T) {
+	repo, store := cliWorkflowRepo(t)
+	defer store.Close()
+	fake := cliFakeOpenCode(t, "true")
+	args := []string{"--id", "wf", "--request", "change a", "--accept", "test \"$(cat a.txt)\" = new", "--check", "false", "--check", "test -f a.txt", "--path", "a.txt", "--opencode", fake, "--timeout", "2s"}
+	if err := workflowStart(store, repo, args, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := workflowRun(store, repo, []string{"wf"}, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	w, _ := store.Get("wf")
+	if w.State != workflow.StateReplanRequired {
+		t.Fatalf("state=%s", w.State)
+	}
+	var beforeRaw []byte
+	if err := store.Database().QueryRow(`SELECT result FROM verification_runs WHERE workflow_id='wf'`).Scan(&beforeRaw); err != nil {
+		t.Fatal(err)
+	}
+	var before struct {
+		Candidate struct{ TreeOID string }
+		Evidence  []struct {
+			ID       string
+			Kind     string
+			ExitCode int
+		}
+	}
+	if err := json.Unmarshal(beforeRaw, &before); err != nil {
+		t.Fatal(err)
+	}
+	var failedID string
+	for _, item := range before.Evidence {
+		if item.Kind == "check" && item.ExitCode != 0 {
+			failedID = item.ID
+		}
+	}
+	if failedID == "" {
+		t.Fatal("missing failed check evidence")
+	}
+	var invocationsBefore int
+	if err := store.Database().QueryRow(`SELECT COUNT(*) FROM opencode_invocations WHERE workflow_id='wf'`).Scan(&invocationsBefore); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	err := workflowRetryVerification(store, []string{"--id", "wf", "--check-id", failedID, "--replacement", "true", "--actor", "tester", "--reason", "verification environment fixed", "--idempotency-key", "retry:v1"}, &out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, _ = store.Get("wf")
+	if w.State != workflow.StateCandidateFrozen {
+		t.Fatalf("state=%s out=%q", w.State, out.String())
+	}
+	var afterRaw []byte
+	if err := store.Database().QueryRow(`SELECT result FROM verification_runs WHERE workflow_id='wf'`).Scan(&afterRaw); err != nil {
+		t.Fatal(err)
+	}
+	var after struct {
+		Candidate struct{ TreeOID string }
+		Passed    bool
+	}
+	if err := json.Unmarshal(afterRaw, &after); err != nil {
+		t.Fatal(err)
+	}
+	if !after.Passed || after.Candidate.TreeOID != before.Candidate.TreeOID {
+		t.Fatalf("candidate changed or verification failed: before=%s after=%s passed=%v", before.Candidate.TreeOID, after.Candidate.TreeOID, after.Passed)
+	}
+	var invocationsAfter, history, revisions int
+	_ = store.Database().QueryRow(`SELECT COUNT(*) FROM opencode_invocations WHERE workflow_id='wf'`).Scan(&invocationsAfter)
+	_ = store.Database().QueryRow(`SELECT COUNT(*) FROM verification_run_history WHERE workflow_id='wf'`).Scan(&history)
+	_ = store.Database().QueryRow(`SELECT COUNT(*) FROM verification_contract_revisions WHERE workflow_id='wf'`).Scan(&revisions)
+	if invocationsAfter != invocationsBefore || history != 1 || revisions != 1 {
+		t.Fatalf("coder reran or provenance missing: invocations=%d/%d history=%d revisions=%d", invocationsBefore, invocationsAfter, history, revisions)
+	}
+	var rawInput []byte
+	if err := store.Database().QueryRow(`SELECT input FROM workflow_run_inputs WHERE workflow_id='wf'`).Scan(&rawInput); err != nil {
+		t.Fatal(err)
+	}
+	var input workflowRunInput
+	_ = json.Unmarshal(rawInput, &input)
+	if len(input.Checks) != 2 || input.Checks[0] != "true" || input.Checks[1] != "test -f a.txt" || len(input.Acceptance) != 1 {
+		t.Fatalf("contract mutated beyond failed check: %+v", input)
+	}
+	if err := workflowRetryVerification(store, []string{"--id", "wf", "--check-id", failedID, "--replacement", "true", "--actor", "tester", "--reason", "verification environment fixed", "--idempotency-key", "retry:v1"}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("idempotent retry failed: %v", err)
+	}
+}
+
 func TestWorkflowAgentDefaultsToDedicatedPrimaryAndPreservesExplicitAgent(t *testing.T) {
 	if got := workflowAgent(nil); got != "workflow-worker" {
 		t.Fatalf("default agent=%q", got)
 	}
 	if got := workflowAgent([]string{"--agent", "explicit-primary"}); got != "explicit-primary" {
 		t.Fatalf("explicit agent=%q", got)
+	}
+}
+
+func TestWorkflowRunPreflightFailureDoesNotCreateAttemptLeaseOrJob(t *testing.T) {
+	repo, store := cliWorkflowRepo(t)
+	defer store.Close()
+	fake := cliFakeOpenCode(t, "true")
+	if err := workflowStart(store, repo, []string{"--id", "wf", "--request", "change", "--accept", "true", "--check", "true", "--path", "a.txt", "--opencode", fake}, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	old := workflowRuntimePreflight
+	defer func() { workflowRuntimePreflight = old }()
+	workflowRuntimePreflight = workflow.RuntimePreflight{LookPath: func(string) (string, error) { return "", errors.New("absent") }}
+	err := workflowRun(store, repo, []string{"wf"}, &bytes.Buffer{})
+	var preflightErr *workflow.RuntimePreflightError
+	if !errors.As(err, &preflightErr) || preflightErr.Code != "opencode_unavailable" {
+		t.Fatalf("err=%v", err)
+	}
+	err = workflowRun(store, repo, []string{"wf", "--detach"}, &bytes.Buffer{})
+	if !errors.As(err, &preflightErr) || preflightErr.Code != "opencode_unavailable" {
+		t.Fatalf("detached err=%v", err)
+	}
+	w, _ := store.Get("wf")
+	if w.State != workflow.StateReady {
+		t.Fatalf("state=%s", w.State)
+	}
+	for _, table := range []string{"mutation_attempts", "leases", "workflow_jobs", "invocation_runtime"} {
+		var count int
+		if err := store.Database().QueryRow("SELECT COUNT(*) FROM " + table + " WHERE workflow_id='wf'").Scan(&count); err != nil && table != "leases" {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("%s=%d", table, count)
+		}
+	}
+}
+
+func TestWorkflowReviewPreflightFailureKeepsCandidateFrozenWithoutInvocation(t *testing.T) {
+	repo, store := cliWorkflowRepo(t)
+	defer store.Close()
+	fake := cliFakeOpenCode(t, "true")
+	if err := workflowStart(store, repo, []string{"--id", "wf", "--request", "change", "--accept", "true", "--check", "true", "--path", "a.txt", "--opencode", fake}, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, next := range []workflow.State{workflow.StateExecuting, workflow.StateVerifying, workflow.StateCandidateFrozen} {
+		current, _ := store.Get("wf")
+		if _, err := store.Transition(workflow.Transition{WorkflowID: "wf", ExpectedState: current.State, ExpectedVersion: current.StateVersion, NextState: next, IdempotencyKey: "test:" + string(next)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := workflowRuntimePreflight
+	defer func() { workflowRuntimePreflight = old }()
+	workflowRuntimePreflight = workflow.RuntimePreflight{LookPath: func(string) (string, error) { return "", errors.New("absent") }}
+	err := workflowReview(store, []string{"--id", "wf"}, &bytes.Buffer{})
+	var preflightErr *workflow.RuntimePreflightError
+	if !errors.As(err, &preflightErr) || preflightErr.Code != "opencode_unavailable" {
+		t.Fatalf("err=%v", err)
+	}
+	w, _ := store.Get("wf")
+	if w.State != workflow.StateCandidateFrozen {
+		t.Fatalf("state=%s", w.State)
+	}
+	var count int
+	if err := store.Database().QueryRow(`SELECT COUNT(*) FROM review_invocations WHERE workflow_id='wf'`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("invocations=%d err=%v", count, err)
+	}
+}
+
+func TestWorkflowRunLegacyInputWithoutDeclaredTransportFailsClosed(t *testing.T) {
+	repo, store := cliWorkflowRepo(t)
+	defer store.Close()
+	fake := cliFakeOpenCode(t, "true")
+	if err := workflowStart(store, repo, []string{"--id", "wf", "--request", "change", "--accept", "true", "--check", "true", "--path", "a.txt", "--opencode", fake}, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	var raw []byte
+	if err := store.Database().QueryRow(`SELECT input FROM workflow_run_inputs WHERE workflow_id='wf'`).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var legacy map[string]any
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	delete(legacy, "ResultTransport")
+	raw, _ = json.Marshal(legacy)
+	if _, err := store.Database().Exec(`UPDATE workflow_run_inputs SET input=? WHERE workflow_id='wf'`, raw); err != nil {
+		t.Fatal(err)
+	}
+	err := workflowRun(store, repo, []string{"wf"}, &bytes.Buffer{})
+	var preflightErr *workflow.RuntimePreflightError
+	if !errors.As(err, &preflightErr) || preflightErr.Code != "result_transport_undeclared" {
+		t.Fatalf("err=%v", err)
+	}
+	w, _ := store.Get("wf")
+	if w.State != workflow.StateReady {
+		t.Fatalf("state=%s", w.State)
 	}
 }
 

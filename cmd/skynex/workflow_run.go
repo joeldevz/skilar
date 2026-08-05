@@ -26,6 +26,8 @@ import (
 
 type workflowRunInput struct {
 	Request, Model, Agent, Executable string
+	ModelExplicit, AgentExplicit      bool
+	ResultTransport                   string
 	Acceptance, Checks, AllowedPaths  []string
 	Timeout                           time.Duration
 	Seal                              gitcandidate.ContextSeal
@@ -173,7 +175,9 @@ func workflowStart(store *workflow.SQLiteStore, repo string, args []string, out 
 		if _, e = store.Database().Exec(`INSERT INTO wayfinder_graphs(workflow_id,version,graph) VALUES(?,?,?)`, id, graph.Version, encoded); e != nil {
 			return e
 		}
-		input := workflowRunInput{Request: request, Model: valueOrEmpty(args, "--model"), Agent: workflowAgent(args), Executable: valueOrEmpty(args, "--opencode"), Timeout: 10 * time.Minute, Seal: seal}
+		_, modelExplicit := flagValue(args, "--model")
+		_, agentExplicit := flagValue(args, "--agent")
+		input := workflowRunInput{Request: request, Model: valueOrEmpty(args, "--model"), Agent: workflowAgent(args), ModelExplicit: modelExplicit, AgentExplicit: agentExplicit, ResultTransport: workflow.ResultTransportFileV1, Executable: valueOrEmpty(args, "--opencode"), Timeout: 10 * time.Minute, Seal: seal}
 		data, _ := json.Marshal(input)
 		_, e = store.Database().Exec(`INSERT INTO workflow_run_inputs(workflow_id,input) VALUES(?,?)`, id, data)
 		if e != nil {
@@ -217,7 +221,9 @@ func workflowStart(store *workflow.SQLiteStore, repo string, args []string, out 
 			return fmt.Errorf("invalid --timeout: %w", err)
 		}
 	}
-	input := workflowRunInput{Request: request, Acceptance: acceptance, Checks: checks, AllowedPaths: paths, Model: valueOrEmpty(args, "--model"), Agent: workflowAgent(args), Executable: valueOrEmpty(args, "--opencode"), Timeout: timeout, Seal: seal, SliceConfigs: configs}
+	_, modelExplicit := flagValue(args, "--model")
+	_, agentExplicit := flagValue(args, "--agent")
+	input := workflowRunInput{Request: request, Acceptance: acceptance, Checks: checks, AllowedPaths: paths, Model: valueOrEmpty(args, "--model"), Agent: workflowAgent(args), ModelExplicit: modelExplicit, AgentExplicit: agentExplicit, ResultTransport: workflow.ResultTransportFileV1, Executable: valueOrEmpty(args, "--opencode"), Timeout: timeout, Seal: seal, SliceConfigs: configs}
 	raw, _ := json.Marshal(input)
 	if _, err = store.Database().Exec(`INSERT INTO workflow_run_inputs(workflow_id,input) VALUES(?,?)`, id, raw); err != nil {
 		return err
@@ -259,6 +265,9 @@ func workflowRunContext(ctx context.Context, store *workflow.SQLiteStore, repo s
 	seal := input.Seal
 	if seal.RepositoryRoot == "" || seal.RepositoryRoot != repo {
 		return errors.New("persisted workflow context does not match repository")
+	}
+	if err = workflowRuntimePreflight.Check(ctx, workflow.RuntimePreflightRequest{Phase: "run", Executable: input.Executable, Model: input.Model, Agent: input.Agent, ModelExplicit: input.ModelExplicit, AgentExplicit: input.AgentExplicit, WorkDir: repo, RequireResultFile: true, ResultTransport: input.ResultTransport}); err != nil {
+		return err
 	}
 	if w.State != workflow.StateVerifying {
 		var graphRaw []byte
@@ -412,6 +421,8 @@ func workflowReview(store *workflow.SQLiteStore, args []string, out io.Writer) e
 	return nil
 }
 
+var workflowRuntimePreflight = workflow.DefaultRuntimePreflight()
+
 func reviewOptionsForWorkflow(store *workflow.SQLiteStore, id string) (review.OpenCodeReviewOptions, error) {
 	var raw []byte
 	if err := store.Database().QueryRow(`SELECT input FROM workflow_run_inputs WHERE workflow_id=?`, id).Scan(&raw); err != nil {
@@ -421,7 +432,9 @@ func reviewOptionsForWorkflow(store *workflow.SQLiteStore, id string) (review.Op
 	if err := json.Unmarshal(raw, &input); err != nil {
 		return review.OpenCodeReviewOptions{}, err
 	}
-	return review.OpenCodeReviewOptions{Executable: input.Executable, Model: input.Model, Timeout: input.Timeout}, nil
+	return review.OpenCodeReviewOptions{Executable: input.Executable, Model: input.Model, Timeout: input.Timeout, Preflight: func(ctx context.Context) error {
+		return workflowRuntimePreflight.Check(ctx, workflow.RuntimePreflightRequest{Phase: "review", Executable: input.Executable, Model: input.Model, Agent: "workflow-reviewer", ModelExplicit: input.ModelExplicit, AgentExplicit: true, WorkDir: input.Seal.RepositoryRoot, RequireResultFile: true, ResultTransport: input.ResultTransport})
+	}}, nil
 }
 
 func workflowApprove(store *workflow.SQLiteStore, args []string, out io.Writer) error {

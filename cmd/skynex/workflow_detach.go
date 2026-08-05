@@ -40,6 +40,13 @@ func workflowRunDetached(store *workflow.SQLiteStore, repo, id string, out io.Wr
 	if w.State != workflow.StateReady && w.State != workflow.StateExecuting && w.State != workflow.StateVerifying && w.State != workflow.StateBlocked {
 		return fmt.Errorf("workflow %s cannot run from %s", id, w.State)
 	}
+	input, err := workflowInputFor(store, id)
+	if err != nil {
+		return err
+	}
+	if err = workflowRuntimePreflight.Check(context.Background(), workflow.RuntimePreflightRequest{Phase: "run", Executable: input.Executable, Model: input.Model, Agent: input.Agent, ModelExplicit: input.ModelExplicit, AgentExplicit: input.AgentExplicit, WorkDir: repo, RequireResultFile: true, ResultTransport: input.ResultTransport}); err != nil {
+		return err
+	}
 	return workflowQueueDetached(store, repo, id, "run", w, out)
 }
 
@@ -54,15 +61,26 @@ func workflowReviewDetached(store *workflow.SQLiteStore, id string, out io.Write
 	if w.State != workflow.StateCandidateFrozen && w.State != workflow.StateReviewing && w.State != workflow.StateBlocked {
 		return fmt.Errorf("workflow %s cannot review from %s", id, w.State)
 	}
-	var raw []byte
-	if err := store.Database().QueryRow(`SELECT input FROM workflow_run_inputs WHERE workflow_id=?`, id).Scan(&raw); err != nil {
+	input, err := workflowInputFor(store, id)
+	if err != nil {
 		return err
 	}
-	var input workflowRunInput
-	if err := json.Unmarshal(raw, &input); err != nil {
+	if err = workflowRuntimePreflight.Check(context.Background(), workflow.RuntimePreflightRequest{Phase: "review", Executable: input.Executable, Model: input.Model, Agent: "workflow-reviewer", ModelExplicit: input.ModelExplicit, AgentExplicit: true, WorkDir: input.Seal.RepositoryRoot, RequireResultFile: true, ResultTransport: input.ResultTransport}); err != nil {
 		return err
 	}
 	return workflowQueueDetached(store, input.Seal.RepositoryRoot, id, "review", w, out)
+}
+
+func workflowInputFor(store *workflow.SQLiteStore, id string) (workflowRunInput, error) {
+	var raw []byte
+	if err := store.Database().QueryRow(`SELECT input FROM workflow_run_inputs WHERE workflow_id=?`, id).Scan(&raw); err != nil {
+		return workflowRunInput{}, err
+	}
+	var input workflowRunInput
+	if err := json.Unmarshal(raw, &input); err != nil {
+		return workflowRunInput{}, err
+	}
+	return input, nil
 }
 
 func workflowQueueDetached(store *workflow.SQLiteStore, repo, id, operation string, w workflow.Workflow, out io.Writer) error {

@@ -18,14 +18,16 @@ import (
 )
 
 type workflowInspection struct {
-	Workflow          workflow.Workflow            `json:"workflow"`
-	Events            []workflow.Event             `json:"events"`
-	Receipt           *review.Receipt              `json:"authoritative_receipt,omitempty"`
-	RunInput          json.RawMessage              `json:"run_input,omitempty"`
-	Approvals         []string                     `json:"current_approvals,omitempty"`
-	Invocations       []invocationInspection       `json:"invocations,omitempty"`
-	ReviewInvocations []reviewInvocationInspection `json:"review_invocations,omitempty"`
-	Jobs              []workflowJobInspection      `json:"jobs,omitempty"`
+	Workflow              workflow.Workflow               `json:"workflow"`
+	Events                []workflow.Event                `json:"events"`
+	Receipt               *review.Receipt                 `json:"authoritative_receipt,omitempty"`
+	RunInput              json.RawMessage                 `json:"run_input,omitempty"`
+	VerificationRun       json.RawMessage                 `json:"verification_run,omitempty"`
+	Approvals             []string                        `json:"current_approvals,omitempty"`
+	Invocations           []invocationInspection          `json:"invocations,omitempty"`
+	ReviewInvocations     []reviewInvocationInspection    `json:"review_invocations,omitempty"`
+	Jobs                  []workflowJobInspection         `json:"jobs,omitempty"`
+	VerificationRevisions []workflow.VerificationRevision `json:"verification_revisions,omitempty"`
 }
 
 type workflowJobInspection struct {
@@ -166,6 +168,8 @@ func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
 		return workflowAbort(store, args[1:], out)
 	case "resume":
 		return workflowResume(store, cwd, args[1:], out)
+	case "retry-verification":
+		return workflowRetryVerification(store, args[1:], out)
 	case "export":
 		return workflowExport(store, reviews, args[1:], out)
 	default:
@@ -175,7 +179,7 @@ func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
 
 func workflowCommandKnown(command string) bool {
 	switch command {
-	case "start", "run", "worker", "notifications", "review", "deliver", "approve", "revoke-approval", "frontier", "answer", "close-discovery", "status", "inspect", "receipt", "abort", "resume", "export":
+	case "start", "run", "worker", "notifications", "review", "deliver", "approve", "revoke-approval", "frontier", "answer", "close-discovery", "status", "inspect", "receipt", "abort", "resume", "retry-verification", "export":
 		return true
 	}
 	return false
@@ -183,22 +187,23 @@ func workflowCommandKnown(command string) bool {
 
 func printWorkflowCommandUsage(command string, out io.Writer) error {
 	usage := map[string]string{
-		"start":           "Usage: skynex workflow start --id ID --request TEXT --path PATH --check COMMAND --accept COMMAND [--route simple|planned|discovery] [--plan-file FILE] [--wayfinder-file FILE] [--override-actor ACTOR --override-reason REASON] [--model MODEL] [--agent AGENT] [--opencode PATH] [--timeout DURATION]\nSimple requires --id, --request, and repeatable --path, --check, --accept. Planned requires --plan-file. Discovery requires --wayfinder-file.",
-		"run":             "Usage: skynex workflow run WORKFLOW_ID [--detach]",
-		"notifications":   "Usage: skynex workflow notifications claim --consumer SESSION_ID | ack|release --id ID --claim-token TOKEN",
-		"review":          "Usage: skynex workflow review --id WORKFLOW_ID [--detach]",
-		"deliver":         "Usage: skynex workflow deliver --id WORKFLOW_ID --message TEXT --idempotency-key KEY [--author-name NAME --author-email EMAIL]",
-		"status":          "Usage: skynex workflow status [WORKFLOW_ID]",
-		"inspect":         "Usage: skynex workflow inspect WORKFLOW_ID",
-		"receipt":         "Usage: skynex workflow receipt WORKFLOW_ID | --id RECEIPT_ID",
-		"approve":         "Usage: skynex workflow approve --id WORKFLOW_ID --action ACTION --actor ACTOR --reason TEXT [--expires DURATION]",
-		"revoke-approval": "Usage: skynex workflow revoke-approval --id WORKFLOW_ID --action ACTION --actor ACTOR --reason TEXT",
-		"abort":           "Usage: skynex workflow abort WORKFLOW_ID --idempotency-key KEY",
-		"resume":          "Usage: skynex workflow resume WORKFLOW_ID --blocker-id ID --idempotency-key KEY",
-		"export":          "Usage: skynex workflow export WORKFLOW_ID --out PATH",
-		"frontier":        "Usage: skynex workflow frontier --id WORKFLOW_ID",
-		"answer":          "Usage: skynex workflow answer --id WORKFLOW_ID --node NODE_ID --answer TEXT --actor ACTOR",
-		"close-discovery": "Usage: skynex workflow close-discovery --id WORKFLOW_ID --plan-file FILE",
+		"start":              "Usage: skynex workflow start --id ID --request TEXT --path PATH --check COMMAND --accept COMMAND [--route simple|planned|discovery] [--plan-file FILE] [--wayfinder-file FILE] [--override-actor ACTOR --override-reason REASON] [--model MODEL] [--agent AGENT] [--opencode PATH] [--timeout DURATION]\nSimple requires --id, --request, and repeatable --path, --check, --accept. Planned requires --plan-file. Discovery requires --wayfinder-file.",
+		"run":                "Usage: skynex workflow run WORKFLOW_ID [--detach]",
+		"notifications":      "Usage: skynex workflow notifications claim --consumer SESSION_ID | ack|release --id ID --claim-token TOKEN",
+		"review":             "Usage: skynex workflow review --id WORKFLOW_ID [--detach]",
+		"deliver":            "Usage: skynex workflow deliver --id WORKFLOW_ID --message TEXT --idempotency-key KEY [--author-name NAME --author-email EMAIL]",
+		"status":             "Usage: skynex workflow status [WORKFLOW_ID]",
+		"inspect":            "Usage: skynex workflow inspect WORKFLOW_ID",
+		"receipt":            "Usage: skynex workflow receipt WORKFLOW_ID | --id RECEIPT_ID",
+		"approve":            "Usage: skynex workflow approve --id WORKFLOW_ID --action ACTION --actor ACTOR --reason TEXT [--expires DURATION]",
+		"revoke-approval":    "Usage: skynex workflow revoke-approval --id WORKFLOW_ID --action ACTION --actor ACTOR --reason TEXT",
+		"abort":              "Usage: skynex workflow abort WORKFLOW_ID --idempotency-key KEY",
+		"resume":             "Usage: skynex workflow resume WORKFLOW_ID --blocker-id ID --idempotency-key KEY",
+		"retry-verification": "Usage: skynex workflow retry-verification --id WORKFLOW_ID --check-id EVIDENCE_ID --replacement COMMAND --actor ACTOR --reason TEXT --idempotency-key KEY",
+		"export":             "Usage: skynex workflow export WORKFLOW_ID --out PATH",
+		"frontier":           "Usage: skynex workflow frontier --id WORKFLOW_ID",
+		"answer":             "Usage: skynex workflow answer --id WORKFLOW_ID --node NODE_ID --answer TEXT --actor ACTOR",
+		"close-discovery":    "Usage: skynex workflow close-discovery --id WORKFLOW_ID --plan-file FILE",
 	}
 	value, ok := usage[command]
 	if !ok {
@@ -224,6 +229,7 @@ Commands:
   revoke-approval     Revoke a current approval
   abort               Stop work and revoke attempts, leases, and approvals
   resume              Reconcile and resume a blocked workflow
+  retry-verification  Replace one failed check and verify the same candidate
   export              Export a workflow summary or receipt
   frontier            Show the next blocking discovery question
   answer              Record an attributed discovery answer
@@ -317,6 +323,10 @@ func workflowInspect(store *workflow.SQLiteStore, reviews *review.SQLiteStore, i
 	if e := store.Database().QueryRow(`SELECT input FROM workflow_run_inputs WHERE workflow_id=?`, id).Scan(&input); e == nil {
 		inspection.RunInput = input
 	}
+	var verificationRun []byte
+	if e := store.Database().QueryRow(`SELECT result FROM verification_runs WHERE workflow_id=?`, id).Scan(&verificationRun); e == nil {
+		inspection.VerificationRun = verificationRun
+	}
 	rows, e := store.Database().Query(`SELECT action||':'||approval_id FROM current_approvals WHERE workflow_id=? ORDER BY action`, id)
 	if e == nil {
 		defer rows.Close()
@@ -347,6 +357,15 @@ func workflowInspect(store *workflow.SQLiteStore, reviews *review.SQLiteStore, i
 			var v reviewInvocationInspection
 			if rows.Scan(&v.ID, &v.CandidateTree, &v.Lens, &v.Model, &v.Status, &v.StartedAt, &v.FinishedAt, &v.ErrorPreview, &v.PID, &v.HeartbeatAt, &v.LastActivityAt) == nil {
 				inspection.ReviewInvocations = append(inspection.ReviewInvocations, v)
+			}
+		}
+	}
+	if rows, e := store.Database().Query(`SELECT workflow_id,revision,candidate_tree,check_id,previous_command,replacement_command,actor,reason,idempotency_key,attempt_id,fencing_token,created_at FROM verification_contract_revisions WHERE workflow_id=? ORDER BY revision`, id); e == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var revision workflow.VerificationRevision
+			if rows.Scan(&revision.WorkflowID, &revision.Revision, &revision.CandidateTree, &revision.CheckID, &revision.PreviousCommand, &revision.ReplacementCommand, &revision.Actor, &revision.Reason, &revision.IdempotencyKey, &revision.AttemptID, &revision.FencingToken, &revision.CreatedAt) == nil {
+				inspection.VerificationRevisions = append(inspection.VerificationRevisions, revision)
 			}
 		}
 	}

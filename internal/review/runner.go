@@ -121,6 +121,16 @@ type OpenCodeReviewRunner struct {
 	Options OpenCodeReviewOptions
 }
 
+func (r *OpenCodeReviewRunner) modelIdentity() string {
+	if r.Options.Model != "" {
+		return r.Options.Model
+	}
+	// OpenCode may select a provider/model from its own configuration when the
+	// workflow does not pin --model. Keep that selection mode explicit and
+	// auditable without passing this sentinel back to the OpenCode CLI.
+	return "opencode-provider-default"
+}
+
 func (r *OpenCodeReviewRunner) Run(ctx context.Context, workflowID string) (Receipt, error) {
 	r.reconcileInterrupted(workflowID)
 	w, err := r.Store.Get(workflowID)
@@ -180,7 +190,7 @@ func (r *OpenCodeReviewRunner) Run(ctx context.Context, workflowID string) (Rece
 	if err = r.persistCheckpoint(workflowID, verified.Record, "semantic", semanticPrompt(), semanticRaw); err != nil {
 		return Receipt{}, err
 	}
-	assessment, err := AssessSemantic(verified.Record, verified.Floor, SemanticInput{RequestedRisk: semantic.RequestedRisk, SelectedLens: semantic.SelectedLens, Justification: semantic.Justification, ModelProvider: "opencode", ModelID: r.Options.Model, PromptTemplateID: "semantic:v1", RenderedRedactedPrompt: "semantic review"}, time.Now())
+	assessment, err := AssessSemantic(verified.Record, verified.Floor, SemanticInput{RequestedRisk: semantic.RequestedRisk, SelectedLens: semantic.SelectedLens, Justification: semantic.Justification, ModelProvider: "opencode", ModelID: r.modelIdentity(), PromptTemplateID: "semantic:v1", RenderedRedactedPrompt: "semantic review"}, time.Now())
 	if err != nil {
 		return Receipt{}, err
 	}
@@ -293,14 +303,15 @@ func (r *OpenCodeReviewRunner) verificationEvidence(c CandidateRecord) ([]Eviden
 
 func (r *OpenCodeReviewRunner) invoke(parent context.Context, workflowID string, c CandidateRecord, lens, prompt string) ([]byte, error) {
 	promptHash := hash([]byte(prompt))
-	checkpointID := hash([]byte(workflowID + "\x00" + c.TreeOID + "\x00" + c.PolicyHash + "\x00" + lens + "\x00" + r.Options.Model + "\x00" + promptHash))
+	modelIdentity := r.modelIdentity()
+	checkpointID := hash([]byte(workflowID + "\x00" + c.TreeOID + "\x00" + c.PolicyHash + "\x00" + lens + "\x00" + modelIdentity + "\x00" + promptHash))
 	var cached []byte
-	if err := r.Store.Database().QueryRow(`SELECT result_json FROM review_checkpoints WHERE id=? AND workflow_id=? AND candidate_tree=? AND policy_hash=? AND lens=? AND model=? AND prompt_hash=?`, checkpointID, workflowID, c.TreeOID, c.PolicyHash, lens, r.Options.Model, promptHash).Scan(&cached); err == nil {
+	if err := r.Store.Database().QueryRow(`SELECT result_json FROM review_checkpoints WHERE id=? AND workflow_id=? AND candidate_tree=? AND policy_hash=? AND lens=? AND model=? AND prompt_hash=?`, checkpointID, workflowID, c.TreeOID, c.PolicyHash, lens, modelIdentity, promptHash).Scan(&cached); err == nil {
 		return cached, nil
 	}
 	// Recover a result durably written after process completion but before the
 	// caller validated/checkpointed it. Validation still happens in Run.
-	if err := r.Store.Database().QueryRow(`SELECT result_json FROM review_invocations WHERE id=? AND workflow_id=? AND candidate_tree=? AND lens=? AND model=? AND prompt_hash=? AND policy_hash=? AND status='completed' AND length(result_json)>0`, "review:"+workflowID+":"+lens, workflowID, c.TreeOID, lens, r.Options.Model, promptHash, c.PolicyHash).Scan(&cached); err == nil {
+	if err := r.Store.Database().QueryRow(`SELECT result_json FROM review_invocations WHERE id=? AND workflow_id=? AND candidate_tree=? AND lens=? AND model=? AND prompt_hash=? AND policy_hash=? AND status='completed' AND length(result_json)>0`, "review:"+workflowID+":"+lens, workflowID, c.TreeOID, lens, modelIdentity, promptHash, c.PolicyHash).Scan(&cached); err == nil {
 		// review_invocations stores the raw process result; the fresh path
 		// returns it redacted, so a resumed run must produce the same bytes or
 		// the receipt digest would not be reproducible across an interruption.
@@ -388,7 +399,7 @@ func (r *OpenCodeReviewRunner) invoke(parent context.Context, workflowID string,
 	configureReviewProcess(cmd)
 	start := time.Now().UTC()
 	id := "review:" + workflowID + ":" + lens
-	_, err = r.Store.Database().Exec(`INSERT OR REPLACE INTO review_invocations(id,workflow_id,candidate_tree,lens,model,status,output_digest,started_at,finished_at,error_preview,pid,heartbeat_at,last_activity_at,result_json,prompt_hash,policy_hash) VALUES(?,?,?,?,?,'running','',?,'','',0,?,?,'',?,?)`, id, workflowID, c.TreeOID, lens, r.Options.Model, start.Format(time.RFC3339Nano), start.Format(time.RFC3339Nano), start.Format(time.RFC3339Nano), promptHash, c.PolicyHash)
+	_, err = r.Store.Database().Exec(`INSERT OR REPLACE INTO review_invocations(id,workflow_id,candidate_tree,lens,model,status,output_digest,started_at,finished_at,error_preview,pid,heartbeat_at,last_activity_at,result_json,prompt_hash,policy_hash) VALUES(?,?,?,?,?,'running','',?,'','',0,?,?,'',?,?)`, id, workflowID, c.TreeOID, lens, modelIdentity, start.Format(time.RFC3339Nano), start.Format(time.RFC3339Nano), start.Format(time.RFC3339Nano), promptHash, c.PolicyHash)
 	if err != nil {
 		return nil, err
 	}
@@ -626,8 +637,9 @@ func (b *reviewRollingBuffer) Bytes() []byte {
 
 func (r *OpenCodeReviewRunner) persistCheckpoint(workflowID string, c CandidateRecord, lens, prompt string, raw []byte) error {
 	promptHash := hash([]byte(prompt))
-	id := hash([]byte(workflowID + "\x00" + c.TreeOID + "\x00" + c.PolicyHash + "\x00" + lens + "\x00" + r.Options.Model + "\x00" + promptHash))
-	_, err := r.Store.Database().Exec(`INSERT OR REPLACE INTO review_checkpoints(id,workflow_id,candidate_tree,policy_hash,lens,model,prompt_hash,result_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, id, workflowID, c.TreeOID, c.PolicyHash, lens, r.Options.Model, promptHash, raw, time.Now().UTC().Format(time.RFC3339Nano))
+	modelIdentity := r.modelIdentity()
+	id := hash([]byte(workflowID + "\x00" + c.TreeOID + "\x00" + c.PolicyHash + "\x00" + lens + "\x00" + modelIdentity + "\x00" + promptHash))
+	_, err := r.Store.Database().Exec(`INSERT OR REPLACE INTO review_checkpoints(id,workflow_id,candidate_tree,policy_hash,lens,model,prompt_hash,result_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, id, workflowID, c.TreeOID, c.PolicyHash, lens, modelIdentity, promptHash, raw, time.Now().UTC().Format(time.RFC3339Nano))
 	return err
 }
 

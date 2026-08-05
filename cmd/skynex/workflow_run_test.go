@@ -1131,8 +1131,45 @@ func TestWorkflowReviewOmitsEmptyModelAndReportsRedactedFailure(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &inspected); err != nil {
 		t.Fatal(err)
 	}
-	if len(inspected.ReviewInvocations) != 1 || inspected.ReviewInvocations[0].Status != "failed" || inspected.ReviewInvocations[0].Model != "" || !strings.Contains(inspected.ReviewInvocations[0].ErrorPreview, "[REDACTED]") {
+	if len(inspected.ReviewInvocations) != 1 || inspected.ReviewInvocations[0].Status != "failed" || inspected.ReviewInvocations[0].Model != "opencode-provider-default" || !strings.Contains(inspected.ReviewInvocations[0].ErrorPreview, "[REDACTED]") {
 		t.Fatalf("review invocation not inspectable: %+v", inspected.ReviewInvocations)
+	}
+}
+
+func TestWorkflowReviewUsesAuditableDefaultModelIdentity(t *testing.T) {
+	repo, store := cliWorkflowRepo(t)
+	defer store.Close()
+	fake := filepath.Join(t.TempDir(), "opencode")
+	body := `#!/bin/sh
+set -eu
+case "$*" in
+  *"Assess risk"*) printf '{"requested_risk":"low","selected_lens":"","justification":"low risk"}' > "$SKYNEX_RESULT_FILE"; exit 0 ;;
+esac
+tree=$(git write-tree)
+printf '{"envelope":{"WorkflowID":"wf","NodeID":"slice_main","AttemptID":"wf:slice_main","BaseCandidateOID":"%s","Status":"completed"},"patch":{"Operations":[{"Path":"a.txt","Data":"bmV3Cg==","Mode":384}]}}' "$tree" > "$SKYNEX_RESULT_FILE"
+`
+	if err := os.WriteFile(fake, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"--id", "wf", "--request", "change a", "--accept", "true", "--check", "true", "--path", "a.txt", "--opencode", fake, "--timeout", "2s"}
+	if err := workflowStart(store, repo, args, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := workflowRun(store, repo, []string{"wf"}, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := workflowReview(store, []string{"--id", "wf"}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("review with provider-selected model failed: %v", err)
+	}
+	if _, err := review.NewSQLiteStore(store.Database()).Authority("wf"); err != nil {
+		t.Fatal(err)
+	}
+	var model string
+	if err := store.Database().QueryRow(`SELECT model FROM review_invocations WHERE workflow_id='wf' AND lens='semantic'`).Scan(&model); err != nil {
+		t.Fatal(err)
+	}
+	if model != "opencode-provider-default" {
+		t.Fatalf("model identity=%q", model)
 	}
 }
 

@@ -90,8 +90,12 @@ func DefaultRuntimePreflight() RuntimePreflight {
 }
 
 func (p RuntimePreflight) Check(ctx context.Context, r RuntimePreflightRequest) error {
+	phase := r.Phase
+	if phase != "run" && phase != "review" {
+		phase = "preflight"
+	}
 	fail := func(code, detail, hint string) error {
-		return &RuntimePreflightError{Code: code, Phase: "preflight", RetrySafe: true, MutationOutcome: "not_started", NextAction: Action{Operation: "configure_runtime", Hint: hint}, Detail: detail}
+		return &RuntimePreflightError{Code: code, Phase: phase, RetrySafe: true, MutationOutcome: "not_started", NextAction: Action{Operation: "configure_runtime", Hint: hint}, Detail: detail}
 	}
 	if r.Phase != "run" && r.Phase != "review" {
 		return fail("invalid_phase", r.Phase, "use run or review")

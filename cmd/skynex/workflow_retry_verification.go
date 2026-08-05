@@ -51,6 +51,7 @@ func workflowRetryVerification(store *workflow.SQLiteStore, args []string, out i
 		if getErr != nil {
 			return getErr
 		}
+		replayed := verification.Result{}
 		if w.State == workflow.StateVerifying {
 			var resumedInputRaw []byte
 			if getErr = store.Database().QueryRow(`SELECT input FROM workflow_run_inputs WHERE workflow_id=?`, id).Scan(&resumedInputRaw); getErr != nil {
@@ -60,9 +61,20 @@ func workflowRetryVerification(store *workflow.SQLiteStore, args []string, out i
 			if getErr = json.Unmarshal(resumedInputRaw, &resumedInput); getErr != nil {
 				return getErr
 			}
-			if _, getErr = runRevisedVerification(store, id, resumedInput, priorRevision.CandidateTree); getErr != nil {
+			if replayed, getErr = runRevisedVerification(store, id, resumedInput, priorRevision.CandidateTree); getErr != nil {
 				return getErr
 			}
+		} else {
+			var replayedRaw []byte
+			if getErr = store.Database().QueryRow(`SELECT result FROM verification_runs WHERE workflow_id=?`, id).Scan(&replayedRaw); getErr != nil {
+				return getErr
+			}
+			if getErr = json.Unmarshal(replayedRaw, &replayed); getErr != nil {
+				return getErr
+			}
+		}
+		if !replayed.Passed {
+			return errors.New("retry-verification replacement check failed")
 		}
 		fmt.Fprintf(out, "%s\tverification-revision-%d\tidempotent\n", id, priorRevision.Revision)
 		return nil

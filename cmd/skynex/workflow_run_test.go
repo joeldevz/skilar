@@ -162,6 +162,82 @@ func TestWorkflowRetryVerificationReplacesOnlyFailedCheckAndPreservesCandidate(t
 	}
 }
 
+func failedCheckEvidenceID(t *testing.T, store *workflow.SQLiteStore) string {
+	t.Helper()
+	var raw []byte
+	if err := store.Database().QueryRow(`SELECT result FROM verification_runs WHERE workflow_id='wf'`).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		Passed   bool
+		Evidence []struct {
+			ID       string
+			Kind     string
+			ExitCode int
+		}
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Passed {
+		t.Fatal("verification unexpectedly passed")
+	}
+	for _, item := range result.Evidence {
+		if item.Kind == "check" && item.ExitCode != 0 {
+			return item.ID
+		}
+	}
+	t.Fatal("missing failed check evidence")
+	return ""
+}
+
+func TestWorkflowRetryVerificationFailingAgainStaysRetryableAndNeverFreezes(t *testing.T) {
+	repo, store := cliWorkflowRepo(t)
+	defer store.Close()
+	fake := cliFakeOpenCode(t, "true")
+	args := []string{"--id", "wf", "--request", "change a", "--accept", "test \"$(cat a.txt)\" = new", "--check", "false", "--check", "test -f a.txt", "--path", "a.txt", "--opencode", fake, "--timeout", "2s"}
+	if err := workflowStart(store, repo, args, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	var runOut bytes.Buffer
+	if err := workflowRun(store, repo, []string{"wf"}, &runOut); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(runOut.String(), "candidate frozen") {
+		t.Fatalf("failing verification reported a frozen candidate: %q", runOut.String())
+	}
+	firstFailed := failedCheckEvidenceID(t, store)
+
+	err := workflowRetryVerification(store, []string{"--id", "wf", "--check-id", firstFailed, "--replacement", "test -f absent", "--actor", "tester", "--reason", "wrong path", "--idempotency-key", "retry:1"}, &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("failing replacement reported success")
+	}
+	w, _ := store.Get("wf")
+	if w.State != workflow.StateReplanRequired {
+		t.Fatalf("state=%s", w.State)
+	}
+	if err = workflowRetryVerification(store, []string{"--id", "wf", "--check-id", firstFailed, "--replacement", "test -f absent", "--actor", "tester", "--reason", "wrong path", "--idempotency-key", "retry:1"}, &bytes.Buffer{}); err == nil {
+		t.Fatal("idempotent replay of a failed retry reported success")
+	}
+
+	secondFailed := failedCheckEvidenceID(t, store)
+	var out bytes.Buffer
+	if err = workflowRetryVerification(store, []string{"--id", "wf", "--check-id", secondFailed, "--replacement", "true", "--actor", "tester", "--reason", "environment fixed", "--idempotency-key", "retry:2"}, &out); err != nil {
+		t.Fatalf("second retry failed: %v", err)
+	}
+	if w, _ = store.Get("wf"); w.State != workflow.StateCandidateFrozen {
+		t.Fatalf("state=%s out=%q", w.State, out.String())
+	}
+	var revisions int
+	if err = store.Database().QueryRow(`SELECT COUNT(*) FROM verification_contract_revisions WHERE workflow_id='wf'`).Scan(&revisions); err != nil || revisions != 2 {
+		t.Fatalf("revisions=%d err=%v", revisions, err)
+	}
+	var invocations int
+	if err = store.Database().QueryRow(`SELECT COUNT(*) FROM opencode_invocations WHERE workflow_id='wf'`).Scan(&invocations); err != nil || invocations != 1 {
+		t.Fatalf("coder reran: invocations=%d err=%v", invocations, err)
+	}
+}
+
 func TestWorkflowAgentDefaultsToDedicatedPrimaryAndPreservesExplicitAgent(t *testing.T) {
 	if got := workflowAgent(nil); got != "workflow-worker" {
 		t.Fatalf("default agent=%q", got)

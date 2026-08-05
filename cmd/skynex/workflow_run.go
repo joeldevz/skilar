@@ -366,11 +366,18 @@ func workflowRunContext(ctx context.Context, store *workflow.SQLiteStore, repo s
 	for _, command := range input.Acceptance {
 		plan.Acceptance = append(plan.Acceptance, verification.Command{Name: "sh", Args: []string{"-c", command}})
 	}
-	_, err = (&verification.Runner{Store: store, EngineVersion: "workflow-cli-v1", RiskPolicy: review.RiskPolicy{}}).Run(context.Background(), id, seal, plan)
+	verified, err := (&verification.Runner{Store: store, EngineVersion: "workflow-cli-v1", RiskPolicy: review.RiskPolicy{}}).Run(context.Background(), id, seal, plan)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "%s\t%s\n", id, workflow.StateCandidateFrozen)
+	if w, err = store.Get(id); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "%s\t%s\n", id, w.State)
+	if !verified.Passed {
+		fmt.Fprintln(out, "verification failed; candidate was not frozen")
+		return nil
+	}
 	fmt.Fprintln(out, "candidate frozen; semantic review runner is not configured")
 	return nil
 }

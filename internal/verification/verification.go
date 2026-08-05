@@ -62,12 +62,16 @@ func (r *Runner) Run(ctx context.Context, workflowID string, seal gitcandidate.C
 		return Result{}, fmt.Errorf("verification: workflow is %s", w.State)
 	}
 	if existing, ok := r.load(workflowID); ok {
+		if !existing.Passed {
+			_, err = r.Store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateReplanRequired, IdempotencyKey: transitionKey("failed", w.StateVersion), ArtifactIDs: evidenceArtifactIDs(existing.Evidence)})
+			return existing, err
+		}
 		drift, driftErr := gitcandidate.DetectDrift(existing.Candidate, r.Policy)
 		if driftErr != nil {
 			return Result{}, driftErr
 		}
 		if drift.Any() {
-			_, _ = r.Store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateReplanRequired, IdempotencyKey: "verification:drift:v1"})
+			_, _ = r.Store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateReplanRequired, IdempotencyKey: transitionKey("drift", w.StateVersion)})
 			return Result{}, errors.New("verification: candidate drifted before replay")
 		}
 		if r.BeforeTransition != nil {
@@ -80,10 +84,10 @@ func (r *Runner) Run(ctx context.Context, workflowID string, seal gitcandidate.C
 			return Result{}, err
 		}
 		if drift.Any() {
-			_, _ = r.Store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateReplanRequired, IdempotencyKey: "verification:drift:v1"})
+			_, _ = r.Store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateReplanRequired, IdempotencyKey: transitionKey("drift", w.StateVersion)})
 			return Result{}, errors.New("verification: candidate drifted before freeze")
 		}
-		_, err = r.Store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateCandidateFrozen, IdempotencyKey: "verification:frozen:v1"})
+		_, err = r.Store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateCandidateFrozen, IdempotencyKey: transitionKey("frozen", w.StateVersion)})
 		return existing, err
 	}
 	candidate, err := gitcandidate.Freeze(seal, r.Policy)
@@ -150,7 +154,7 @@ func (r *Runner) Run(ctx context.Context, workflowID string, seal gitcandidate.C
 		return Result{}, err
 	}
 	if !passed {
-		_, err = r.Store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateReplanRequired, IdempotencyKey: "verification:failed:v1", ArtifactIDs: evidenceArtifactIDs(evidence)})
+		_, err = r.Store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateReplanRequired, IdempotencyKey: transitionKey("failed", w.StateVersion), ArtifactIDs: evidenceArtifactIDs(evidence)})
 		return result, err
 	}
 	if r.BeforeTransition != nil {
@@ -163,11 +167,20 @@ func (r *Runner) Run(ctx context.Context, workflowID string, seal gitcandidate.C
 		return result, driftErr
 	}
 	if drift.Any() {
-		_, _ = r.Store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateReplanRequired, IdempotencyKey: "verification:drift:v1"})
+		_, _ = r.Store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateReplanRequired, IdempotencyKey: transitionKey("drift", w.StateVersion)})
 		return result, errors.New("verification: candidate drifted before freeze")
 	}
-	_, err = r.Store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateCandidateFrozen, IdempotencyKey: "verification:frozen:v1"})
+	_, err = r.Store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateCandidateFrozen, IdempotencyKey: transitionKey("frozen", w.StateVersion)})
 	return result, err
+}
+
+// transitionKey scopes every verification transition to the exact state version
+// it was decided from. A workflow can legally re-enter verifying (retry of one
+// failed check, or resume from blocked), and a fixed key would then be replayed
+// against a different expected version and rejected as idempotency reuse,
+// wedging the workflow in verifying with no supported way out.
+func transitionKey(kind string, stateVersion uint64) string {
+	return fmt.Sprintf("verification:%s:v1:sv%d", kind, stateVersion)
 }
 
 func evidenceArtifactIDs(evidence []Evidence) []string {

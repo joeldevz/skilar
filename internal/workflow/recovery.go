@@ -54,6 +54,9 @@ type ResumeRequest struct {
 
 func (s *SQLiteStore) Resume(ctx context.Context, repo string, req ResumeRequest) (Workflow, error) {
 	_ = repo
+	if !ResumeSupported() {
+		return Workflow{}, ErrResumeUnsupported
+	}
 	w, err := s.Get(req.WorkflowID)
 	if err != nil {
 		return Workflow{}, err

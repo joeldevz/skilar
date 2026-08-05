@@ -14,6 +14,10 @@ Planned workflows require `--plan-file` matching `schemas/workflow-plan.schema.j
 
 Detach is Unix-only. On Windows the capability gate rejects the request before any job record or worker process is created, with `detached workflow execution is not supported on Windows; run without --detach`; the foreground run is unaffected.
 
+## Resume and recovery
+
+`resume` reconciles a blocked workflow against the live worktree and must hold the exclusive worktree lock while it does so. That lock has no Windows implementation, so resume is declared unsupported on Windows and fails closed before reading or mutating any workflow state, with `workflow resume is not supported on Windows because exclusive worktree locking is unavailable; abort the workflow or resume it from a Unix host`. A workflow blocked on Windows must be aborted or resumed from a Unix host; every other workflow command, including the foreground `run` and `review`, is portable across Linux and Windows.
+
 Only one live job is admitted at a time. A job is considered healthy only when both its durable heartbeat is at most 30 seconds old and its recorded PID is alive, so a crashed worker or a reused PID is reconciled to `failed` instead of blocking the next run. Use `skynex workflow status` to observe state and `skynex workflow resume` to continue a blocked workflow after reconciliation.
 
 `notifications claim | ack | release | presence` is the terminal-notification channel that the OpenCode plugin polls, so a workflow that reaches a terminal state surfaces in the session that owns it.

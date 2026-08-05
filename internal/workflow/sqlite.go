@@ -418,7 +418,7 @@ COMMIT;`
 		}
 	}
 	if version < 18 {
-		const schemaV18 = `BEGIN IMMEDIATE;
+		const schemaV18 = `
 CREATE TABLE IF NOT EXISTS verification_run_history (
   workflow_id TEXT NOT NULL,
   revision INTEGER NOT NULL,
@@ -442,10 +442,80 @@ CREATE TABLE IF NOT EXISTS verification_contract_revisions (
   created_at TEXT NOT NULL,
   PRIMARY KEY(workflow_id,revision),
   UNIQUE(workflow_id,idempotency_key)
-);
-PRAGMA user_version=18;
-COMMIT;`
-		if _, err := s.db.Exec(schemaV18); err != nil {
+);`
+		tx, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if _, err := tx.Exec(schemaV18); err != nil {
+			return err
+		}
+		if err := backfillResultTransport(tx); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`PRAGMA user_version=18`); err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// backfillResultTransport declares the transport that in-flight workflows were
+// already using. Every run input written before schema 18 came from the Skynex
+// OpenCode adapter, which has always spoken skynex-result-file-v1; without this
+// they would unmarshal with an empty transport and fail preflight forever with
+// no recovery other than abandoning a frozen candidate.
+func backfillResultTransport(tx *sql.Tx) error {
+	rows, err := tx.Query(`SELECT workflow_id,input FROM workflow_run_inputs`)
+	if err != nil {
+		return err
+	}
+	type backfilled struct {
+		id    string
+		input []byte
+	}
+	var pending []backfilled
+	for rows.Next() {
+		var id string
+		var raw []byte
+		if err := rows.Scan(&id, &raw); err != nil {
+			rows.Close()
+			return err
+		}
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(raw, &fields) != nil {
+			continue
+		}
+		var declared string
+		if value, ok := fields["ResultTransport"]; ok && json.Unmarshal(value, &declared) == nil && declared != "" {
+			continue
+		}
+		encoded, err := json.Marshal(ResultTransportFileV1)
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		fields["ResultTransport"] = encoded
+		updated, err := json.Marshal(fields)
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		pending = append(pending, backfilled{id: id, input: updated})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, item := range pending {
+		if _, err := tx.Exec(`UPDATE workflow_run_inputs SET input=? WHERE workflow_id=?`, item.input, item.id); err != nil {
 			return err
 		}
 	}

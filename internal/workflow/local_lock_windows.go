@@ -2,13 +2,11 @@
 
 package workflow
 
-import (
-	"errors"
-)
+const localLockSupported = false
 
 type localLock struct{}
 
 func acquireLocalLock(string) (*localLock, error) {
-	return nil, errors.New("exclusive workflow lock is not implemented on Windows")
+	return nil, ErrResumeUnsupported
 }
 func (l *localLock) Close() error { return nil }

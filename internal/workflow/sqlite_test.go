@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -256,6 +257,106 @@ func TestLiveReadOnlyCanObserveActiveWALWithoutMutatingSchema(t *testing.T) {
 	}
 	if _, err = reader.Database().Exec(`DELETE FROM workflows`); err == nil {
 		t.Fatal("live read-only connection allowed mutation")
+	}
+}
+
+func downgradeToSchema17(t *testing.T, store *SQLiteStore) {
+	t.Helper()
+	for _, statement := range []string{
+		`DROP TABLE IF EXISTS verification_run_history`,
+		`DROP TABLE IF EXISTS verification_contract_revisions`,
+		`PRAGMA user_version=17`,
+	} {
+		if _, err := store.Database().Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestSchema18BackfillsResultTransportForInFlightWorkflows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state", "workflows.db")
+	store, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs := map[string]string{
+		"wf-legacy":    `{"Request":"do it","Checks":["go test ./..."],"Timeout":600000000000,"Seal":{"RepositoryRoot":"/repo"}}`,
+		"wf-empty":     `{"Request":"do it","ResultTransport":"","AllowedPaths":["internal"]}`,
+		"wf-declared":  `{"Request":"do it","ResultTransport":"some-other-transport-v9"}`,
+		"wf-corrupt":   `not json at all`,
+		"wf-preserved": `{"Request":"keep","ModelExplicit":true,"SliceConfigs":{"a":{"Nested":[1,2,3]}}}`,
+	}
+	for id, input := range inputs {
+		if _, err = store.Create(Workflow{ID: id, Route: RouteSimple, MinimumRisk: RiskLow, BasisTree: "tree-" + id}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = store.Database().Exec(`INSERT INTO workflow_run_inputs(workflow_id,input) VALUES(?,?)`, id, []byte(input)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = store.Database().Exec(`UPDATE workflows SET state=?,state_version=4 WHERE id=?`, StateVerifying, "wf-legacy"); err != nil {
+		t.Fatal(err)
+	}
+	downgradeToSchema17(t, store)
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	read := func(id string) map[string]json.RawMessage {
+		t.Helper()
+		var raw []byte
+		if err := store.Database().QueryRow(`SELECT input FROM workflow_run_inputs WHERE workflow_id=?`, id).Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			t.Fatalf("%s: %v (%s)", id, err, raw)
+		}
+		return fields
+	}
+	transport := func(id string) string {
+		t.Helper()
+		var value string
+		if err := json.Unmarshal(read(id)["ResultTransport"], &value); err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	for _, id := range []string{"wf-legacy", "wf-empty", "wf-preserved"} {
+		if got := transport(id); got != ResultTransportFileV1 {
+			t.Fatalf("%s transport=%q", id, got)
+		}
+	}
+	if got := transport("wf-declared"); got != "some-other-transport-v9" {
+		t.Fatalf("overwrote a declared transport: %q", got)
+	}
+	preserved := read("wf-preserved")
+	if string(preserved["Request"]) != `"keep"` || string(preserved["ModelExplicit"]) != "true" || string(preserved["SliceConfigs"]) != `{"a":{"Nested":[1,2,3]}}` {
+		t.Fatalf("unrelated fields changed: %v", preserved)
+	}
+	legacy := read("wf-legacy")
+	if string(legacy["Checks"]) != `["go test ./..."]` || string(legacy["Timeout"]) != "600000000000" {
+		t.Fatalf("unrelated fields changed: %v", legacy)
+	}
+	var corrupt []byte
+	if err = store.Database().QueryRow(`SELECT input FROM workflow_run_inputs WHERE workflow_id=?`, "wf-corrupt").Scan(&corrupt); err != nil {
+		t.Fatal(err)
+	}
+	if string(corrupt) != "not json at all" {
+		t.Fatalf("corrupt input rewritten: %q", corrupt)
+	}
+	w, err := store.Get("wf-legacy")
+	if err != nil || w.State != StateVerifying || w.StateVersion != 4 {
+		t.Fatalf("in-flight workflow disturbed: %+v err=%v", w, err)
+	}
+	var version int
+	if err = store.Database().QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 18 {
+		t.Fatalf("version=%d err=%v", version, err)
 	}
 }
 

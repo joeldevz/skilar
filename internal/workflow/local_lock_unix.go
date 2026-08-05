@@ -8,6 +8,8 @@ import (
 	"syscall"
 )
 
+const localLockSupported = true
+
 type localLock struct{ file *os.File }
 
 func acquireLocalLock(path string) (*localLock, error) {

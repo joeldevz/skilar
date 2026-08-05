@@ -38,10 +38,27 @@ func TestRuntimePreflightRejectsCapabilityFailuresWithoutStarting(t *testing.T) 
 			tc.request.WorkDir = t.TempDir()
 			err := p.Check(context.Background(), tc.request)
 			var got *RuntimePreflightError
-			if !errors.As(err, &got) || got.Code != tc.want || got.Phase != "preflight" || !got.RetrySafe || got.MutationOutcome != "not_started" || got.NextAction.Operation == "" {
+			if !errors.As(err, &got) || got.Code != tc.want || got.Phase != tc.request.Phase || !got.RetrySafe || got.MutationOutcome != "not_started" || got.NextAction.Operation == "" {
 				t.Fatalf("err=%#v", err)
 			}
 		})
+	}
+}
+
+func TestRuntimePreflightReportsThePhaseThatFailedClosed(t *testing.T) {
+	p := preflightFixture(t, RuntimeCapabilities{DefaultAgent: true})
+	p.LookPath = func(string) (string, error) { return "", os.ErrNotExist }
+	for _, phase := range []string{"run", "review"} {
+		err := p.Check(context.Background(), RuntimePreflightRequest{Phase: phase, RequireResultFile: true, ResultTransport: ResultTransportFileV1, WorkDir: t.TempDir()})
+		var got *RuntimePreflightError
+		if !errors.As(err, &got) || got.Phase != phase {
+			t.Fatalf("phase=%s err=%#v", phase, err)
+		}
+	}
+	err := p.Check(context.Background(), RuntimePreflightRequest{Phase: "deliver", WorkDir: t.TempDir()})
+	var got *RuntimePreflightError
+	if !errors.As(err, &got) || got.Code != "invalid_phase" || got.Phase != "preflight" {
+		t.Fatalf("err=%#v", err)
 	}
 }
 

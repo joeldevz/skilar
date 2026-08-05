@@ -10,7 +10,7 @@ var forwardTransitions = map[State]map[State]struct{}{
 	StateReviewing:           set(StateReceipted),
 	StateReceipted:           set(StateDelivered),
 	StateIntegrationConflict: set(StateReady),
-	StateReplanRequired:      set(StateDiscovering),
+	StateReplanRequired:      set(StateDiscovering, StateVerifying),
 }
 
 var nonTerminalStates = set(

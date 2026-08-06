@@ -269,6 +269,10 @@ func workflowRunContext(ctx context.Context, store *workflow.SQLiteStore, repo s
 	if err = workflowRuntimePreflight.Check(ctx, workflow.RuntimePreflightRequest{Phase: "run", Executable: input.Executable, Model: input.Model, Agent: input.Agent, ModelExplicit: input.ModelExplicit, AgentExplicit: input.AgentExplicit, WorkDir: repo, RequireResultFile: true, ResultTransport: input.ResultTransport}); err != nil {
 		return err
 	}
+	var graphVersion uint64
+	if err = store.Database().QueryRow(`SELECT COALESCE(MAX(version),1) FROM execution_graphs WHERE workflow_id=?`, id).Scan(&graphVersion); err != nil {
+		return err
+	}
 	if w.State != workflow.StateVerifying {
 		var graphRaw []byte
 		if err = store.Database().QueryRow(`SELECT graph FROM execution_graphs WHERE workflow_id=? ORDER BY version DESC LIMIT 1`, id).Scan(&graphRaw); err != nil {
@@ -303,6 +307,9 @@ func workflowRunContext(ctx context.Context, store *workflow.SQLiteStore, repo s
 					break
 				}
 				attemptID := id + ":" + ready.ID
+				if graph.Version > 1 {
+					attemptID = fmt.Sprintf("%s:v%d:%s", id, graph.Version, ready.ID)
+				}
 				owner := "workflow-cli"
 				token, tokenErr := newFencingToken()
 				if tokenErr != nil {
@@ -372,7 +379,7 @@ func workflowRunContext(ctx context.Context, store *workflow.SQLiteStore, repo s
 	for _, command := range input.Acceptance {
 		plan.Acceptance = append(plan.Acceptance, verification.Command{Name: "sh", Args: []string{"-c", command}})
 	}
-	verified, err := (&verification.Runner{Store: store, EngineVersion: "workflow-cli-v1", RiskPolicy: review.RiskPolicy{}}).Run(context.Background(), id, seal, plan)
+	verified, err := (&verification.Runner{Store: store, EngineVersion: fmt.Sprintf("workflow-cli-v1/graph-v%d", graphVersion), RiskPolicy: review.RiskPolicy{}}).Run(context.Background(), id, seal, plan)
 	if err != nil {
 		return err
 	}

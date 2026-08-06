@@ -28,6 +28,7 @@ type workflowInspection struct {
 	ReviewInvocations     []reviewInvocationInspection    `json:"review_invocations,omitempty"`
 	Jobs                  []workflowJobInspection         `json:"jobs,omitempty"`
 	VerificationRevisions []workflow.VerificationRevision `json:"verification_revisions,omitempty"`
+	ReplanRevisions       []workflow.ReplanRevision       `json:"replan_revisions,omitempty"`
 }
 
 type workflowJobInspection struct {
@@ -187,6 +188,8 @@ func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
 		return workflowResume(store, cwd, args[1:], out)
 	case "retry-verification":
 		return workflowRetryVerification(store, args[1:], out)
+	case "replan":
+		return workflowReplan(store, args[1:], out)
 	case "export":
 		return workflowExport(store, reviews, args[1:], out)
 	default:
@@ -235,7 +238,7 @@ func workflowDiagnosticNeedsRecovery(store *workflow.SQLiteStore, args []string)
 
 func workflowCommandKnown(command string) bool {
 	switch command {
-	case "start", "run", "worker", "notifications", "review", "deliver", "approve", "revoke-approval", "frontier", "answer", "close-discovery", "status", "inspect", "receipt", "abort", "resume", "retry-verification", "export":
+	case "start", "run", "worker", "notifications", "review", "deliver", "approve", "revoke-approval", "frontier", "answer", "close-discovery", "status", "inspect", "receipt", "abort", "resume", "retry-verification", "replan", "export":
 		return true
 	}
 	return false
@@ -256,6 +259,7 @@ func printWorkflowCommandUsage(command string, out io.Writer) error {
 		"abort":              "Usage: skynex workflow abort WORKFLOW_ID --idempotency-key KEY",
 		"resume":             "Usage: skynex workflow resume WORKFLOW_ID --blocker-id ID --idempotency-key KEY",
 		"retry-verification": "Usage: skynex workflow retry-verification --id WORKFLOW_ID --check-id EVIDENCE_ID --replacement COMMAND --actor ACTOR --reason TEXT --idempotency-key KEY",
+		"replan":             "Usage: skynex workflow replan --id WORKFLOW_ID --finding-id FINDING_ID --plan-file PLAN.json --actor ACTOR --reason TEXT --idempotency-key KEY",
 		"export":             "Usage: skynex workflow export WORKFLOW_ID --out PATH",
 		"frontier":           "Usage: skynex workflow frontier --id WORKFLOW_ID",
 		"answer":             "Usage: skynex workflow answer --id WORKFLOW_ID --node NODE_ID --answer TEXT --actor ACTOR",
@@ -286,6 +290,7 @@ Commands:
   abort               Stop work and revoke attempts, leases, and approvals
   resume              Reconcile and resume a blocked workflow
   retry-verification  Replace one failed check and verify the same candidate
+  replan              Revise a failed plan in place while preserving lineage
   export              Export a workflow summary or receipt
   frontier            Show the next blocking discovery question
   answer              Record an attributed discovery answer
@@ -452,6 +457,7 @@ func workflowInspect(store *workflow.SQLiteStore, reviews *review.SQLiteStore, i
 			}
 		}
 	}
+	inspection.ReplanRevisions, _ = store.ReplanRevisions(id)
 	return writeJSON(out, inspection)
 }
 

@@ -11,7 +11,7 @@ import (
 func assertWorkflowOrchestratorContract(t *testing.T, raw []byte) {
 	t.Helper()
 	text := strings.ToLower(string(raw))
-	required := []string{"skynex workflow start", "skynex workflow run", "skynex workflow review", "skynex workflow deliver", "skynex workflow status", "skynex workflow inspect", "skynex workflow receipt", "skynex workflow approve", "skynex workflow abort", "skynex workflow resume", "skynex workflow retry-verification", "candidate_frozen", "receipted", "depth 0", "depth 1", "depth 4", "neurox", "--id example --request", "--path", "--check", "--accept"}
+	required := []string{"skynex workflow start", "skynex workflow run", "skynex workflow review", "skynex workflow deliver", "skynex workflow status", "skynex workflow inspect", "skynex workflow receipt", "skynex workflow approve", "skynex workflow abort", "skynex workflow resume", "skynex workflow retry-verification", "skynex workflow replan", "candidate_frozen", "receipted", "depth 0", "depth 1", "depth 4", "neurox", "--id example --request", "--path", "--check", "--accept"}
 	for _, value := range required {
 		if !strings.Contains(text, value) {
 			t.Errorf("orchestrator contract missing %q", value)
@@ -286,7 +286,7 @@ func TestAllSourceAndEmbeddedAgentsUseRiskBasedGitPolicy(t *testing.T) {
 func assertContinuousWorkflowPolicy(t *testing.T, raw []byte) {
 	t.Helper()
 	text := strings.ToLower(string(raw))
-	for _, want := range []string{"continuous execution", "do not ask", "candidate_frozen", "workflow review --id", "--detach", "replan_required", "verify the evidence", "corrective workflow", "derived", "idempotent", "technical job failure", "retry", "retries are exhausted", "human gate", "destructive", "real ambiguity", "do not auto-approve", "do not auto-deliver", "commit, push, or pr", "receipt-driven development is disabled", "kill switch",
+	for _, want := range []string{"continuous execution", "do not ask", "candidate_frozen", "workflow review --id", "--detach", "replan_required", "verify the evidence", "workflow replan", "same workflow id", "idempotency key", "technical job failure", "retry", "retries are exhausted", "human gate", "destructive", "real ambiguity", "do not auto-approve", "do not auto-deliver", "commit, push, or pr", "receipt-driven development is disabled", "kill switch",
 		// Recovery must reach both correction paths: resume for a durable
 		// blocker, retry-verification for one wrong check on the same candidate.
 		"workflow resume workflow_id --blocker-id", "workflow retry-verification --id workflow_id --check-id", "--replacement", "--actor", "--reason", "instead of rerunning the coder", "preserves the same immutable candidate"} {

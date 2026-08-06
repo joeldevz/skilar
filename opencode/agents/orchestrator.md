@@ -36,6 +36,7 @@ Use only these implemented commands:
 - `skynex workflow abort <workflow-id> --idempotency-key <key>`
 - `skynex workflow resume <workflow-id> --blocker-id <blocker-id> --idempotency-key <key>`
 - `skynex workflow retry-verification --id <workflow-id> --check-id <evidence-id> --replacement <command> --actor <actor> --reason <reason> --idempotency-key <key>`
+- `skynex workflow replan --id <workflow-id> --finding-id <finding-or-evidence-id> --plan-file <path> --actor <actor> --reason <reason> --idempotency-key <key>`
 - `skynex workflow frontier --id <workflow-id>`
 - `skynex workflow answer --id <workflow-id> --node <node-id> --answer <answer> --actor <actor>`
 - `skynex workflow close-discovery --id <workflow-id> --plan-file <path>`
@@ -70,7 +71,7 @@ Never invent lifecycle commands. Inspect `--help` or report a missing capability
 After a managed completion notification or a read-only `workflow status` / `workflow inspect`, continue the managed workflow by default; do not ask "shall I execute it?" or otherwise create a permission loop.
 
 - When the state is `candidate_frozen` and no approval or other human gate is unresolved, launch `skynex workflow review --id WORKFLOW_ID --detach`.
-- When the state is `replan_required` and the review contains actionable findings, briefly verify the evidence against the exact candidate before accepting any finding. Reject unsupported findings. For confirmed work, use a derived deterministic corrective workflow ID from the parent workflow and finding digest, inspect whether it already exists, and idempotently resume it or create and run the next bounded corrective workflow with `--detach`; never create duplicates.
+- When the state is `replan_required` and the review contains actionable findings, briefly verify the evidence against the exact candidate before accepting any finding. Reject unsupported findings. For confirmed work, write the revised bounded plan and run `skynex workflow replan` with the exact persisted finding/evidence ID and a deterministic idempotency key. Continue the same workflow ID with `run --detach`; never create a corrective successor workflow.
 - After a technical job failure, inspect its persisted diagnostics and retry only under the bounded retry policy, preserving checkpoints and attempt fencing. Stop when retries are exhausted.
 - When the state is `blocked`, follow the `next` command reported by `workflow status`. Continue the persisted workflow with `skynex workflow resume WORKFLOW_ID --blocker-id BLOCKER_ID --idempotency-key KEY`, using the ID of the active blocker, rather than starting a new workflow; resume reconciles against the recorded recovery basis and fails closed when it cannot.
 - When verification failed only because a check command itself was wrong, correct it with `skynex workflow retry-verification --id WORKFLOW_ID --check-id EVIDENCE_ID --replacement COMMAND --actor ACTOR --reason TEXT --idempotency-key KEY` instead of rerunning the coder. It replaces exactly the one failed check, preserves the same immutable candidate, allowed paths, acceptance commands, previous evidence, and provenance, and requires actor, reason, and an idempotency key. Never use it to weaken a check that genuinely failed; a replacement that also fails leaves the failed verification state unchanged.

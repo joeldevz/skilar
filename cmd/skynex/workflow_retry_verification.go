@@ -174,7 +174,11 @@ func runRevisedVerification(store *workflow.SQLiteStore, id string, input workfl
 	for _, command := range input.Acceptance {
 		plan.Acceptance = append(plan.Acceptance, verification.Command{Name: "sh", Args: []string{"-c", command}})
 	}
-	result, err := (&verification.Runner{Store: store, EngineVersion: "workflow-cli-v1", RiskPolicy: review.RiskPolicy{}}).Run(context.Background(), id, input.Seal, plan)
+	var graphVersion uint64
+	if err := store.Database().QueryRow(`SELECT COALESCE(MAX(version),1) FROM execution_graphs WHERE workflow_id=?`, id).Scan(&graphVersion); err != nil {
+		return verification.Result{}, err
+	}
+	result, err := (&verification.Runner{Store: store, EngineVersion: fmt.Sprintf("workflow-cli-v1/graph-v%d", graphVersion), RiskPolicy: review.RiskPolicy{}}).Run(context.Background(), id, input.Seal, plan)
 	if err != nil {
 		return result, err
 	}

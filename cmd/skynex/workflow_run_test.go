@@ -125,6 +125,69 @@ func TestWorkflowPersistsRecoveryBasisSoBlockedResumeSucceeds(t *testing.T) {
 	}
 }
 
+func TestForegroundRunRefusesToInheritALiveDetachedWorkersAttempt(t *testing.T) {
+	repo, store := cliWorkflowRepo(t)
+	defer store.Close()
+	fake := cliFakeOpenCode(t, "true")
+	args := []string{"--id", "wf", "--request", "change a", "--accept", "true", "--check", "true", "--path", "a.txt", "--opencode", fake, "--timeout", "2s"}
+	if err := workflowStart(store, repo, args, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	w, err := store.Get("wf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateExecuting, IdempotencyKey: "to-executing"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.CreateWorkflowJobOperation("job-live", "wf", "run", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.StartWorkflowJob("job-live", os.Getpid(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	err = workflowRun(store, repo, []string{"wf"}, &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("foreground run proceeded against a live detached worker")
+	}
+	if !strings.Contains(err.Error(), "job-live") || !strings.Contains(err.Error(), "abort") {
+		t.Fatalf("refusal is not actionable: %v", err)
+	}
+	if err = workflowReview(store, []string{"--id", "wf"}, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "job-live") {
+		t.Fatalf("foreground review was not refused: %v", err)
+	}
+	job, err := store.WorkflowJob("job-live")
+	if err != nil || job.State != workflow.JobRunning {
+		t.Fatalf("job=%+v err=%v", job, err)
+	}
+	if w, err = store.Get("wf"); err != nil || w.State != workflow.StateExecuting {
+		t.Fatalf("workflow=%+v err=%v", w, err)
+	}
+}
+
+func TestForegroundRunProceedsOnceTheDetachedWorkerIsDead(t *testing.T) {
+	repo, store := cliWorkflowRepo(t)
+	defer store.Close()
+	fake := cliFakeOpenCode(t, "test \"$(cat a.txt)\" = base")
+	args := []string{"--id", "wf", "--request", "change a", "--accept", "test \"$(cat a.txt)\" = new", "--check", "test -f a.txt", "--path", "a.txt", "--opencode", fake, "--timeout", "2s"}
+	if err := workflowStart(store, repo, args, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateWorkflowJobOperation("job-dead", "wf", "run", time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.StartWorkflowJob("job-dead", 99999999, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := workflowRun(store, repo, []string{"wf"}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("a dead worker blocked the foreground run: %v", err)
+	}
+	w, err := store.Get("wf")
+	if err != nil || w.State != workflow.StateCandidateFrozen {
+		t.Fatalf("workflow=%+v err=%v", w, err)
+	}
+}
+
 func TestWorkflowRetryVerificationReplacesOnlyFailedCheckAndPreservesCandidate(t *testing.T) {
 	repo, store := cliWorkflowRepo(t)
 	defer store.Close()

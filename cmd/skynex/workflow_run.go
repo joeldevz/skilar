@@ -242,7 +242,34 @@ func workflowStart(store *workflow.SQLiteStore, repo string, args []string, out 
 }
 
 func workflowRun(store *workflow.SQLiteStore, repo string, args []string, out io.Writer) error {
+	if !hasFlag(args, "--detach") {
+		id, err := requiredWorkflowID(args)
+		if err != nil {
+			return err
+		}
+		if err = refuseWhileDetachedWorkerIsLive(store, id, "run"); err != nil {
+			return err
+		}
+	}
 	return workflowRunContext(context.Background(), store, repo, args, out)
+}
+
+// refuseWhileDetachedWorkerIsLive keeps a foreground command from inheriting an
+// attempt, worktree, or candidate that a healthy detached worker still owns.
+// The worker's own owner and fencing token live in the durable attempt row, so
+// a second process can reproduce them and heartbeat the same lease; only the
+// job liveness record distinguishes the owner from an intruder. The check stays
+// read-only: a crashed worker is simply not live here, so the foreground run
+// still proceeds without first blocking the workflow.
+func refuseWhileDetachedWorkerIsLive(store *workflow.SQLiteStore, id, operation string) error {
+	job, live, err := store.LiveWorkflowJob(id, time.Now())
+	if err != nil {
+		return err
+	}
+	if !live {
+		return nil
+	}
+	return fmt.Errorf("workflow %s already has a live detached %s worker (job %s, pid %d); wait for its completion notification, or run `skynex workflow abort %s --idempotency-key abort-%s` to stop it before running %s in the foreground", id, job.Operation, job.ID, job.PID, id, id, operation)
 }
 
 func workflowRunContext(ctx context.Context, store *workflow.SQLiteStore, repo string, args []string, out io.Writer) error {
@@ -460,6 +487,9 @@ func workflowReview(store *workflow.SQLiteStore, args []string, out io.Writer) e
 	}
 	if hasFlag(args, "--detach") {
 		return workflowReviewDetached(store, id, out)
+	}
+	if err = refuseWhileDetachedWorkerIsLive(store, id, "review"); err != nil {
+		return err
 	}
 	options, err := reviewOptionsForWorkflow(store, id)
 	if err != nil {

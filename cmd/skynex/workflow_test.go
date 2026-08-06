@@ -97,6 +97,48 @@ func TestWorkflowCLIStatusInspectAndAbortIdempotently(t *testing.T) {
 	}
 }
 
+func TestWorkflowCLIInspectReconcilesDeadDetachedWorker(t *testing.T) {
+	repo := workflowRepo(t)
+	store, err := workflow.OpenRepositorySQLite(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := store.Create(workflow.Workflow{ID: "wf-dead", Route: workflow.RouteSimple, MinimumRisk: workflow.RiskLow, BasisTree: "tree"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, next := range []workflow.State{workflow.StateDiscovering, workflow.StateReady, workflow.StateExecuting} {
+		w, err = store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: next, IdempotencyKey: "setup-" + string(rune('a'+i))})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = store.CreateWorkflowJobOperation("job-dead", w.ID, "run", time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.StartWorkflowJob("job-dead", 99999999, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err = runWorkflowCLI([]string{"inspect", "wf-dead"}, repo, &out); err != nil {
+		t.Fatal(err)
+	}
+	var inspection workflowInspection
+	if err = json.Unmarshal(out.Bytes(), &inspection); err != nil {
+		t.Fatal(err)
+	}
+	if inspection.Workflow.State != workflow.StateBlocked || inspection.Workflow.ResumeTarget != workflow.StateExecuting {
+		t.Fatalf("workflow=%+v", inspection.Workflow)
+	}
+	if len(inspection.Jobs) != 1 || inspection.Jobs[0].State != string(workflow.JobFailed) || inspection.Jobs[0].NextAction == "" {
+		t.Fatalf("jobs=%+v", inspection.Jobs)
+	}
+}
+
 func TestWorkflowCommandHelpOutsideRepositoryDoesNotCreateDatabase(t *testing.T) {
 	dir := t.TempDir()
 	commands := []string{"start", "run", "review", "deliver", "status", "inspect", "receipt", "approve", "revoke-approval", "abort", "resume", "export", "frontier", "answer", "close-discovery"}

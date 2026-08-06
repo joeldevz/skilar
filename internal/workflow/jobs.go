@@ -42,21 +42,42 @@ const MaxWorkflowJobAttempts = 3
 
 var workflowJobProcessAlive = workflowProcessAlive
 
+type staleWorkflowJob struct{ id, operation string }
+
+// HasStaleWorkflowJobs is safe for a read-only diagnostic connection. Callers
+// can use it to decide whether they need to reopen the database for recovery.
+func (s *SQLiteStore) HasStaleWorkflowJobs(workflowID string, now time.Time) (bool, error) {
+	stale, err := s.staleWorkflowJobs(workflowID, now)
+	return len(stale) != 0, err
+}
+
 func (s *SQLiteStore) ReconcileStaleWorkflowJobs(workflowID string, now time.Time) error {
-	rows, err := s.db.Query(`SELECT id,operation,state,pid,created_at,heartbeat_at FROM workflow_jobs WHERE workflow_id=? AND state IN (?,?,?)`, workflowID, JobQueued, JobRunning, JobCancelRequested)
+	found, err := s.staleWorkflowJobs(workflowID, now)
 	if err != nil {
 		return err
 	}
-	type staleJob struct{ id, operation string }
-	var found []staleJob
+	for _, item := range found {
+		if err := s.FinishWorkflowJob(item.id, JobFailed, "interrupted", "detached "+item.operation+" worker interrupted", now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *SQLiteStore) staleWorkflowJobs(workflowID string, now time.Time) ([]staleWorkflowJob, error) {
+	rows, err := s.db.Query(`SELECT id,operation,state,pid,created_at,heartbeat_at FROM workflow_jobs WHERE workflow_id=? AND state IN (?,?,?)`, workflowID, JobQueued, JobRunning, JobCancelRequested)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var found []staleWorkflowJob
 	for rows.Next() {
 		var id, operation string
 		var state JobState
 		var pid int
 		var created, heartbeat string
 		if err := rows.Scan(&id, &operation, &state, &pid, &created, &heartbeat); err != nil {
-			rows.Close()
-			return err
+			return nil, err
 		}
 		createdAt, _ := time.Parse(time.RFC3339Nano, created)
 		heartbeatAt, _ := time.Parse(time.RFC3339Nano, heartbeat)
@@ -80,16 +101,10 @@ func (s *SQLiteStore) ReconcileStaleWorkflowJobs(workflowID string, now time.Tim
 			stale = !fresh || !live
 		}
 		if stale {
-			found = append(found, staleJob{id, operation})
+			found = append(found, staleWorkflowJob{id, operation})
 		}
 	}
-	rows.Close()
-	for _, item := range found {
-		if err := s.FinishWorkflowJob(item.id, JobFailed, "interrupted", "detached "+item.operation+" worker interrupted", now); err != nil {
-			return err
-		}
-	}
-	return nil
+	return found, rows.Err()
 }
 
 func (s *SQLiteStore) HeartbeatWorkflowSession(sessionID string, now time.Time) error {

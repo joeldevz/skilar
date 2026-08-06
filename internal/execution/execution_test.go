@@ -66,6 +66,83 @@ func TestSchedulerDependencyOrderAndSingleWriter(t *testing.T) {
 	}
 }
 
+func TestSchedulerCompletesFinalSliceAndTransitionAtomically(t *testing.T) {
+	_, store, seal, c := execFixture(t)
+	defer store.Close()
+	s, err := NewScheduler(store, graph())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if _, err = store.AcquireLease("worktree:"+seal.WorktreeID, "owner", "token", now, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	first := Attempt{ID: "a1", WorkflowID: "wf", SliceID: "slice_a", WorktreeID: seal.WorktreeID, Owner: "owner", FencingToken: "token", BasisTree: c.TreeOID, AllowedPaths: []string{"a.txt"}, OperationID: "op1"}
+	if err = s.Start(first); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Complete("wf", "slice_a"); err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.ID, second.SliceID, second.OperationID = "a2", "slice_b", "op2"
+	if err = s.Start(second); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Complete("wf", "slice_b"); err != nil {
+		t.Fatal(err)
+	}
+	w, err := store.Get("wf")
+	if err != nil || w.State != workflow.StateVerifying {
+		t.Fatalf("workflow=%+v err=%v", w, err)
+	}
+	var completed int
+	if err = store.Database().QueryRow(`SELECT COUNT(*) FROM execution_slice_state WHERE workflow_id='wf' AND status='completed'`).Scan(&completed); err != nil || completed != 2 {
+		t.Fatalf("completed=%d err=%v", completed, err)
+	}
+}
+
+func TestSchedulerReconcilesLegacyCompletedExecution(t *testing.T) {
+	_, store, seal, c := execFixture(t)
+	defer store.Close()
+	s, err := NewScheduler(store, graph())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if _, err = store.AcquireLease("worktree:"+seal.WorktreeID, "owner", "token", now, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	first := Attempt{ID: "a1", WorkflowID: "wf", SliceID: "slice_a", WorktreeID: seal.WorktreeID, Owner: "owner", FencingToken: "token", BasisTree: c.TreeOID, AllowedPaths: []string{"a.txt"}, OperationID: "op1"}
+	if err = s.Start(first); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Complete("wf", "slice_a"); err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.ID, second.SliceID, second.OperationID = "a2", "slice_b", "op2"
+	if err = s.Start(second); err != nil {
+		t.Fatal(err)
+	}
+	// Reproduce the durable state written by the pre-fix two-transaction
+	// completion path: the last slice is complete but the workflow is not.
+	if _, err = store.Database().Exec(`UPDATE execution_slice_state SET status='completed' WHERE workflow_id='wf' AND slice_id='slice_b'`); err != nil {
+		t.Fatal(err)
+	}
+	advanced, err := s.ReconcileCompletion()
+	if err != nil || !advanced {
+		t.Fatalf("advanced=%v err=%v", advanced, err)
+	}
+	w, err := store.Get("wf")
+	if err != nil || w.State != workflow.StateVerifying {
+		t.Fatalf("workflow=%+v err=%v", w, err)
+	}
+	if advanced, err = s.ReconcileCompletion(); err != nil || advanced {
+		t.Fatalf("second reconcile advanced=%v err=%v", advanced, err)
+	}
+}
+
 func TestBrokerPatchStaleForbiddenAndRecovery(t *testing.T) {
 	repo, store, seal, c := execFixture(t)
 	defer store.Close()

@@ -109,31 +109,19 @@ func (s *Scheduler) Start(a Attempt) error {
 		return err
 	}
 	if w.State == workflow.StateReady {
-		_, err = s.store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateExecuting, IdempotencyKey: "execution:start:v1"})
+		_, err = s.store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateExecuting, IdempotencyKey: fmt.Sprintf("execution:start:v%d", s.graph.Version)})
 	}
 	return err
 }
 func (s *Scheduler) Complete(workflowID, sliceID string) error {
-	res, err := s.db.Exec(`UPDATE execution_slice_state SET status='completed' WHERE workflow_id=? AND slice_id=? AND status='active'`, workflowID, sliceID)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		return errors.New("execution: slice is not active")
-	}
-	var remaining int
-	if err = s.db.QueryRow(`SELECT COUNT(*) FROM execution_slice_state WHERE workflow_id=? AND status!='completed'`, workflowID).Scan(&remaining); err != nil {
-		return err
-	}
-	if remaining == 0 {
-		w, err := s.store.Get(workflowID)
-		if err != nil {
-			return err
-		}
-		_, err = s.store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: workflow.StateExecuting, ExpectedVersion: w.StateVersion, NextState: workflow.StateVerifying, IdempotencyKey: "execution:complete:v1"})
-		return err
-	}
-	return nil
+	return s.store.CompleteExecutionSlice(workflowID, sliceID)
+}
+
+// ReconcileCompletion closes the historical crash window from versions that
+// persisted the final slice completion separately from the workflow state
+// transition. It is safe to call at the start of every execution pass.
+func (s *Scheduler) ReconcileCompletion() (bool, error) {
+	return s.store.ReconcileCompletedExecution(s.graph.WorkflowID)
 }
 
 type FileOperation struct {

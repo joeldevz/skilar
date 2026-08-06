@@ -129,6 +129,23 @@ func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// Keep healthy diagnostics genuinely read-only. If their liveness probe
+	// finds an orphaned worker, reopen only then so the command can persist the
+	// durable blocker instead of reporting a workflow as executing forever.
+	if readOnly && (args[0] == "status" || args[0] == "inspect") {
+		needsRecovery, probeErr := workflowDiagnosticNeedsRecovery(store, args)
+		if probeErr != nil {
+			store.Close()
+			return probeErr
+		}
+		if needsRecovery {
+			store.Close()
+			store, err = workflow.OpenRepositorySQLite(cwd)
+			if err != nil {
+				return err
+			}
+		}
+	}
 	defer store.Close()
 	reviews := review.NewSQLiteStore(store.Database())
 	switch args[0] {
@@ -175,6 +192,45 @@ func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
 	default:
 		return fmt.Errorf("unknown workflow command %q", args[0])
 	}
+}
+
+func workflowDiagnosticNeedsRecovery(store *workflow.SQLiteStore, args []string) (bool, error) {
+	var ids []string
+	switch args[0] {
+	case "inspect":
+		id, err := requiredWorkflowID(args[1:])
+		if err != nil {
+			return false, err
+		}
+		ids = []string{id}
+	case "status":
+		if len(args) > 1 {
+			ids = []string{args[1]}
+		} else {
+			rows, err := store.Database().Query(`SELECT id FROM workflows`)
+			if err != nil {
+				return false, err
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var id string
+				if err = rows.Scan(&id); err != nil {
+					return false, err
+				}
+				ids = append(ids, id)
+			}
+			if err = rows.Err(); err != nil {
+				return false, err
+			}
+		}
+	}
+	for _, id := range ids {
+		stale, err := store.HasStaleWorkflowJobs(id, time.Now())
+		if err != nil || stale {
+			return stale, err
+		}
+	}
+	return false, nil
 }
 
 func workflowCommandKnown(command string) bool {
@@ -240,6 +296,9 @@ Run skynex workflow <command> --help for command-specific options.`)
 
 func workflowStatus(store *workflow.SQLiteStore, args []string, out io.Writer) error {
 	if len(args) > 0 {
+		if err := store.ReconcileStaleWorkflowJobs(args[0], time.Now()); err != nil {
+			return err
+		}
 		w, err := store.Get(args[0])
 		if err != nil {
 			return err
@@ -270,7 +329,28 @@ func workflowStatus(store *workflow.SQLiteStore, args []string, out io.Writer) e
 		}
 		return nil
 	}
-	rows, err := store.Database().Query(`SELECT id,state,state_version,route,minimum_risk FROM workflows ORDER BY id`)
+	rows, err := store.Database().Query(`SELECT id FROM workflows ORDER BY id`)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	if err = rows.Close(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err = store.ReconcileStaleWorkflowJobs(id, time.Now()); err != nil {
+			return err
+		}
+	}
+	rows, err = store.Database().Query(`SELECT id,state,state_version,route,minimum_risk FROM workflows ORDER BY id`)
 	if err != nil {
 		return err
 	}
@@ -287,6 +367,9 @@ func workflowStatus(store *workflow.SQLiteStore, args []string, out io.Writer) e
 }
 
 func workflowInspect(store *workflow.SQLiteStore, reviews *review.SQLiteStore, id string, out io.Writer) error {
+	if err := store.ReconcileStaleWorkflowJobs(id, time.Now()); err != nil {
+		return err
+	}
 	w, err := store.Get(id)
 	if err != nil {
 		return err

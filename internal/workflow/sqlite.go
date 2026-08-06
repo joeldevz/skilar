@@ -680,6 +680,119 @@ func (s *SQLiteStore) Transition(req Transition) (Workflow, error) {
 	return w, nil
 }
 
+// CompleteExecutionSlice atomically records the terminal slice result and, if
+// it was the final slice, advances the workflow to verification. Keeping these
+// writes in one transaction prevents a dead detached worker from leaving every
+// slice completed while the workflow remains in executing.
+func (s *SQLiteStore) CompleteExecutionSlice(workflowID, sliceID string) error {
+	ctx := context.Background()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err = conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		}
+	}()
+	res, err := conn.ExecContext(ctx, `UPDATE execution_slice_state SET status='completed' WHERE workflow_id=? AND slice_id=? AND status='active'`, workflowID, sliceID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return errors.New("execution: slice is not active")
+	}
+	if _, err = completeExecutionIfReady(ctx, conn, workflowID, s.now); err != nil {
+		return err
+	}
+	if _, err = conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+// ReconcileCompletedExecution repairs workflows created before final-slice
+// completion became atomic. It does not change a partially executed workflow.
+func (s *SQLiteStore) ReconcileCompletedExecution(workflowID string) (bool, error) {
+	ctx := context.Background()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer conn.Close()
+	if _, err = conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return false, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		}
+	}()
+	advanced, err := completeExecutionIfReady(ctx, conn, workflowID, s.now)
+	if err != nil {
+		return false, err
+	}
+	if _, err = conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return false, err
+	}
+	committed = true
+	return advanced, nil
+}
+
+func completeExecutionIfReady(ctx context.Context, conn *sql.Conn, workflowID string, now func() time.Time) (bool, error) {
+	var remaining int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM execution_slice_state WHERE workflow_id=? AND status!='completed'`, workflowID).Scan(&remaining); err != nil {
+		return false, err
+	}
+	if remaining != 0 {
+		return false, nil
+	}
+	w, err := scanWorkflow(conn.QueryRowContext(ctx, `SELECT id,state,state_version,route,minimum_risk,basis_tree,resume_target FROM workflows WHERE id=?`, workflowID))
+	if err != nil {
+		return false, err
+	}
+	if w.State == StateVerifying {
+		return false, nil
+	}
+	if w.State != StateExecuting {
+		return false, fmt.Errorf("execution: all slices completed but workflow is %s", w.State)
+	}
+	next := w
+	next.State = StateVerifying
+	next.StateVersion++
+	res, err := conn.ExecContext(ctx, `UPDATE workflows SET state=?,state_version=? WHERE id=? AND state=? AND state_version=?`, next.State, next.StateVersion, next.ID, StateExecuting, w.StateVersion)
+	if err != nil {
+		return false, err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return false, ErrCASConflict
+	}
+	var graphVersion uint64
+	if err = conn.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),1) FROM execution_graphs WHERE workflow_id=?`, workflowID).Scan(&graphVersion); err != nil {
+		return false, err
+	}
+	key := fmt.Sprintf("execution:complete:v%d", graphVersion)
+	artifacts, _ := json.Marshal([]string(nil))
+	stamp := now().UTC().Format(time.RFC3339Nano)
+	if _, err = conn.ExecContext(ctx, `INSERT INTO transition_events(workflow_id,from_state,to_state,state_version,idempotency_key,artifact_ids,occurred_at) VALUES(?,?,?,?,?,?,?)`, next.ID, StateExecuting, StateVerifying, next.StateVersion, key, artifacts, stamp); err != nil {
+		return false, err
+	}
+	req := Transition{WorkflowID: next.ID, ExpectedState: StateExecuting, ExpectedVersion: w.StateVersion, NextState: StateVerifying, IdempotencyKey: key}
+	reqJSON, _ := json.Marshal(cloneTransition(req))
+	resultJSON, _ := json.Marshal(next)
+	if _, err = conn.ExecContext(ctx, `INSERT INTO idempotency(workflow_id,key,request,result) VALUES(?,?,?,?)`, next.ID, key, reqJSON, resultJSON); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *SQLiteStore) Events(id string) ([]Event, error) {
 	if _, err := s.Get(id); err != nil {
 		return nil, err

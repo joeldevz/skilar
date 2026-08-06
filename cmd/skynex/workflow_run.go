@@ -282,6 +282,12 @@ func workflowRunContext(ctx context.Context, store *workflow.SQLiteStore, repo s
 		if err != nil {
 			return err
 		}
+		// A worker from an older process may have died after committing the last
+		// slice but before advancing the workflow to verification. Repair that
+		// durable state before trying to schedule another mutation.
+		if _, err = scheduler.ReconcileCompletion(); err != nil {
+			return err
+		}
 		for {
 			var attempt execution.Attempt
 			var allowedRaw []byte

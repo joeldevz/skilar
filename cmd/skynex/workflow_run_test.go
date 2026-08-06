@@ -165,6 +165,69 @@ func TestForegroundRunRefusesToInheritALiveDetachedWorkersAttempt(t *testing.T) 
 	}
 }
 
+func TestConcurrentForegroundRunsCannotShareAnAttempt(t *testing.T) {
+	repo, store := cliWorkflowRepo(t)
+	defer store.Close()
+	gate := filepath.Join(t.TempDir(), "gate")
+	fake := cliFakeOpenCode(t, "touch '"+gate+"'; sleep 1")
+	args := []string{"--id", "wf", "--request", "change a", "--accept", "test \"$(cat a.txt)\" = new", "--check", "true", "--path", "a.txt", "--opencode", fake, "--timeout", "5s"}
+	if err := workflowStart(store, repo, args, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	first := make(chan error, 1)
+	go func() { first <- workflowRun(store, repo, []string{"wf"}, &bytes.Buffer{}) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(gate); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("first run never dispatched")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	second := workflowRun(store, repo, []string{"wf"}, &bytes.Buffer{})
+	if second == nil {
+		t.Fatal("a second concurrent foreground run was admitted")
+	}
+	if !strings.Contains(second.Error(), "already being executed") {
+		t.Fatalf("second run error=%v", second)
+	}
+	if err := <-first; err != nil {
+		t.Fatalf("first run was disturbed: %v", err)
+	}
+	w, err := store.Get("wf")
+	if err != nil || w.State != workflow.StateCandidateFrozen {
+		t.Fatalf("workflow=%+v err=%v", w, err)
+	}
+	var conflicts int
+	if err = store.Database().QueryRow(`SELECT COUNT(*) FROM stale_result_audit`).Scan(&conflicts); err != nil || conflicts != 0 {
+		t.Fatalf("stale results=%d err=%v", conflicts, err)
+	}
+}
+
+func TestExecutionFenceIsReleasedForTheNextRun(t *testing.T) {
+	repo, store := cliWorkflowRepo(t)
+	defer store.Close()
+	marker := filepath.Join(t.TempDir(), "first")
+	prefix := "if [ ! -f '" + marker + "' ]; then touch '" + marker + "'; echo bad > \"$SKYNEX_RESULT_FILE\"; exit 0; fi"
+	fake := cliFakeOpenCode(t, prefix)
+	args := []string{"--id", "wf", "--request", "change a", "--accept", "test \"$(cat a.txt)\" = new", "--check", "true", "--path", "a.txt", "--opencode", fake, "--timeout", "2s"}
+	if err := workflowStart(store, repo, args, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := workflowRun(store, repo, []string{"wf"}, &bytes.Buffer{}); err == nil {
+		t.Fatal("expected the first run to fail")
+	}
+	var held int
+	if err := store.Database().QueryRow(`SELECT COUNT(*) FROM leases WHERE resource='workflow-execution:wf'`).Scan(&held); err != nil || held != 0 {
+		t.Fatalf("fence leaked after a failed run: %d err=%v", held, err)
+	}
+	if err := workflowRun(store, repo, []string{"wf"}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("resume err=%v", err)
+	}
+}
+
 func TestForegroundRunProceedsOnceTheDetachedWorkerIsDead(t *testing.T) {
 	repo, store := cliWorkflowRepo(t)
 	defer store.Close()

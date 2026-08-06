@@ -272,6 +272,68 @@ func refuseWhileDetachedWorkerIsLive(store *workflow.SQLiteStore, id, operation 
 	return fmt.Errorf("workflow %s already has a live detached %s worker (job %s, pid %d); wait for its completion notification, or run `skynex workflow abort %s --idempotency-key abort-%s` to stop it before running %s in the foreground", id, job.Operation, job.ID, job.PID, id, id, operation)
 }
 
+// workflowExecutionFenceTTL bounds how long a crashed executor can hold a
+// workflow. It matches the job liveness window, so a process that dies without
+// releasing its fence frees the workflow on the same schedule as a dead worker.
+const workflowExecutionFenceTTL = 30 * time.Second
+
+const workflowExecutionFenceHeartbeat = 5 * time.Second
+
+// executionFence is the durable claim one process holds while it executes a
+// workflow. The attempt row publishes the worktree owner and fencing token, so
+// any second process can reproduce them and heartbeat that lease; this fence is
+// keyed to a private per-process identity that nothing else can read back, and
+// it covers the detached worker and the foreground CLI alike because both enter
+// through workflowRunContext.
+type executionFence struct {
+	store           *workflow.SQLiteStore
+	resource, owner string
+	token           string
+	stop, done      chan struct{}
+}
+
+func fenceWorkflowExecution(store *workflow.SQLiteStore, id string) (*executionFence, error) {
+	token, err := newFencingToken()
+	if err != nil {
+		return nil, err
+	}
+	fence := &executionFence{
+		store:    store,
+		resource: "workflow-execution:" + id,
+		owner:    fmt.Sprintf("execution-pid-%d-%s", os.Getpid(), token[:16]),
+		token:    token,
+		stop:     make(chan struct{}),
+		done:     make(chan struct{}),
+	}
+	now := time.Now()
+	if _, err = store.AcquireLease(fence.resource, fence.owner, fence.token, now, now.Add(workflowExecutionFenceTTL)); err != nil {
+		if errors.Is(err, workflow.ErrLeaseConflict) {
+			return nil, fmt.Errorf("workflow %s is already being executed by another process; wait for it to finish, or retry in %s if that process died", id, workflowExecutionFenceTTL)
+		}
+		return nil, err
+	}
+	go func() {
+		defer close(fence.done)
+		ticker := time.NewTicker(workflowExecutionFenceHeartbeat)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-fence.stop:
+				return
+			case beat := <-ticker.C:
+				_, _ = store.HeartbeatLease(fence.resource, fence.owner, fence.token, beat, beat.Add(workflowExecutionFenceTTL))
+			}
+		}
+	}()
+	return fence, nil
+}
+
+func (f *executionFence) Release() {
+	close(f.stop)
+	<-f.done
+	_, _ = f.store.Database().Exec(`DELETE FROM leases WHERE resource=? AND owner=? AND fencing_token=?`, f.resource, f.owner, f.token)
+}
+
 func workflowRunContext(ctx context.Context, store *workflow.SQLiteStore, repo string, args []string, out io.Writer) error {
 	id, err := requiredWorkflowID(args)
 	if err != nil {
@@ -280,6 +342,11 @@ func workflowRunContext(ctx context.Context, store *workflow.SQLiteStore, repo s
 	if hasFlag(args, "--detach") {
 		return workflowRunDetached(store, repo, id, out)
 	}
+	fence, err := fenceWorkflowExecution(store, id)
+	if err != nil {
+		return err
+	}
+	defer fence.Release()
 	w, err := store.Get(id)
 	if err != nil {
 		return err

@@ -199,6 +199,7 @@ func workflowWorker(store *workflow.SQLiteStore, repo string, args []string, out
 		// blocker.
 		if workflow.ExecutionDisplaced(err) {
 			state = workflow.JobCancelled
+			message = workflow.JobDisplacedErrorPrefix + err.Error()
 		}
 	}
 	if w.State == workflow.StateAborted {

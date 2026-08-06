@@ -40,6 +40,8 @@ type WorkflowNotification struct {
 const WorkflowSessionPresenceTTL = 20 * time.Second
 const MaxWorkflowJobAttempts = 3
 
+const JobDisplacedErrorPrefix = "execution displaced: "
+
 var workflowJobProcessAlive = workflowProcessAlive
 
 type staleWorkflowJob struct{ id, operation string }
@@ -317,7 +319,7 @@ func (s *SQLiteStore) RetryTechnicalWorkflowJob(workflowID, operation string, no
 		return Workflow{}, fmt.Errorf("workflow %s latest %s job is not failed", workflowID, operation)
 	}
 	var attempts int
-	if err = s.db.QueryRow(`SELECT COUNT(*) FROM workflow_jobs WHERE workflow_id=? AND operation=?`, workflowID, operation).Scan(&attempts); err != nil {
+	if err = s.db.QueryRow(`SELECT COUNT(*) FROM workflow_jobs WHERE workflow_id=? AND operation=? AND NOT (state=? AND error LIKE ?)`, workflowID, operation, JobCancelled, JobDisplacedErrorPrefix+"%").Scan(&attempts); err != nil {
 		return Workflow{}, err
 	}
 	if attempts >= MaxWorkflowJobAttempts {
@@ -346,7 +348,7 @@ func (s *SQLiteStore) RetryTechnicalWorkflowJob(workflowID, operation string, no
 
 func (s *SQLiteStore) WorkflowJobAttempts(workflowID, operation string) (int, error) {
 	var attempts int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM workflow_jobs WHERE workflow_id=? AND operation=?`, workflowID, operation).Scan(&attempts)
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM workflow_jobs WHERE workflow_id=? AND operation=? AND NOT (state=? AND error LIKE ?)`, workflowID, operation, JobCancelled, JobDisplacedErrorPrefix+"%").Scan(&attempts)
 	return attempts, err
 }
 

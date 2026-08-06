@@ -88,6 +88,46 @@ func TestRenderAgentsAllowsSafeName(t *testing.T) {
 	}
 }
 
+func TestRenderAgentsResolvesPromptFile(t *testing.T) {
+	source := t.TempDir()
+	agentsDir := filepath.Join(source, "opencode", "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	config := `{"agent":{"standalone":{"prompt":"{file:./agents/standalone.md}","description":"standalone agent"}}}`
+	if err := os.WriteFile(filepath.Join(source, "opencode", "opencode.json"), []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentsDir, "standalone.md"), []byte("resolved prompt body\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	target := t.TempDir()
+	if err := renderAgents(source, target); err != nil {
+		t.Fatalf("renderAgents failed: %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(target, "agents", "standalone.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "resolved prompt body") {
+		t.Fatalf("rendered agent did not include prompt body: %q", content)
+	}
+	if strings.Contains(string(content), "{file:") {
+		t.Fatalf("rendered agent retained unresolved file reference: %q", content)
+	}
+}
+
+func TestResolveAgentPromptRejectsTraversal(t *testing.T) {
+	opencodeDir := filepath.Join(t.TempDir(), "opencode")
+	if err := os.MkdirAll(opencodeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveAgentPrompt(opencodeDir, "{file:./agents/../secret.md}"); err == nil {
+		t.Fatal("expected traversal prompt reference to be rejected")
+	}
+}
+
 func TestRenderAgentsRejectsSymlinkedConfigWithoutReadingTarget(t *testing.T) {
 	source := t.TempDir()
 	outside := filepath.Join(t.TempDir(), "secret.json")

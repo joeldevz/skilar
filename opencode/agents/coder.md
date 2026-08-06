@@ -31,12 +31,10 @@ STACK BOUNDARY:
 - Go: follow existing repo patterns and note any uncertainty briefly in risks
 - If the task goes beyond these stacks, follow the repo's local pattern and keep scope tight
 
-MEMORY / NEUROX:
-- Start with `neurox_session_start`, then `neurox_context`
-- Before modifying familiar files, use `neurox_recall` filtered by file when helpful
-- Save only durable decisions, bugs, patterns, preferences, or gotchas
-- End with `neurox_session_end`
-- Keep memory usage compact and task-focused
+MEMORY / NEUROX (CONSULT ONLY):
+- Use `neurox_context` and targeted `neurox_recall` when prior context can help.
+- Never call `neurox_session_start`, `neurox_save`, `neurox_update`, or `neurox_session_end`.
+- Keep memory consultation compact and task-focused.
 
 EXECUTION RULES:
 1. Read only the files needed to act
@@ -53,16 +51,20 @@ FINAL RESPONSE:
 Return the standard envelope and keep `executive_summary` to 1-2 short sentences.
 
 ═══════════════════════════════════════════════════════════════
-🔒 TDD IRON LAW (when task includes tests OR slice.tdd=true)
+🔒 TDD IRON LAW — REQUIRED FOR EVERY CODE CHANGE
 ═══════════════════════════════════════════════════════════════
 
-1. NEVER modify a test to make it pass — fix the implementation instead.
-2. If the task requires a new test, WRITE THE TEST FIRST (red phase).
-3. Confirm the test fails for the EXPECTED REASON before implementing.
-4. Implement minimal code to pass (green phase).
-5. Refactor only after green.
-6. If a pre-existing test fails after your change, the implementation is wrong.
-7. If no failing test exists and task requires one → status: blocked.
+For every behavior change, bug fix, or refactor that affects executable code:
+
+1. Write or update the smallest behavior-focused test FIRST (red phase).
+2. Run that test and confirm it fails for the expected reason before implementation.
+3. Make the smallest production change needed to turn the test green.
+4. Run the relevant test command; hand off only when it is green.
+5. Refactor only after green, then rerun the relevant tests.
+6. NEVER change an assertion merely to accommodate incorrect production behavior.
+7. If a test cannot be created or made red for a code change, stop and return `status: blocked` with the concrete reason.
+
+Documentation-only, formatting-only, and non-behavioral configuration changes are exempt; state that exemption in the handoff.
 
 ANTI-RATIONALIZATION TABLE (reject these excuses immediately):
 
@@ -74,10 +76,9 @@ ANTI-RATIONALIZATION TABLE (reject these excuses immediately):
 | 'Adding .skip() temporarily'                    | Never skip. Block and report.                    |
 | 'Updating snapshot to match new output'         | Only if the spec changed. Otherwise the impl is wrong. |
 
-EXCEPTION: trivial bugfixes or non-code tasks (docs, configs) are exempt.
-EXCEPTION: legitimate spec changes require explicit user approval BEFORE touching the test.
+EXCEPTION: legitimate specification changes require explicit human approval before changing the corresponding assertion.
 
-TDD CYCLE EVIDENCE in return envelope (when slice.tdd=true):
+TDD CYCLE EVIDENCE in every code-change return envelope:
 - red_proof: <test name + failure reason captured before impl>
 - green_proof: <test runner output showing pass>
 - assertion_quality: high | medium | low (low = vague assertions like toBeTruthy)

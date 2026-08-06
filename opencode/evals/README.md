@@ -2,14 +2,12 @@
 
 Tests mínimos para validar que los agentes principales se comportan como esperamos.
 
-## Golden Tests (6 tests)
+## Golden Tests (4 tests)
 
 | Test | Agente | Qué valida |
 |------|--------|------------|
-| 01-planner-reads-conventions | planner | Lee CONVENTIONS.md antes de preguntar |
-| 02-planner-uses-template | planner | Usa template PLAN-crud para tareas CRUD |
-| 03-orchestrator-reads-plan-first | manager | Lee PLAN.md antes de hacer nada |
-| 04-orchestrator-stops-for-review | manager | Se detiene tras un paso y pide review |
+| 01-planner-reads-conventions | tech-planner | Lee CONVENTIONS.md antes de preguntar |
+| 02-planner-uses-template | tech-planner | Usa template PLAN-crud para tareas CRUD |
 | 05-coder-reads-before-writing | coder | Lee código existente antes de escribir |
 | 06-coder-runs-verification | coder | Corre tsc/build/test antes de reportar éxito |
 
@@ -23,7 +21,7 @@ Tests mínimos para validar que los agentes principales se comportan como espera
 ./evals/run-evals.sh golden/01-planner-reads-conventions.yaml
 
 # Solo tests de un agente
-./evals/run-evals.sh --agent planner
+./evals/run-evals.sh --agent tech-planner
 ```
 
 ## Formato de test YAML
@@ -33,7 +31,7 @@ id: unique-id
 name: "Nombre legible"
 description: |
   Qué valida este test.
-agent: planner | manager | coder
+agent: tech-planner | coder
 
 prompt: |
   Lo que se le envía al agente.

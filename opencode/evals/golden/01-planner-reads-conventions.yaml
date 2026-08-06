@@ -1,9 +1,9 @@
-id: planner-reads-conventions
-name: "Planner reads CONVENTIONS.md before asking questions"
+id: tech-planner-reads-conventions
+name: "Tech planner reads CONVENTIONS.md before asking questions"
 description: |
-  Given a project that has CONVENTIONS.md, the planner must read it
+  Given a project that has CONVENTIONS.md, the tech planner must read it
   during discovery phase before asking the user any questions.
-agent: planner
+agent: tech-planner
 
 prompt: |
   Plan the implementation of a new "notifications" module for this NestJS project.

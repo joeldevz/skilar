@@ -69,7 +69,7 @@ var simpleGroups = []simpleGroup{
 	{
 		key:    "Orchestrator",
 		desc:   "Plans, coordinates and delegates all work",
-		agents: []string{"orchestrator", "manager"},
+		agents: []string{"orchestrator", "skynex-orchestrator", "manager"},
 	},
 	{
 		key:    "Workers",
@@ -89,20 +89,21 @@ type agentConfig struct {
 }
 
 var agentDescriptions = map[string]string{
-	"orchestrator":    "Coordinates all agents, decides strategy",
-	"tech-planner":    "Writes PLAN.md with technical steps",
-	"product-planner": "Writes SPEC.md with business context",
-	"coder":           "Implements code changes",
-	"manager":         "Executes plan step by step",
-	"verifier":        "Runs lint, build, tests",
-	"test-reviewer":   "Reviews test quality",
-	"security":        "Adversarial security judge",
-	"skill-validator": "Validates code conventions",
-	"advisor":         "Senior strategic consultant",
+	"orchestrator":        "Coordinates all agents, decides strategy",
+	"skynex-orchestrator": "Coordinates with durable lineage and risk-based validation",
+	"tech-planner":        "Writes PLAN.md with technical steps",
+	"product-planner":     "Writes SPEC.md with business context",
+	"coder":               "Implements code changes",
+	"manager":             "Executes plan step by step",
+	"verifier":            "Runs lint, build, tests",
+	"test-reviewer":       "Reviews test quality",
+	"security":            "Adversarial security judge",
+	"skill-validator":     "Validates code conventions",
+	"advisor":             "Senior strategic consultant",
 }
 
 var agentList = []string{
-	"orchestrator", "tech-planner", "product-planner",
+	"orchestrator", "skynex-orchestrator", "tech-planner", "product-planner",
 	"coder", "manager", "verifier",
 	"test-reviewer", "security", "skill-validator", "advisor",
 }

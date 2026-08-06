@@ -65,18 +65,18 @@ modo `0600`.
 2. Copia todo el contenido de `opencode/` a `~/.config/opencode/`
 3. Restaura tu API key de Context7 del backup si la tenias configurada
 4. Ejecuta `bun install --ignore-scripts` (o `npm install --ignore-scripts` como fallback) para dependencias de plugins
-5. Resultado: 11 agentes, 8 commands, skills, templates, evals, y MCPs configurados
+5. Resultado: 12 agentes, 8 commands, skills, templates, evals, y MCPs configurados
 
 #### Para Claude Code
 
 1. Hace backup de `~/.claude/` si ya existe
-2. Renderiza los agentes (`orchestrator`, `advisor`, `coder`, `manager`, `tech-planner`, `product-planner`, `verifier`, `test-reviewer`, `security`, `skill-validator`, `linear-orchestrator`) en `~/.claude/agents/`
+2. Renderiza los agentes (`orchestrator`, `skynex-orchestrator`, `advisor`, `coder`, `infrastructure-engineer`, `tech-planner`, `verifier`, `test-reviewer`, `security`, `skill-validator`, `pr-reviewer`) en `~/.claude/agents/`
 3. Convierte los 8 commands de OpenCode en skills de Claude Code en `~/.claude/skills/`
 4. Copia skills compartidas (`grill-me`, `prd`, `security`, `write-a-skill`, `diagnose`, `triage`) a `~/.claude/skills/`
 5. Copia templates a `~/.claude/templates/`
 6. Agrega el bloque del workflow a `~/.claude/CLAUDE.md` (sin borrar contenido existente)
 7. Registra Neurox como MCP server en `~/.claude.json`
-8. Resultado: 11 agentes, 8 skills de comando, skills core (grill-me, prd, security, write-a-skill, diagnose, triage), overlay de CLAUDE.md, y Neurox MCP listo
+8. Resultado: 12 agentes, 8 skills de comando, skills core (grill-me, prd, security, write-a-skill, diagnose, triage), overlay de CLAUDE.md, y Neurox MCP listo
 
 ## Instalacion manual
 
@@ -149,7 +149,7 @@ opencode
 ```bash
 # Verificar agentes
 ls ~/.claude/agents/
-# Deberia mostrar también: orchestrator.md  advisor.md  coder.md  manager.md  tech-planner.md  product-planner.md  verifier.md  test-reviewer.md  security.md  skill-validator.md  linear-orchestrator.md
+# Deberia mostrar también: orchestrator.md  skynex-orchestrator.md  advisor.md  coder.md  infrastructure-engineer.md  tech-planner.md  verifier.md  test-reviewer.md  security.md  skill-validator.md  pr-reviewer.md
 
 # Verificar skills
 ls ~/.claude/skills/

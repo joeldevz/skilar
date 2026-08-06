@@ -26,16 +26,17 @@ Esta skill DEBE usar Neurox para memoria persistente:
 `
 
 var skillMap = map[string][]string{
-	"orchestrator":    {"security"},
-	"advisor":         {},
-	"product-planner": {"prd"},
-	"tech-planner":    {"prd", "nestjs-patterns", "typescript-advanced-types"},
-	"coder":           {"nestjs-patterns", "typescript-advanced-types"},
-	"verifier":        {},
-	"test-reviewer":   {},
-	"security":        {"security"},
-	"skill-validator": {},
-	"manager":         {},
+	"orchestrator":        {"security"},
+	"skynex-orchestrator": {"security"},
+	"advisor":             {},
+	"product-planner":     {"prd"},
+	"tech-planner":        {"prd", "nestjs-patterns", "typescript-advanced-types"},
+	"coder":               {"nestjs-patterns", "typescript-advanced-types"},
+	"verifier":            {},
+	"test-reviewer":       {},
+	"security":            {"security"},
+	"skill-validator":     {},
+	"manager":             {},
 }
 
 // InstallClaude installs all Claude Code assets from srcDir.
@@ -123,7 +124,8 @@ func InstallClaudeWithReporter(srcDir string, req *models.InstallRequest, report
 
 // renderAgents reads opencode.json and generates ~/.claude/agents/{name}.md
 func renderAgents(srcDir, target string) error {
-	configPath := filepath.Join(srcDir, "opencode", "opencode.json")
+	opencodePath := filepath.Join(srcDir, "opencode")
+	configPath := filepath.Join(opencodePath, "opencode.json")
 	data, err := safefs.ReadFileAbsoluteVerified(configPath, 4<<20)
 	if err != nil {
 		return err
@@ -163,6 +165,10 @@ func renderAgents(srcDir, target string) error {
 		if err := json.Unmarshal(agent["prompt"], &prompt); err != nil {
 			continue
 		}
+		prompt, err = resolveAgentPrompt(opencodePath, prompt)
+		if err != nil {
+			return fmt.Errorf("resolve agent %s prompt: %w", name, err)
+		}
 		if err := json.Unmarshal(agent["description"], &description); err != nil {
 			description = name
 		}
@@ -194,6 +200,32 @@ func renderAgents(srcDir, target string) error {
 		}
 	}
 	return nil
+}
+
+func resolveAgentPrompt(opencodePath, prompt string) (string, error) {
+	const prefix = "{file:"
+	if !strings.HasPrefix(prompt, prefix) || !strings.HasSuffix(prompt, "}") {
+		return prompt, nil
+	}
+	reference := strings.TrimSuffix(strings.TrimPrefix(prompt, prefix), "}")
+	reference = strings.TrimPrefix(reference, "./")
+	reference, err := safefs.Relative(reference)
+	if err != nil {
+		return "", err
+	}
+	if !strings.HasPrefix(reference, "agents/") {
+		return "", fmt.Errorf("agent prompt must be below agents/: %q", reference)
+	}
+	root, err := safefs.Open(opencodePath)
+	if err != nil {
+		return "", err
+	}
+	defer root.Close()
+	data, err := safefs.ReadFileVerified(root, reference, 4<<20)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
 func validateAgentName(name string) error {

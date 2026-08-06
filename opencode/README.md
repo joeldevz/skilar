@@ -33,13 +33,12 @@ opencode/
 - recomienda defaults razonables
 - genera `PLAN.md`
 
-### `manager`
+### `infrastructure-engineer`
 
-- lee `PLAN.md`
-- ejecuta un solo paso por vez
-- delega implementacion a `coder`
-- actualiza estados del plan
-- obliga a revision humana antes de continuar
+- gestiona tareas acotadas de infraestructura, CI/CD, runtime y despliegue
+- prepara las herramientas de calidad requeridas desde sus fuentes upstream
+- separa los límites no testeables y ejecuta la verificación relevante
+- conserva el acceso completo a Neurox para registrar decisiones operativas duraderas
 
 Estados de `PLAN.md`:
 
@@ -60,7 +59,7 @@ Estados de `PLAN.md`:
 
 La lista canónica es el contenido de `opencode/commands/`:
 
-`/commit`, `/docs`, `/linear`, `/pr`, `/review-pr`, `/rollback`, `/setup` y `/skills-scan`.
+`/commit`, `/docs`, `/pr`, `/review-pr`, `/rollback`, `/setup` y `/skills-scan`.
 
 Los comandos descritos en documentos antiguos no forman parte de la distribución actual.
 

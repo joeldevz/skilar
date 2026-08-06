@@ -178,8 +178,9 @@ skynex completion fish > ~/.config/fish/completions/skynex.fish
 
 | Agente | Rol | Que hace |
 |--------|-----|----------|
+| `skynex-orchestrator` | Orquestacion durable optimizada | Coordina directamente sin `skynex workflow`: ajusta el proceso al riesgo, liga resultados al intento y valida una sola vez el candidato Git |
 | `planner` | Discovery y planificacion | Inicia memoria con Neurox, lee convenciones, explora el codebase, hace preguntas, genera `PLAN.md` |
-| `manager` | Orquestacion y review | Lee `PLAN.md`, ejecuta un paso por vez, delega a `coder`, exige revision humana |
+| `infrastructure-engineer` | Infraestructura y entrega | Gestiona CI/CD, runtime, despliegues y verificación de herramientas con límites de seguridad explícitos |
 | `coder` | Implementacion acotada | Implementa una tarea, sigue patrones locales, consulta Context7 para docs, verifica antes de entregar |
 
 ### Estados de PLAN.md

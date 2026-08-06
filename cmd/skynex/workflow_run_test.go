@@ -43,10 +43,15 @@ func cliWorkflowRepo(t *testing.T) (string, *workflow.SQLiteStore) {
 
 func cliFakeOpenCode(t *testing.T, prefix string) string {
 	t.Helper()
+	return cliFakeOpenCodeFor(t, prefix, "wf")
+}
+
+func cliFakeOpenCodeFor(t *testing.T, prefix, workflowID string) string {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "opencode")
 	body := "#!/bin/sh\nset -eu\n" + prefix + `
 tree=$(git write-tree)
-printf '{"envelope":{"WorkflowID":"wf","NodeID":"slice_main","AttemptID":"wf:slice_main","BaseCandidateOID":"%s","Status":"completed","EvidenceIDs":["fake"]},"patch":{"Operations":[{"Path":"a.txt","Data":"bmV3Cg==","Mode":384}]}}' "$tree" > "$SKYNEX_RESULT_FILE"
+printf '{"envelope":{"WorkflowID":"` + workflowID + `","NodeID":"slice_main","AttemptID":"` + workflowID + `:slice_main","BaseCandidateOID":"%s","Status":"completed","EvidenceIDs":["fake"]},"patch":{"Operations":[{"Path":"a.txt","Data":"bmV3Cg==","Mode":384}]}}' "$tree" > "$SKYNEX_RESULT_FILE"
 `
 	if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
 		t.Fatal(err)
@@ -203,6 +208,163 @@ func TestConcurrentForegroundRunsCannotShareAnAttempt(t *testing.T) {
 	var conflicts int
 	if err = store.Database().QueryRow(`SELECT COUNT(*) FROM stale_result_audit`).Scan(&conflicts); err != nil || conflicts != 0 {
 		t.Fatalf("stale results=%d err=%v", conflicts, err)
+	}
+}
+
+func TestDetachedQueueRefusesInsteadOfBlockingALiveRun(t *testing.T) {
+	repo, store := cliWorkflowRepo(t)
+	defer store.Close()
+	gate := filepath.Join(t.TempDir(), "gate")
+	fake := cliFakeOpenCode(t, "touch '"+gate+"'; sleep 1")
+	args := []string{"--id", "wf", "--request", "change a", "--accept", "test \"$(cat a.txt)\" = new", "--check", "true", "--path", "a.txt", "--opencode", fake, "--timeout", "5s"}
+	if err := workflowStart(store, repo, args, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	first := make(chan error, 1)
+	go func() { first <- workflowRun(store, repo, []string{"wf"}, &bytes.Buffer{}) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(gate); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("first run never dispatched")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	queued := workflowRun(store, repo, []string{"wf", "--detach"}, &bytes.Buffer{})
+	if queued == nil {
+		t.Fatal("a detached run was queued against a live executor")
+	}
+	if !errors.Is(queued, workflow.ErrExecutionFenceHeld) {
+		t.Fatalf("detach error=%v", queued)
+	}
+	var jobs int
+	if err := store.Database().QueryRow(`SELECT COUNT(*) FROM workflow_jobs WHERE workflow_id='wf'`).Scan(&jobs); err != nil || jobs != 0 {
+		t.Fatalf("refusal created a durable job: %d err=%v", jobs, err)
+	}
+	if err := <-first; err != nil {
+		t.Fatalf("the live run was disturbed: %v", err)
+	}
+	w, err := store.Get("wf")
+	if err != nil || w.State != workflow.StateCandidateFrozen {
+		t.Fatalf("workflow=%+v err=%v", w, err)
+	}
+}
+
+func TestFenceRefusalByAWorkerNeverBlocksTheWorkflow(t *testing.T) {
+	repo, store := cliWorkflowRepo(t)
+	defer store.Close()
+	fake := cliFakeOpenCode(t, "true")
+	args := []string{"--id", "wf", "--request", "change a", "--accept", "true", "--check", "true", "--path", "a.txt", "--opencode", fake, "--timeout", "2s"}
+	if err := workflowStart(store, repo, args, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := fenceWorkflowExecution(store, "wf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Release()
+	if _, err = store.CreateWorkflowJobOperation("job-loser", "wf", "run", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.Get("wf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = workflowWorker(store, repo, []string{"wf", "--job", "job-loser"}, &bytes.Buffer{}); !errors.Is(err, workflow.ErrExecutionFenceHeld) {
+		t.Fatalf("worker err=%v", err)
+	}
+	job, err := store.WorkflowJob("job-loser")
+	if err != nil || job.State != workflow.JobCancelled {
+		t.Fatalf("job=%+v err=%v", job, err)
+	}
+	after, err := store.Get("wf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.State != before.State || after.StateVersion != before.StateVersion {
+		t.Fatalf("a refusal blocked the workflow: %+v -> %+v", before, after)
+	}
+}
+
+func TestExecutionFenceStopsARunThatLostExclusivity(t *testing.T) {
+	repo, store := cliWorkflowRepo(t)
+	defer store.Close()
+	fake := cliFakeOpenCode(t, "true")
+	args := []string{"--id", "wf", "--request", "change a", "--accept", "true", "--check", "true", "--path", "a.txt", "--opencode", fake, "--timeout", "2s"}
+	if err := workflowStart(store, repo, args, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	fence, err := fenceWorkflowExecution(store, "wf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fence.Release()
+	if err = fence.Validate(); err != nil {
+		t.Fatalf("a freshly taken fence did not validate: %v", err)
+	}
+	if _, err = store.Database().Exec(`DELETE FROM leases WHERE resource=?`, workflow.ExecutionFenceResource("wf")); err != nil {
+		t.Fatal(err)
+	}
+	if err = fence.Validate(); !errors.Is(err, workflow.ErrExecutionFenceLost) {
+		t.Fatalf("a lapsed fence still validated: %v", err)
+	}
+}
+
+func TestExecutionFenceIsScopedToOneWorkflowID(t *testing.T) {
+	_, store := cliWorkflowRepo(t)
+	defer store.Close()
+	held, err := fenceWorkflowExecution(store, "wf-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Release()
+	if _, err = fenceWorkflowExecution(store, "wf-a"); !errors.Is(err, workflow.ErrExecutionFenceHeld) {
+		t.Fatalf("a second executor of the same workflow was admitted: %v", err)
+	}
+	other, err := fenceWorkflowExecution(store, "wf-b")
+	if err != nil {
+		t.Fatalf("a distinct workflow was blocked by an unrelated fence: %v", err)
+	}
+	other.Release()
+}
+
+func TestDistinctWorkflowsRunConcurrentlyInSeparateWorktrees(t *testing.T) {
+	primary, store := cliWorkflowRepo(t)
+	defer store.Close()
+	alternative := filepath.Join(t.TempDir(), "alternative")
+	if out, err := exec.Command("git", "-C", primary, "worktree", "add", "-b", "alternative", alternative).CombinedOutput(); err != nil {
+		t.Fatalf("git worktree add: %v %s", err, out)
+	}
+	shared, err := workflow.OpenRepositorySQLite(alternative)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shared.Close()
+	if store.Path() != shared.Path() {
+		t.Fatalf("worktrees did not share one durable store: %q vs %q", store.Path(), shared.Path())
+	}
+	for _, item := range []struct{ id, repo string }{{"wf-primary", primary}, {"wf-alternative", alternative}} {
+		fake := cliFakeOpenCodeFor(t, "sleep 1", item.id)
+		args := []string{"--id", item.id, "--request", "change a", "--accept", "test \"$(cat a.txt)\" = new", "--check", "true", "--path", "a.txt", "--opencode", fake, "--timeout", "10s"}
+		if err = workflowStart(store, item.repo, args, &bytes.Buffer{}); err != nil {
+			t.Fatalf("%s: %v", item.id, err)
+		}
+	}
+	results := make(chan error, 2)
+	go func() { results <- workflowRun(store, primary, []string{"wf-primary"}, &bytes.Buffer{}) }()
+	go func() { results <- workflowRun(shared, alternative, []string{"wf-alternative"}, &bytes.Buffer{}) }()
+	for i := 0; i < 2; i++ {
+		if err = <-results; err != nil {
+			t.Fatalf("a distinct workflow was refused or disturbed: %v", err)
+		}
+	}
+	for _, id := range []string{"wf-primary", "wf-alternative"} {
+		w, getErr := store.Get(id)
+		if getErr != nil || w.State != workflow.StateCandidateFrozen {
+			t.Fatalf("%s=%+v err=%v", id, w, getErr)
+		}
 	}
 }
 

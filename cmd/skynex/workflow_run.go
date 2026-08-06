@@ -272,6 +272,21 @@ func refuseWhileDetachedWorkerIsLive(store *workflow.SQLiteStore, id, operation 
 	return fmt.Errorf("workflow %s already has a live detached %s worker (job %s, pid %d); wait for its completion notification, or run `skynex workflow abort %s --idempotency-key abort-%s` to stop it before running %s in the foreground", id, job.Operation, job.ID, job.PID, id, id, operation)
 }
 
+// refuseWhileExecutionFenceIsHeld rejects an execution request before it can
+// create durable state, scoped strictly to this workflow ID. A different
+// workflow is never affected, so alternative solutions to the same problem run
+// concurrently in their own worktrees and branches.
+func refuseWhileExecutionFenceIsHeld(store *workflow.SQLiteStore, id string) error {
+	held, err := store.ExecutionFenceHeld(id, time.Now())
+	if err != nil {
+		return err
+	}
+	if !held {
+		return nil
+	}
+	return fmt.Errorf("%w: workflow %s is already being executed; wait for it to finish, or retry in %s if that process died", workflow.ErrExecutionFenceHeld, id, workflowExecutionFenceTTL)
+}
+
 // workflowExecutionFenceTTL bounds how long a crashed executor can hold a
 // workflow. It matches the job liveness window, so a process that dies without
 // releasing its fence frees the workflow on the same schedule as a dead worker.
@@ -286,10 +301,10 @@ const workflowExecutionFenceHeartbeat = 5 * time.Second
 // it covers the detached worker and the foreground CLI alike because both enter
 // through workflowRunContext.
 type executionFence struct {
-	store           *workflow.SQLiteStore
-	resource, owner string
-	token           string
-	stop, done      chan struct{}
+	store                       *workflow.SQLiteStore
+	workflowID, resource, owner string
+	token                       string
+	stop, done                  chan struct{}
 }
 
 func fenceWorkflowExecution(store *workflow.SQLiteStore, id string) (*executionFence, error) {
@@ -298,17 +313,18 @@ func fenceWorkflowExecution(store *workflow.SQLiteStore, id string) (*executionF
 		return nil, err
 	}
 	fence := &executionFence{
-		store:    store,
-		resource: "workflow-execution:" + id,
-		owner:    fmt.Sprintf("execution-pid-%d-%s", os.Getpid(), token[:16]),
-		token:    token,
-		stop:     make(chan struct{}),
-		done:     make(chan struct{}),
+		store:      store,
+		workflowID: id,
+		resource:   workflow.ExecutionFenceResource(id),
+		owner:      fmt.Sprintf("execution-pid-%d-%s", os.Getpid(), token[:16]),
+		token:      token,
+		stop:       make(chan struct{}),
+		done:       make(chan struct{}),
 	}
 	now := time.Now()
 	if _, err = store.AcquireLease(fence.resource, fence.owner, fence.token, now, now.Add(workflowExecutionFenceTTL)); err != nil {
 		if errors.Is(err, workflow.ErrLeaseConflict) {
-			return nil, fmt.Errorf("workflow %s is already being executed by another process; wait for it to finish, or retry in %s if that process died", id, workflowExecutionFenceTTL)
+			return nil, fmt.Errorf("%w: workflow %s is already being executed; wait for it to finish, or retry in %s if that process died", workflow.ErrExecutionFenceHeld, id, workflowExecutionFenceTTL)
 		}
 		return nil, err
 	}
@@ -321,11 +337,28 @@ func fenceWorkflowExecution(store *workflow.SQLiteStore, id string) (*executionF
 			case <-fence.stop:
 				return
 			case beat := <-ticker.C:
-				_, _ = store.HeartbeatLease(fence.resource, fence.owner, fence.token, beat, beat.Add(workflowExecutionFenceTTL))
+				if _, err := store.HeartbeatLease(fence.resource, fence.owner, fence.token, beat, beat.Add(workflowExecutionFenceTTL)); err == nil {
+					continue
+				}
+				// The claim lapsed. Reclaim it only while it is genuinely free;
+				// if another executor took it, Validate stops this run before
+				// the next mutation instead of acting on a stale claim.
+				_, _ = store.AcquireLease(fence.resource, fence.owner, fence.token, beat, beat.Add(workflowExecutionFenceTTL))
 			}
 		}
 	}()
 	return fence, nil
+}
+
+// Validate re-proves exclusivity against the durable lease. Every step that
+// mutates the worktree or adopts another executor's work calls it first, so a
+// heartbeat that silently lapsed cannot let two processes both believe they own
+// the workflow.
+func (f *executionFence) Validate() error {
+	if err := f.store.ValidateLease(f.resource, f.owner, f.token, time.Now()); err != nil {
+		return fmt.Errorf("%w for workflow %s; stopping before mutating", workflow.ErrExecutionFenceLost, f.workflowID)
+	}
+	return nil
 }
 
 func (f *executionFence) Release() {
@@ -442,6 +475,9 @@ func workflowRunContext(ctx context.Context, store *workflow.SQLiteStore, repo s
 			// writing the patch and committing it. Reconcile the worktree under
 			// the lease before dispatching the same attempt again.
 			if inherited {
+				if err = fence.Validate(); err != nil {
+					return err
+				}
 				adopted, resumeErr := scheduler.ResumeAttempt(&execution.Broker{Store: store, Seal: seal}, attempt)
 				if resumeErr != nil {
 					return resumeErr
@@ -472,6 +508,9 @@ func workflowRunContext(ctx context.Context, store *workflow.SQLiteStore, repo s
 			}
 			result, err := adapter.Run(ctx, execution.OpenCodeRequest{InvocationID: "invoke:" + attempt.ID, Attempt: attempt, Seal: seal, Checks: checks, Prompt: input.Request + "\nAcceptance: " + strings.Join(criteria, "; ")})
 			if err != nil {
+				return err
+			}
+			if err = fence.Validate(); err != nil {
 				return err
 			}
 			post, err := (&execution.Broker{Store: store, Seal: seal}).Apply(context.Background(), result)

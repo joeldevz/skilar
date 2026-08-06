@@ -1098,6 +1098,15 @@ func (s *SQLiteStore) HeartbeatLease(resource, owner, token string, now, expires
 	return Lease{resource, owner, token, expiresAt.UTC()}, nil
 }
 
+// ExecutionFenceHeld reports whether any process currently owns the execution
+// fence for the workflow. It is read-only, so a caller can refuse before
+// creating durable state instead of discovering the conflict mid-run.
+func (s *SQLiteStore) ExecutionFenceHeld(workflowID string, now time.Time) (bool, error) {
+	var count int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM leases WHERE resource=? AND expires_at>?`, ExecutionFenceResource(workflowID), now.UnixNano()).Scan(&count)
+	return count > 0, err
+}
+
 func (s *SQLiteStore) ValidateLease(resource, owner, token string, now time.Time) error {
 	var count int
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM leases WHERE resource=? AND owner=? AND fencing_token=? AND expires_at>?`, resource, owner, token, now.UnixNano()).Scan(&count)

@@ -15,7 +15,23 @@ var (
 	ErrIdempotencyReuse  = errors.New("workflow: idempotency key reused with different input")
 	ErrStaleResult       = errors.New("workflow: stale result")
 	ErrLeaseConflict     = errors.New("workflow: lease conflict")
+	// ErrExecutionFenceHeld marks a refusal to execute, not a failure of the
+	// work itself. A caller that turns job failures into durable blockers must
+	// not block a workflow whose only problem is that someone else owns it.
+	ErrExecutionFenceHeld = errors.New("workflow: another process is executing this workflow")
+	// ErrExecutionFenceLost marks the loss of exclusivity mid-run. The holder
+	// must stop before its next mutation rather than act on a stale claim.
+	ErrExecutionFenceLost = errors.New("workflow: execution fence was lost")
 )
+
+// ExecutionFenceResource names the lease granting one process exclusive
+// execution of exactly one workflow. It is scoped strictly to the workflow ID,
+// never to the repository or worktree, so distinct workflows — including
+// alternative solutions to the same problem, each in its own worktree and
+// branch — execute concurrently without ever contending for this fence.
+func ExecutionFenceResource(workflowID string) string {
+	return "workflow-execution:" + workflowID
+}
 
 // Store captures the persistence boundary needed by the engine. A SQLite store
 // can implement this contract without changing transition callers.

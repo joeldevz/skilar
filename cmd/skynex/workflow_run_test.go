@@ -288,6 +288,60 @@ func TestFenceRefusalByAWorkerNeverBlocksTheWorkflow(t *testing.T) {
 	}
 }
 
+func TestDisplacedWorkerLosingTheFenceNeverBlocksTheWorkflow(t *testing.T) {
+	repo, store := cliWorkflowRepo(t)
+	defer store.Close()
+	gate := filepath.Join(t.TempDir(), "gate")
+	fake := cliFakeOpenCode(t, "touch '"+gate+"'; sleep 0.5")
+	args := []string{"--id", "wf", "--request", "change a", "--accept", "true", "--check", "true", "--path", "a.txt", "--opencode", fake, "--timeout", "5s"}
+	if err := workflowStart(store, repo, args, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateWorkflowJobOperation("job-displaced", "wf", "run", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	worker := make(chan error, 1)
+	go func() {
+		worker <- workflowWorker(store, repo, []string{"wf", "--job", "job-displaced"}, &bytes.Buffer{})
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(gate); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("worker never dispatched")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// The worker's fence lapsed and another executor took over while it was
+	// dispatching; it must notice before mutating.
+	if _, err := store.Database().Exec(`DELETE FROM leases WHERE resource=?`, workflow.ExecutionFenceResource("wf")); err != nil {
+		t.Fatal(err)
+	}
+	err := <-worker
+	if !errors.Is(err, workflow.ErrExecutionFenceLost) {
+		t.Fatalf("worker err=%v", err)
+	}
+	job, err := store.WorkflowJob("job-displaced")
+	if err != nil || job.State != workflow.JobCancelled {
+		t.Fatalf("job=%+v err=%v", job, err)
+	}
+	w, err := store.Get("wf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.State == workflow.StateBlocked {
+		t.Fatalf("a displaced worker blocked the workflow: %+v", w)
+	}
+	if w.State != workflow.StateExecuting {
+		t.Fatalf("workflow=%+v", w)
+	}
+	if w.ResumeTarget != "" {
+		t.Fatalf("a displaced worker set a resume target: %q", w.ResumeTarget)
+	}
+}
+
 func TestExecutionFenceStopsARunThatLostExclusivity(t *testing.T) {
 	repo, store := cliWorkflowRepo(t)
 	defer store.Close()

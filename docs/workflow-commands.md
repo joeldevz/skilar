@@ -40,7 +40,7 @@ Only a process that owns the work may perform that reconciliation. Executing a w
 
 **The fence is scoped strictly to one workflow ID**, never to the repository or the worktree. Any number of distinct workflows run at the same time against the same repository — including alternative solutions to the same problem, each in its own worktree and branch. Only a second executor of the *same* workflow is refused.
 
-That refusal happens before durable state exists. `run --detach` checks the fence before creating its job record, because a worker spawned into a conflict would finish as failed and a failed job is a durable blocker — queueing against a healthy executor would otherwise abort the very run it collided with. Should a worker still lose that race, its refusal is recorded as cancelled rather than failed, so it never blocks the workflow that legitimately owns the fence.
+That refusal happens before durable state exists. `run --detach` checks the fence before creating its job record, because a worker spawned into a conflict would finish as failed and a failed job is a durable blocker — queueing against a healthy executor would otherwise abort the very run it collided with. Should a worker still lose that race, or lose a fence it already held, it is recorded as cancelled rather than failed. A displaced worker did not fail; it stopped before mutating, so it never blocks the workflow under whichever executor legitimately owns the fence now.
 
 Exclusivity is re-proven, not assumed: before adopting another executor's mutation and before committing its own, a run revalidates its fence against the durable lease and stops if it has been lost, so a heartbeat that silently lapsed cannot leave two processes both believing they own the workflow.
 

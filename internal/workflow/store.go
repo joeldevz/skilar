@@ -24,6 +24,16 @@ var (
 	ErrExecutionFenceLost = errors.New("workflow: execution fence was lost")
 )
 
+// ExecutionDisplaced reports whether an error means the executor does not own
+// the workflow's execution fence: it was refused the fence, or it lost one it
+// held. Neither is a failure of the work — a displaced executor stops before
+// mutating — so a caller that turns failures into durable blockers must treat
+// both alike, or it blocks the workflow under whoever legitimately owns the
+// fence now.
+func ExecutionDisplaced(err error) bool {
+	return errors.Is(err, ErrExecutionFenceHeld) || errors.Is(err, ErrExecutionFenceLost)
+}
+
 // ExecutionFenceResource names the lease granting one process exclusive
 // execution of exactly one workflow. It is scoped strictly to the workflow ID,
 // never to the repository or worktree, so distinct workflows — including

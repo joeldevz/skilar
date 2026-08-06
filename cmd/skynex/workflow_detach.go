@@ -192,10 +192,12 @@ func workflowWorker(store *workflow.SQLiteStore, repo string, args []string, out
 	if err != nil {
 		state = workflow.JobFailed
 		message = err.Error()
-		// This worker was never admitted, so it neither did nor broke any work.
-		// Recording it as failed would block the workflow that legitimately
-		// owns the fence, turning a refusal into a durable blocker.
-		if errors.Is(err, workflow.ErrExecutionFenceHeld) {
+		// This worker does not own the workflow: it was refused the execution
+		// fence, or it lost one it held and stopped before mutating. Recording
+		// either as failed would block the workflow under whichever executor
+		// legitimately owns the fence now, turning displacement into a durable
+		// blocker.
+		if workflow.ExecutionDisplaced(err) {
 			state = workflow.JobCancelled
 		}
 	}

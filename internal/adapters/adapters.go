@@ -1,7 +1,6 @@
 package adapters
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -157,11 +156,6 @@ func installSkillsRepo(pkg *models.PackageDefinition, req *models.InstallRequest
 		}
 	}
 
-	// Inject advisor model into opencode.json if configured
-	if req.Advisor != nil && req.Advisor.Enabled {
-		injectAdvisorModel(req.Advisor.Model)
-	}
-
 	return &models.InstallResult{
 		PackageID:        pkg.ID,
 		RequestedVersion: version,
@@ -232,39 +226,4 @@ func trimNewline(s string) string {
 		s = s[:len(s)-1]
 	}
 	return s
-}
-
-// injectAdvisorModel updates the installed opencode.json with the chosen advisor model.
-func injectAdvisorModel(model string) {
-	configPath := filepath.Join(paths.OpencodeDir(), "opencode.json")
-
-	data, err := readExistingFile(configPath)
-	if err != nil {
-		return // Silently skip if not installed
-	}
-
-	var config map[string]interface{}
-	if err := json.Unmarshal(data, &config); err != nil {
-		return
-	}
-
-	agents, ok := config["agent"].(map[string]interface{})
-	if !ok {
-		return
-	}
-
-	advisorAgent, ok := agents["advisor"].(map[string]interface{})
-	if !ok {
-		return
-	}
-
-	advisorAgent["model"] = model
-	agents["advisor"] = advisorAgent
-	config["agent"] = agents
-
-	out, err := json.MarshalIndent(config, "", "  ")
-	if err != nil {
-		return
-	}
-	_ = writeFile(configPath, string(append(out, '\n')))
 }

@@ -37,7 +37,7 @@ _skynex_completions() {
                     return 0
                     ;;
                 install)
-                    COMPREPLY=($(compgen -W "--package --target --version --non-interactive --yes --verbose --trust-setup-scripts --state-dir --advisor-model" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "--package --target --version --non-interactive --yes --verbose --trust-setup-scripts --state-dir" -- "${cur}"))
                     return 0
                     ;;
             esac

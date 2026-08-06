@@ -77,6 +77,9 @@ func SaveConfig(path string, req *models.InstallRequest, existing map[string]int
 	defaults := cloneMap(asMap(cfg["defaults"]))
 	defaults["interactive"] = req.Interactive
 	defaults["targets"] = req.Targets
+	if req.NeuroxSelectionSet {
+		defaults["neuroxEnabled"] = req.NeuroxEnabled
+	}
 	cfg["defaults"] = defaults
 	pkgs := cloneMap(asMap(cfg["packages"]))
 	for _, pkgID := range req.Packages {
@@ -86,13 +89,8 @@ func SaveConfig(path string, req *models.InstallRequest, existing map[string]int
 		pkgs[pkgID] = pkg
 	}
 	cfg["packages"] = pkgs
-	if req.Advisor != nil {
-		advisor := cloneMap(asMap(cfg["advisor"]))
-		advisor["enabled"] = req.Advisor.Enabled
-		advisor["model"] = req.Advisor.Model
-		advisor["maxUses"] = req.Advisor.MaxUses
-		cfg["advisor"] = advisor
-	}
+	// Migrate the retired Advisor setting away on the next ordinary save.
+	delete(cfg, "advisor")
 	return atomicWrite(path, cfg, expectedHash...)
 }
 
@@ -123,12 +121,6 @@ func SaveLock(path string, results []*models.InstallResult, req *models.InstallR
 		pkgs[r.PackageID] = map[string]interface{}{
 			"requestedVersion": r.RequestedVersion, "resolvedVersion": r.ResolvedVersion,
 			"resolvedRef": r.ResolvedRef, "commit": r.Commit, "targets": targets,
-		}
-	}
-	if req.Advisor != nil && req.Advisor.Enabled {
-		lock["advisor"] = map[string]interface{}{
-			"enabled": true, "model": req.Advisor.Model,
-			"installedAt": time.Now().UTC().Format(time.RFC3339),
 		}
 	}
 	return atomicWrite(path, lock)

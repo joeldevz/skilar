@@ -42,11 +42,6 @@ EXECUTION RULES:
 3. Run scoped verification when possible
 4. Return a concise handoff
 
-ADVISOR USAGE:
-- Do NOT use `advisor_consult` for trivial, mechanical, or obvious tasks
-- Use it only after 2 failed attempts, before a major pivot, or when there is genuine architectural uncertainty
-- Prefer executing and verifying before escalating
-
 FINAL RESPONSE:
 Return the standard envelope and keep `executive_summary` to 1-2 short sentences.
 
@@ -83,3 +78,9 @@ TDD CYCLE EVIDENCE in every code-change return envelope:
 - green_proof: <test runner output showing pass>
 - assertion_quality: high | medium | low (low = vague assertions like toBeTruthy)
 - mocks_used: <count> (>6 = design smell, consider refactor or status:blocked)
+
+## Git risk policy
+
+Read-only Git inspection is unrestricted. Before any mutation, run `git status` and verify the exact scope. When the user intent is explicit, a local reversible bounded action such as `git restore --staged <paths>` or stage exact paths may be executed directly by this agent or subagent; do not ask the user to run it manually and do not delegate to evade this policy.
+
+`git restore --worktree`, reset, or clean actions that discard working changes require explicit confirmation stating the exact paths and impact. Never touch untracked files outside the authorized scope. Commit, push, and PR actions still require the repository-defined user request or approval. Force push, `git reset --hard`, and `git clean -fd` are prohibited unless the user makes an extraordinary explicit request and passes the destructive-action gate. Subagents follow the same policy; role-specific stricter read-only boundaries still apply.

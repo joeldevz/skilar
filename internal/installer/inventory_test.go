@@ -29,6 +29,23 @@ func TestListSnapshotsSortsTrustedCreatedAtAndReportsSafety(t *testing.T) {
 	}
 }
 
+func TestListSnapshotsTreatsRestorableV1WithoutStatusAsPrunableLegacy(t *testing.T) {
+	state := t.TempDir()
+	base := filepath.Join(state, "snapshots")
+	if err := os.MkdirAll(base, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeSnapshotFixture(t, base, "00000000000000000000000000000001", `{"version":1,"entries":[{"path":"x","kind":"file"}]}`, "payload")
+
+	items, err := ListSnapshots(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Status != "legacy" || !items[0].Restorable || !items[0].EligibleToPrune {
+		t.Fatalf("legacy inventory = %#v", items)
+	}
+}
+
 func writeSnapshotFixture(t *testing.T, base, id, manifest, payload string) {
 	t.Helper()
 	dir := filepath.Join(base, id)

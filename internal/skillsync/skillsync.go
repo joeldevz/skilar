@@ -528,7 +528,13 @@ func readFSFileVerified(f fs.FS, name string) ([]byte, error) {
 	b, readErr := io.ReadAll(io.LimitReader(opened, maxSkillFileBytes+1))
 	stat, statErr := opened.Stat()
 	closeErr := opened.Close()
-	if readErr != nil || statErr != nil || closeErr != nil || !os.SameFile(before, stat) || stat.Mode().Type() != before.Mode().Type() {
+	if readErr != nil || statErr != nil || closeErr != nil || stat.Mode().Type() != before.Mode().Type() {
+		return nil, fmt.Errorf("bundle file changed while reading %q", name)
+	}
+	// Virtual bundles (embed.FS) have no inode identity for os.SameFile to
+	// compare, and an unconditional comparison would reject every embedded
+	// entry. Only os-backed bundles can be re-identified.
+	if safefs.HasFileIdentity(before) && !os.SameFile(before, stat) {
 		return nil, fmt.Errorf("bundle file changed while reading %q", name)
 	}
 	if !safefs.SingleLink(stat) {

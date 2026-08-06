@@ -25,11 +25,11 @@ const (
 func ChooseBackupCapacity(input io.Reader, output io.Writer, summary string, canPrune bool) BackupCapacityChoice {
 	choice := BackupCapacityChoice(BackupCancel)
 	options := []huh.Option[string]{
-		huh.NewOption("Manage backups", string(BackupManage)),
+		huh.NewOption("Manage backups: keep 3 and continue (recommended)", string(BackupManage)).Selected(true),
 		huh.NewOption("Cancel", string(BackupCancel)),
 	}
 	if canPrune {
-		options = append([]huh.Option[string]{huh.NewOption("Remove oldest backup and continue", string(BackupRemoveOldest)).Selected(true)}, options...)
+		options = append(options[:1], append([]huh.Option[string]{huh.NewOption("Remove oldest backup and continue", string(BackupRemoveOldest))}, options[1:]...)...)
 	}
 	field := huh.NewSelect[string]().Title(summary).Options(options...).Value((*string)(&choice))
 	form := huh.NewForm(huh.NewGroup(field)).WithAccessible(accessibleMode()).WithTheme(wizardTheme(noColor())).WithInput(input).WithOutput(output)
@@ -43,16 +43,6 @@ func ConfirmBackupPrune(input io.Reader, output io.Writer, count int) bool {
 	confirmed := false
 	form := huh.NewForm(huh.NewGroup(huh.NewConfirm().Title(fmt.Sprintf("Remove %d eligible backup(s)?", count)).Affirmative("Remove").Negative("Cancel").Value(&confirmed))).WithAccessible(accessibleMode()).WithTheme(wizardTheme(noColor())).WithInput(input).WithOutput(output)
 	return form.Run() == nil && confirmed
-}
-
-// AdvisorModels is retained for callers that consume the curated advisor catalog.
-var AdvisorModels = []models.AdvisorModel{
-	{ID: "anthropic/claude-opus-4-6", DisplayName: "Claude Opus 4.6", Provider: "Anthropic", Description: "Most capable — best for complex strategic decisions"},
-	{ID: "anthropic/claude-sonnet-4-6", DisplayName: "Claude Sonnet 4.6", Provider: "Anthropic", Description: "Good balance of capability and cost"},
-	{ID: "openai/gpt-4o", DisplayName: "GPT-4o", Provider: "OpenAI", Description: "Strong reasoning, multi-modal"},
-	{ID: "openai/o3", DisplayName: "o3", Provider: "OpenAI", Description: "Advanced reasoning model"},
-	{ID: "google/gemini-2.5-pro", DisplayName: "Gemini 2.5 Pro", Provider: "Google", Description: "Strong reasoning, large context window"},
-	{ID: "anthropic/claude-haiku-4-5", DisplayName: "Claude Haiku 4.5", Provider: "Anthropic", Description: "Fast and cheap — good for simple advice"},
 }
 
 // ResolveSkillDecisions presents only actionable modified entries. Unknown

@@ -51,6 +51,13 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "workflow" {
+		if err := runWorkflowCLI(os.Args[2:], "", os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "Workflow error:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	args := parseArgs()
 	if args.ParseError != "" {
 		fmt.Fprintf(os.Stderr, "Error: %s\n", args.ParseError)
@@ -245,7 +252,6 @@ type cliArgs struct {
 	Help              bool
 	ListPackages      bool
 	ListVersions      string
-	AdvisorModel      string
 	ShowVersion       bool
 	Doctor            bool
 	Install           bool
@@ -272,6 +278,8 @@ type cliArgs struct {
 	BackupKeep        int
 	LegacyVersion     bool
 	ParseError        string
+	WithNeurox        bool
+	WithoutNeurox     bool
 }
 
 func parseArgs() *cliArgs {
@@ -438,13 +446,13 @@ func parseArgsFrom(osArgs []string) *cliArgs {
 			}
 		case "--trust-setup-scripts":
 			args.TrustScripts = true
+		case "--with-neurox":
+			args.WithNeurox = true
+		case "--without-neurox":
+			args.WithoutNeurox = true
 		case "--state-dir":
 			if v, ok := value(&i, "--state-dir"); ok {
 				args.StateDir = v
-			}
-		case "--advisor-model":
-			if v, ok := value(&i, "--advisor-model"); ok {
-				args.AdvisorModel = v
 			}
 		case "--cleanup-deprecated":
 			args.CleanupDeprecated = true
@@ -463,7 +471,14 @@ func parseArgsFrom(osArgs []string) *cliArgs {
 			}
 		case "status":
 			args.Status = true
+		default:
+			if isFlag(osArgs[i]) && args.ParseError == "" {
+				args.ParseError = fmt.Sprintf("unknown option: %s", osArgs[i])
+			}
 		}
+	}
+	if args.WithNeurox && args.WithoutNeurox {
+		args.ParseError = "--with-neurox and --without-neurox are mutually exclusive"
 	}
 	return args
 }
@@ -526,21 +541,14 @@ func resolveNonInteractive(args *cliArgs, cat *models.Catalog, cfg map[string]in
 	}
 
 	req := &models.InstallRequest{
-		Packages:          args.Packages,
-		Targets:           args.Targets,
-		Versions:          versions,
-		Interactive:       false,
-		CleanupDeprecated: args.CleanupDeprecated,
-		TrustSetupScripts: args.TrustScripts,
-	}
-
-	// Advisor config from flag
-	if args.AdvisorModel != "" {
-		req.Advisor = &models.AdvisorConfig{
-			Enabled: true,
-			Model:   args.AdvisorModel,
-			MaxUses: 3,
-		}
+		Packages:           args.Packages,
+		Targets:            args.Targets,
+		Versions:           versions,
+		Interactive:        false,
+		CleanupDeprecated:  args.CleanupDeprecated,
+		TrustSetupScripts:  args.TrustScripts,
+		NeuroxEnabled:      !args.WithoutNeurox,
+		NeuroxSelectionSet: true,
 	}
 
 	return req, nil
@@ -791,6 +799,11 @@ func handleUpdate(pkg string, stateDir string, cleanupDeprecated bool, trustScri
 	}
 
 	request := newUpdateInstallRequest(packagesToUpdate, targets, versions, stateDir, cleanupDeprecated, trustScripts...)
+	if defaults, ok := cfg["defaults"].(map[string]interface{}); ok {
+		if enabled, ok := defaults["neuroxEnabled"].(bool); ok {
+			request.NeuroxEnabled, request.NeuroxSelectionSet = enabled, true
+		}
+	}
 
 	// Preflight
 	issues := preflight.Run(request, cat)
@@ -857,13 +870,15 @@ func handleUpdate(pkg string, stateDir string, cleanupDeprecated bool, trustScri
 func newUpdateInstallRequest(packages, targets []string, versions map[string]string, stateDir string, cleanupDeprecated bool, trustScripts ...bool) *models.InstallRequest {
 	trust := len(trustScripts) > 0 && trustScripts[0]
 	return &models.InstallRequest{
-		Packages:          packages,
-		Targets:           targets,
-		Versions:          versions,
-		Interactive:       false,
-		StateDir:          stateDir,
-		CleanupDeprecated: cleanupDeprecated,
-		TrustSetupScripts: trust,
+		Packages:           packages,
+		Targets:            targets,
+		Versions:           versions,
+		Interactive:        false,
+		StateDir:           stateDir,
+		CleanupDeprecated:  cleanupDeprecated,
+		TrustSetupScripts:  trust,
+		NeuroxEnabled:      true,
+		NeuroxSelectionSet: true,
 	}
 }
 
@@ -989,6 +1004,7 @@ func printUsage() {
 	fmt.Println(`Usage: skynex [command] [options]
 
 Commands:
+  workflow <command>      Inspect or control managed workflows
   install                 Interactive installer (TUI)
   backup list              List retained recovery backups
   backup prune             Remove eligible backups (interactive)
@@ -1026,7 +1042,6 @@ Options:
    --package PACKAGE          Package to install (skills). Repeatable.
    --target TARGET            Target: claude, opencode, or both. Repeatable.
    --version PKG=VER          Version for a package (e.g., skills=latest). Repeatable.
-   --advisor-model MODEL      Advisor model (e.g., anthropic/claude-opus-4-6).
     --cleanup-deprecated       Remove deprecated skynex-managed files (interactive install: prompts; update: flag only).
     --dry-run                  Print the deterministic install plan and run read-only preflight.
    --verbose                 Show detailed install progress.
@@ -1034,6 +1049,8 @@ Options:
    --non-interactive          Skip prompts, require all inputs via flags.
    --yes, -y                  Skip confirmation prompt.
    --trust-setup-scripts      Trust external setup scripts.
+	--with-neurox              Install the Neurox MCP and OpenCode plugin (recommended default).
+	--without-neurox           Do not install Neurox integration.
    --state-dir DIR            State directory (default: ~/.config/skynex).
    --list-packages            List available packages.
    --list-versions PKG        List versions for a package.

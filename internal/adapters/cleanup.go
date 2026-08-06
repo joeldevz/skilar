@@ -1,6 +1,8 @@
 package adapters
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"io/fs"
@@ -15,15 +17,22 @@ import (
 
 // DeprecatedFile is a single deprecated file to potentially remove.
 type DeprecatedFile struct {
-	Path   string // absolute path
-	Root   string // absolute, trusted cleanup root
-	Target string // "opencode" or "claude"
+	Path           string // absolute path
+	Root           string // absolute, trusted cleanup root
+	Target         string // "opencode" or "claude"
+	ExpectedDigest string // when set, only this known managed content may be removed
 }
 
 // DeprecatedManifest defines all deprecated skynex-managed files.
 // Maps target → list of relative paths (relative to ~/.config/opencode or ~/.claude).
 var DeprecatedManifest = map[string][]string{
 	"opencode": {
+		"agents/advisor.md",
+		"plugins/advisor.ts",
+		"skills/_shared/advisor-protocol.md",
+		"agents/manager.md",
+		"agents/linear-orchestrator.md",
+		"commands/linear.md",
 		"commands/onboard.md",
 		"tools/advisor.ts",
 		"commands/verify-skill.md",
@@ -35,6 +44,7 @@ var DeprecatedManifest = map[string][]string{
 		"skills/typescript-advanced-types",
 	},
 	"claude": {
+		"agents/advisor.md",
 		"skills/onboard/SKILL.md",
 		"agents/product-planner.md",
 		"skills/verify-skill/SKILL.md",
@@ -55,6 +65,15 @@ var DeprecatedManifest = map[string][]string{
 		"skills/estimate",
 		"skills/plan-rewrite",
 	},
+}
+
+var legacyExactDigests = map[string]string{
+	"agents/advisor.md":                  "0602a2572e6db69370508ec426a27f119f36efda76ecfe8fb2132b736b68eb9d",
+	"plugins/advisor.ts":                 "6cd3980c927468d5bfce07b0ff1da18e66856d904fc862e9500005bdbc2f0115",
+	"skills/_shared/advisor-protocol.md": "4fd594d171c6b17b4dd65c5fdd4e497b15cf949e9ef638c283b57907998cfd76",
+	"agents/manager.md":                  "af28404635ef21a56134be959008aa302dbe48296e64c8700d25dc737d3b1893",
+	"agents/linear-orchestrator.md":      "63cd6ec3272ae96c28b06ce798b1139cf10142974dbf075350957e89ecb406ca",
+	"commands/linear.md":                 "149dee85fe4a81963b3a5572e375fefa4fae54e9a09385a986390a2d4b9122f5",
 }
 
 // FindDeprecatedFiles scans target directories for deprecated files.
@@ -82,6 +101,12 @@ func FindDeprecatedFiles() (map[string][]DeprecatedFile, error) {
 					Path:   absPath,
 					Root:   baseDir,
 					Target: target,
+					ExpectedDigest: func() string {
+						if target == "opencode" {
+							return legacyExactDigests[relPath]
+						}
+						return ""
+					}(),
 				})
 			} else if !os.IsNotExist(err) {
 				return nil, fmt.Errorf("scan deprecated %s path %s: %w", target, absPath, err)
@@ -107,6 +132,22 @@ func RemoveDeprecatedFiles(files []DeprecatedFile) (int, error) {
 			return 0, err
 		}
 	}
+	filtered := files[:0]
+	for _, f := range files {
+		if f.ExpectedDigest != "" {
+			raw, err := os.ReadFile(f.Path)
+			if err != nil {
+				return 0, err
+			}
+			sum := sha256.Sum256(raw)
+			if hex.EncodeToString(sum[:]) != f.ExpectedDigest {
+				fmt.Printf("    Preserving modified deprecated file: %s\n", f.Path)
+				continue
+			}
+		}
+		filtered = append(filtered, f)
+	}
+	files = filtered
 
 	count := 0
 	roots := make(map[string]*safefs.Root)

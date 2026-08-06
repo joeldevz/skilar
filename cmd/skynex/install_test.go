@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/joeldevz/skynex/internal/installer"
 	"github.com/joeldevz/skynex/internal/models"
@@ -41,6 +42,37 @@ func installTestDeps(events *[]string) installDependencies {
 	}
 }
 
+func TestRunInstallManageBackupsPrunesToThreeAndContinues(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	events := []string{}
+	deps := installTestDeps(&events)
+	deps.listSnapshots = func(string) ([]installer.Snapshot, error) {
+		snapshots := make([]installer.Snapshot, 5)
+		for i := range snapshots {
+			snapshots[i] = installer.Snapshot{ID: "retained", CreatedAt: time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)}
+		}
+		return snapshots, nil
+	}
+	deps.chooseBackupCapacity = func(string, bool) prompts.BackupCapacityChoice {
+		return prompts.BackupManage
+	}
+	pruned := 0
+	deps.pruneSnapshots = func(_ string, count int) (int, error) {
+		pruned = count
+		return count, nil
+	}
+
+	if err := runInstall(&cliArgs{StateDir: t.TempDir()}, deps); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(events, []string{"catalog", "config", "wizard", "preflight", "apply", "apply-callback"}) {
+		t.Fatalf("events = %v", events)
+	}
+	if pruned != 2 {
+		t.Fatalf("pruned = %d, want 2 (keep 3)", pruned)
+	}
+}
+
 func TestRunInstallInteractiveSuccessAppliesInOrder(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	events := []string{}
@@ -64,6 +96,29 @@ func TestRunInstallInteractiveSuccessAppliesInOrder(t *testing.T) {
 	}
 	if !mutationCalled {
 		t.Fatal("successful install did not execute its mutation callback")
+	}
+}
+
+func TestRunInstallSuccessSummarySharedByInteractiveAndNonInteractive(t *testing.T) {
+	for _, nonInteractive := range []bool{false, true} {
+		t.Run(map[bool]string{false: "interactive", true: "noninteractive"}[nonInteractive], func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			events := []string{}
+			deps := installTestDeps(&events)
+			args := &cliArgs{StateDir: t.TempDir(), NonInteractive: nonInteractive}
+			if nonInteractive {
+				args.Packages, args.Targets, args.Yes = []string{"pkg"}, []string{"opencode"}, true
+				deps.apply = func(*installer.Plan, func() error) error { events = append(events, "apply"); return nil }
+			}
+			var output strings.Builder
+			deps.output, deps.errorOutput = &output, &output
+			if err := runInstall(args, deps); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(output.String(), "✓ Installation complete.") || !strings.Contains(output.String(), "Neurox:") || !strings.Contains(output.String(), "State files:") {
+				t.Fatalf("summary=%q", output.String())
+			}
+		})
 	}
 }
 
@@ -117,6 +172,54 @@ func TestRunInstallApplyCallbackErrorPropagates(t *testing.T) {
 	if !reflect.DeepEqual(events, []string{"config", "preflight", "apply", "apply-callback"}) {
 		t.Fatalf("events = %v", events)
 	}
+	if output, ok := deps.output.(*strings.Builder); ok && strings.Contains(output.String(), "Installation complete") {
+		t.Fatalf("failure printed success: %q", output.String())
+	}
+}
+
+func TestInstallSummaryStableSuccessNoopNeuroxAndSnapshot(t *testing.T) {
+	plan := &installer.Plan{Version: 1, Operations: []installer.Operation{
+		{Kind: installer.WriteState, Destination: "/state/z.lock"},
+		{Kind: installer.InstallTarget, PackageID: "zeta", Target: "opencode", Destination: "/open"},
+		{Kind: installer.InstallTarget, PackageID: "alpha", Target: "claude", Destination: "/claude"},
+		{Kind: installer.WriteState, Destination: "/state/a.json"},
+		{Kind: installer.CleanupDeprecated, Destination: "/state"},
+	}}
+	results := []*models.InstallResult{
+		{PackageID: "zeta", ResolvedVersion: "2", Targets: map[string]*models.TargetResult{"opencode": {Status: "installed", Artifacts: []string{"/open/z", "/open/a"}}}},
+		{PackageID: "alpha", ResolvedVersion: "1", Targets: map[string]*models.TargetResult{"claude": {Status: "installed", Artifacts: []string{"/claude"}}}},
+	}
+	request := &models.InstallRequest{NeuroxSelectionSet: true, NeuroxEnabled: true}
+	issues := []*models.ValidationIssue{{Level: "warning", Message: "z warning"}, {Level: "warning", Message: "a warning"}}
+	var first, second strings.Builder
+	snapshot := &installer.Snapshot{ID: "snap-123"}
+	if err := renderInstallSummary(&first, request, plan, results, issues, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if err := renderInstallSummary(&second, request, plan, results, issues, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if first.String() != second.String() {
+		t.Fatal("summary is nondeterministic")
+	}
+	got := first.String()
+	for _, want := range []string{"✓ Installation complete.", "alpha @ 1", "zeta @ 2", "claude -> /claude", "opencode -> /open", "artifact: /open/a", "Neurox: enabled", "/state/a.json", "Cleanup: applied", "a warning", "Recovery snapshot: snap-123"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("summary missing %q: %s", want, got)
+		}
+	}
+	if strings.Index(got, "alpha @ 1") > strings.Index(got, "zeta @ 2") || strings.Index(got, "a warning") > strings.Index(got, "z warning") {
+		t.Fatalf("summary not sorted: %s", got)
+	}
+
+	unchanged := []*models.InstallResult{{PackageID: "alpha", ResolvedVersion: "1", Targets: map[string]*models.TargetResult{"claude": {Status: "unchanged"}}}}
+	var noop strings.Builder
+	if err := renderInstallSummary(&noop, &models.InstallRequest{}, plan, unchanged, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(noop.String(), "Installation complete") || !strings.Contains(noop.String(), "Nothing changed") || !strings.Contains(noop.String(), "Neurox: preserved") {
+		t.Fatalf("bad no-op summary: %s", noop.String())
+	}
 }
 
 func TestRunInstallExactCurrentSkipsWizardAndApply(t *testing.T) {
@@ -147,6 +250,46 @@ func TestRunInstallExactCurrentSkipsWizardAndApply(t *testing.T) {
 	}
 }
 
+func TestRunInstallNonInteractiveExactCurrentSkipsSnapshotAndApply(t *testing.T) {
+	events := []string{}
+	deps := installTestDeps(&events)
+	deps.exactRequestCurrent = func(string, string, *models.InstallRequest) bool {
+		events = append(events, "current")
+		return true
+	}
+	deps.preflight = func(*models.InstallRequest, *models.Catalog, preflight.Options) []*models.ValidationIssue {
+		events = append(events, "preflight")
+		return nil
+	}
+	deps.listSnapshots = func(string) ([]installer.Snapshot, error) {
+		events = append(events, "snapshots")
+		return nil, nil
+	}
+	deps.apply = func(*installer.Plan, func() error) error {
+		events = append(events, "apply")
+		return nil
+	}
+	var output strings.Builder
+	deps.output, deps.errorOutput = &output, &output
+	args := &cliArgs{
+		StateDir:       t.TempDir(),
+		NonInteractive: true,
+		Packages:       []string{"pkg"},
+		Targets:        []string{"opencode"},
+		Versions:       map[string]string{"pkg": "latest"},
+		Yes:            true,
+	}
+	if err := runInstall(args, deps); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(events, []string{"catalog", "config", "current"}) {
+		t.Fatalf("events = %v", events)
+	}
+	if got := output.String(); got != "✓ Skynex is up to date.\n  Nothing changed.\n" {
+		t.Fatalf("output = %q", got)
+	}
+}
+
 func TestRunInstallForceSkipsExactCurrentGate(t *testing.T) {
 	events := []string{}
 	deps := installTestDeps(&events)
@@ -159,5 +302,39 @@ func TestRunInstallForceSkipsExactCurrentGate(t *testing.T) {
 	}
 	if !reflect.DeepEqual(events, []string{"catalog", "config", "wizard", "preflight", "apply", "apply-callback"}) {
 		t.Fatalf("events = %v", events)
+	}
+}
+
+func TestNeuroxFlagsResolveExplicitAndRecommendedDefaults(t *testing.T) {
+	cat := &models.Catalog{Packages: map[string]*models.PackageDefinition{"skills": {ID: "skills", DefaultVersion: "latest"}}}
+	for _, tc := range []struct {
+		name string
+		argv []string
+		want bool
+	}{
+		{"recommended default", []string{"install", "--package", "skills", "--target", "opencode", "--non-interactive"}, true},
+		{"explicit on", []string{"install", "--package", "skills", "--target", "opencode", "--non-interactive", "--with-neurox"}, true},
+		{"explicit off", []string{"install", "--package", "skills", "--target", "opencode", "--non-interactive", "--without-neurox"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := parseArgsFrom(tc.argv)
+			req, err := resolveNonInteractive(args, cat, map[string]interface{}{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if req.NeuroxEnabled != tc.want {
+				t.Fatalf("NeuroxEnabled=%v want %v", req.NeuroxEnabled, tc.want)
+			}
+		})
+	}
+	if args := parseArgsFrom([]string{"install", "--with-neurox", "--without-neurox"}); args.ParseError == "" {
+		t.Fatal("conflicting Neurox flags must fail")
+	}
+}
+
+func TestUpdateRequestDefaultsToRecommendedNeurox(t *testing.T) {
+	req := newUpdateInstallRequest([]string{"skills"}, []string{"opencode"}, map[string]string{"skills": "latest"}, t.TempDir(), false)
+	if !req.NeuroxEnabled || !req.NeuroxSelectionSet {
+		t.Fatalf("update request lost recommended Neurox default: %#v", req)
 	}
 }

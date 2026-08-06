@@ -73,7 +73,7 @@ coder (returns status:success)
     │              │
     │              ├─ SOUND → status:approved
     │              ├─ NEEDS_REFACTOR → return to coder
-    │              └─ DESIGN_SMELL → escalate to advisor
+    │              └─ DESIGN_SMELL → escalate to human review
     │
     └─ DEVIATION/VIOLATION → return to coder (don't waste Stage 2 tokens)
 ```
@@ -108,7 +108,7 @@ coder (returns status:success)
 3. How to handle disagreement between Stage 1 and Stage 2?
    - Stage 1 fails → never reach Stage 2 (problem doesn't exist)
    - Both pass → proceed to commit
-   - Stage 2 fails after Stage 1 passes → coder retry with Stage 2 feedback (max 2 retries, then advisor)
+   - Stage 2 fails after Stage 1 passes → coder retry with Stage 2 feedback (max 2 retries, then human review)
 
 4. Should this skill be parameterized like `adversarial-review` (with `domain`)?
    - Maybe in v2; v1 keeps the two stages separate and explicit

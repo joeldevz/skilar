@@ -14,3 +14,6 @@ internal/assets/data/*
 
 # Local backups (no version)
 *.backup-*
+
+# Local isolated test/install sandbox (may contain caches and credentials)
+.sandbox/

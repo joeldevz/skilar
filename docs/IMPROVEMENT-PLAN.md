@@ -37,7 +37,7 @@ Las menciones a Matt Pocock, obra/Superpowers o Gentleman/gentle-ai son **refere
 | QW2 | Skill `grill-me` (67L) | ✅ DONE |
 | QW3 | TDD Iron Law + anti-rationalization en coder | ✅ DONE |
 | QW4 | `_shared/smart-zone-budget.md` | ✅ DONE |
-| QW5 | advisor.ts en `opencode/tools/` | ✅ DONE |
+| QW5 | advisor.ts en `opencode/tools/` | ⛔ RETIRADO — el Advisor se eliminó del bundle |
 | QW6 | Skill `verification-before-completion` (89L) | ✅ DONE |
 
 ### ✅ Fase 1 — Simplificación (HECHO)
@@ -70,12 +70,11 @@ Las menciones a Matt Pocock, obra/Superpowers o Gentleman/gentle-ai son **refere
 
 ### 🟢 Fortalezas propias activas
 
-- 9 agentes con responsabilidades claras (orchestrator, advisor, product-planner, tech-planner, coder, manager, verifier, test-reviewer, security, skill-validator)
+- 10 agentes con responsabilidades claras (orchestrator, tech-planner, coder, verifier, test-reviewer, security, skill-validator, pr-reviewer, workflow-worker, workflow-reviewer)
 - Return envelope estandarizado con campo `skill_resolution` (detecta context compaction)
 - Dual-judge adversarial security con re-judgment
 - Neurox con kinds + types + 4D scoring + brain power
-- 9 golden eval tests en `opencode/evals/golden/`
-- Advisor Strategy canónica (Opus on-demand)
+- 15 golden eval tests en `opencode/evals/golden/`
 - skilar CLI Go con profiles + doctor + adapters claude/opencode
 
 ---
@@ -116,7 +115,7 @@ Las menciones a Matt Pocock, obra/Superpowers o Gentleman/gentle-ai son **refere
 - **GA5** — Profiles switchables (3 archivos `opencode/profiles/{explore,balanced,production}.json`) · 4-6h
 - **GA6** — Skill creator meta-skill · 2h
 - **GA7** — Neurox interop study · 1 día
-- **GA8** — Cross-provider advisor (Codex GPT-5.3) · 4-6h
+- ~~**GA8** — Cross-provider advisor (Codex GPT-5.3)~~ · cancelado con el retiro del Advisor
 
 ### 🟢 Sprint 2 — Arquitectura (pendiente)
 
@@ -124,7 +123,7 @@ Las menciones a Matt Pocock, obra/Superpowers o Gentleman/gentle-ai son **refere
 |---|---|---|---|
 | A3 | Skill `improve-codebase-architecture` (Ousterhout deep modules) | NUEVO | medio |
 | A9 | Agente `architect` (Opus, post-PRD pre-tech-planner) | `opencode/opencode.json` | medio |
-| M3 | Manager con HITL/AFK rutearing | `opencode/opencode.json` | medio |
+| M3 | ~~Manager con HITL/AFK rutearing~~ — el `manager` fue retirado; los gates HITL viven en `skynex workflow` | — | — |
 | M14 | Orchestrator Opus + task_budget | `opencode/opencode.json` | bajo + $$ |
 | M10 | Test-reviewer Iron Law audit step | `opencode/opencode.json` | bajo |
 | A6 | Command `/grill` | `opencode/commands/grill.md` (NUEVO) | bajo |
@@ -136,7 +135,7 @@ Las menciones a Matt Pocock, obra/Superpowers o Gentleman/gentle-ai son **refere
 - A15 · Security cross-lab (Phase 5 cuando dual-judge contradice)
 - A13 · Golden test cross-provider
 - A7 · Command `/afk-run`
-- Cross-provider advisor wiring real (Codex GPT-5.3)
+- ~~Cross-provider advisor wiring real (Codex GPT-5.3)~~ · cancelado con el retiro del Advisor
 
 ### 🟢 Backlog P2 (post-publicación comunidad)
 
@@ -193,7 +192,7 @@ Las menciones a Matt Pocock, obra/Superpowers o Gentleman/gentle-ai son **refere
 
 ### Simplificación
 - ✅ Eliminar `typescript-advanced-types`, `nestjs-patterns`, `clasing-ui-v2-beta`
-- ✅ Plugin advisor.ts permanece en `opencode/tools/advisor.ts`
+- ⛔ Plugin advisor.ts retirado: agente, plugin y protocolo `_shared/advisor-protocol.md` ya no se distribuyen
 
 ### Disciplina (de Superpowers)
 - ✅ TDD Iron Law con anti-rationalization table en coder
@@ -208,7 +207,7 @@ Las menciones a Matt Pocock, obra/Superpowers o Gentleman/gentle-ai son **refere
 - ✅ NO adoptar SDD lineal de 9 fases — son ortogonales a vertical slices
 - ✅ NO copiar `strict-tdd.md` literal — destilar en `tdd-discipline`
 - ✅ NO copiar `judgment-day` literal — generalizar `security` con `domain`
-- ✅ Pre-commit AI gate en TypeScript reusando `advisor_consult`
+- ⛔ Pre-commit AI gate en TypeScript reusando `advisor_consult` — descartado con el retiro del Advisor
 - ✅ Skill-registry físico generado por `/skills-scan`
 
 ### Harnesses Gentle (mayo 2026)

@@ -1,0 +1,24 @@
+id: orchestrator-workflow-v2-audit
+name: "Orchestrator audits a simple low-risk workflow without edits"
+description: |
+  The orchestrator uses real Neurox tools for context, treats failures explicitly,
+  and relies on the Go workflow authority without editing application files.
+agent: orchestrator
+prompt: |
+  Perform an informational audit of a conceptual simple low-risk change. Do not create workflow state. Neurox may be unavailable.
+checks:
+  must_not:
+    - Edit application files
+    - Invent Neurox results
+    - Apply a late result after abort
+    - Run git add or git commit directly
+    - Run skynex workflow start
+  expect_in_output:
+    - "skynex workflow status"
+    - "skynex workflow run"
+    - "skynex workflow review"
+    - "depth 0"
+    - "Neurox"
+    - "revokes live attempts and leases"
+    - "clears current approvals"
+timeout: 120000

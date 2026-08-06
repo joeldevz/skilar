@@ -82,6 +82,10 @@ func copyDirExcluding(src, dst string, exclude []string) error {
 			_ = r.Close()
 			return fmt.Errorf("source changed to non-regular entry %q", path)
 		}
+		if only, linkErr := safefs.SingleLinkFile(r); linkErr != nil || !only {
+			_ = r.Close()
+			return fmt.Errorf("source is hard-linked: %s", path)
+		}
 		after, err := sourceRoot.Lstat(relPath)
 		if err != nil || !os.SameFile(before, after) || after.Mode().Type() != before.Mode().Type() {
 			_ = r.Close()
@@ -137,6 +141,10 @@ func copyFile(src, dst string) error {
 	if err != nil || !os.SameFile(info, opened) || !safefs.SingleLink(opened) {
 		_ = in.Close()
 		return fmt.Errorf("source changed while opening: %s", src)
+	}
+	if only, linkErr := safefs.SingleLinkFile(in); linkErr != nil || !only {
+		_ = in.Close()
+		return fmt.Errorf("source is hard-linked: %s", src)
 	}
 	destRoot, err := safefs.OpenOrCreate(filepath.Dir(dst), 0o700)
 	if err != nil {

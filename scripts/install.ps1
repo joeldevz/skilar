@@ -227,8 +227,27 @@ function Install-ViaBinary {
     $allowedSigners = Join-Path $tmpDir "allowed_signers"
     $signer = "skynex-release ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINUht44Rk/nWIXqcKizh8SWdnECJZOQ5yuPjaxaWxAAF skynex release signing`n"
     Set-Content -Path $allowedSigners -NoNewline -Encoding ascii -Value $signer
-    Get-Content -Raw -Path $checksumsPath | & $sshKeygen.Source -Y verify -f $allowedSigners -I skynex-release -n file -s $signaturePath 2>$null
-    if ($LASTEXITCODE -ne 0) { Stop-WithError "Invalid checksums.txt signature" }
+    # `ssh-keygen -Y verify` reads the signed message from stdin, and the signature
+    # covers checksums.txt byte for byte. PowerShell must not produce those bytes:
+    # piping `Get-Content` re-encodes the text and appends a newline, and a
+    # redirected StandardInput writer emits the console encoding preamble (a UTF-8
+    # BOM when the code page is 65001) before anything is written. Let the command
+    # processor redirect the file itself, exactly like `< checksums.txt` on Unix.
+    $verifyCommand = '""{0}" -Y verify -f "{1}" -I skynex-release -n file -s "{2}" < "{3}""' -f $sshKeygen.Source, $allowedSigners, $signaturePath, $checksumsPath
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = if ($env:ComSpec) { $env:ComSpec } else { Join-Path $env:SystemRoot "System32\cmd.exe" }
+    $psi.Arguments = "/d /s /c $verifyCommand"
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $verify = [Diagnostics.Process]::Start($psi)
+    $verifyOutput = $verify.StandardOutput.ReadToEnd()
+    $verifyError = $verify.StandardError.ReadToEnd()
+    $verify.WaitForExit()
+    if ($verify.ExitCode -ne 0) {
+      $verifyDetail = (($verifyError + " " + $verifyOutput) -replace '\s+', ' ').Trim()
+      Stop-WithError ("Invalid checksums.txt signature. " + $verifyDetail).Trim()
+    }
     Write-Success "Release signature verified"
     $matches = @(Get-Content $checksumsPath | Where-Object {
       $parts = $_ -split "\s+"

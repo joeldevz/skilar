@@ -206,3 +206,69 @@ func TestMergeOpencodeConfig_ForceNeuroxEntry(t *testing.T) {
 		t.Error("neurox entry should be forced even when not in installed config")
 	}
 }
+
+func TestMergeOpencodeConfigDisablesNeuroxWithoutDeletingUserServer(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "opencode.json")
+	os.WriteFile(path, []byte(`{"mcp":{}}`), 0o600)
+	backup := map[string]json.RawMessage{"mcp": json.RawMessage(`{"custom":{"type":"local","command":["custom"]},"neurox":{"type":"local","command":["neurox","mcp"],"enabled":true}}`)}
+	if err := mergeOpencodeConfigForNeurox(path, backup, false, discardReporter()); err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]interface{}
+	raw, _ := os.ReadFile(path)
+	json.Unmarshal(raw, &got)
+	mcp := got["mcp"].(map[string]interface{})
+	if _, ok := mcp["custom"]; !ok {
+		t.Fatal("custom MCP lost")
+	}
+	if _, ok := mcp["neurox"]; ok {
+		t.Fatal("Neurox MCP retained while disabled")
+	}
+}
+
+func TestMergeOpencodeConfigPreservesCustomNeuroxWhenDisabled(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "opencode.json")
+	os.WriteFile(path, []byte(`{"mcp":{"neurox":{"type":"local","command":["neurox","mcp"]}}}`), 0o600)
+	backup := map[string]json.RawMessage{"mcp": json.RawMessage(`{"neurox":{"type":"remote","url":"https://example.test"}}`)}
+	if err := mergeOpencodeConfigForNeurox(path, backup, false, discardReporter()); err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]interface{}
+	raw, _ := os.ReadFile(path)
+	json.Unmarshal(raw, &got)
+	if _, ok := got["mcp"].(map[string]interface{})["neurox"]; !ok {
+		t.Fatal("custom Neurox MCP entry was removed")
+	}
+}
+
+func TestInstallOwnedTreeRetiresUnmodifiedConditionalPluginAndPreservesModified(t *testing.T) {
+	source := t.TempDir()
+	target := t.TempDir()
+	os.MkdirAll(filepath.Join(source, "plugins"), 0o700)
+	os.WriteFile(filepath.Join(source, "plugins", "neurox.ts"), []byte("managed"), 0o600)
+	if err := installOwnedTree(source, target); err != nil {
+		t.Fatal(err)
+	}
+	empty := t.TempDir()
+	if err := installOwnedTree(empty, target); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(target, "plugins", "neurox.ts")); !os.IsNotExist(err) {
+		t.Fatalf("unchanged plugin not retired: %v", err)
+	}
+
+	os.WriteFile(filepath.Join(source, "plugins", "neurox.ts"), []byte("managed"), 0o600)
+	if err := installOwnedTree(source, target); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(target, "plugins", "neurox.ts"), []byte("user modified"), 0o600)
+	if err := installOwnedTree(empty, target); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(target, "plugins", "neurox.ts"))
+	if err != nil || string(raw) != "user modified" {
+		t.Fatalf("modified plugin not preserved: %q %v", raw, err)
+	}
+}

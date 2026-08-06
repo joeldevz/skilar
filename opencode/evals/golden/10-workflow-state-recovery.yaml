@@ -1,0 +1,17 @@
+id: workflow-state-recovery
+name: "Workflow resumes idempotently from persisted state"
+description: |
+  The orchestrator must inspect persisted workflow state and resume the live attempt instead of starting a duplicate mutation.
+agent: orchestrator
+prompt: |
+  Resume workflow wf-recovery after the previous OpenCode invocation was interrupted.
+checks:
+  must_read:
+    - .git/skynex/workflows.sqlite
+  must_not:
+    - Create a second attempt for an already-live slice
+    - Recompute the ContextSeal
+  expect_in_output:
+    - "workflow status"
+    - "resume"
+timeout: 120000

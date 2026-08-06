@@ -30,6 +30,9 @@ func InstallOpencodeWithReporterAndOptions(srcDir string, req *models.InstallReq
 	if target == "" {
 		target = opencodeDir()
 	}
+	if err := archiveInactiveLegacyWorkflowDB(target); err != nil {
+		return err
+	}
 	if _, err := validateInstallDestinationTreeIdentity(target); err != nil {
 		return fmt.Errorf("validate opencode install destination: %w", err)
 	}
@@ -104,18 +107,27 @@ func InstallOpencodeWithReporterAndOptions(srcDir string, req *models.InstallReq
 		backupDirIfExistsWithReporter(target, reporter)
 	}
 
-	// Copy opencode/ → target using Go (no rsync)
+	// Copy owned OpenCode config while preserving modified/unknown files.
 	reporter.Detail("Copying OpenCode config to %s...", target)
-	if err := copyDirExcluding(sourceDir, target, []string{"node_modules", "skills"}); err != nil {
+	excluded := map[string]bool{}
+	if req == nil || !req.NeuroxEnabled {
+		excluded["plugins/neurox.ts"] = true
+		plugin := filepath.Join(target, "plugins", "neurox.ts")
+		if raw, readErr := os.ReadFile(plugin); readErr == nil {
+			owned, ok := loadInventory(target).Files["plugins/neurox.ts"]
+			if !ok || owned != fileDigest(raw) {
+				reporter.Warning("preserving existing Neurox plugin because it is not an unchanged Skynex-managed file: %s", plugin)
+			}
+		}
+	}
+	if err := installOwnedTreeExcluding(sourceDir, target, excluded, reporter); err != nil {
 		return fmt.Errorf("copy opencode dir: %w", err)
 	}
 
 	// Merge preserved MCP servers
-	if backupConfig != nil {
-		installedPath := filepath.Join(target, "opencode.json")
-		if err := mergeOpencodeConfigWithReporter(installedPath, backupConfig, reporter); err != nil {
-			reporter.Warning("MCP merge failed: %v", err)
-		}
+	installedPath := filepath.Join(target, "opencode.json")
+	if err := mergeOpencodeConfigForNeurox(installedPath, backupConfig, req != nil && req.NeuroxEnabled, reporter); err != nil {
+		reporter.Warning("MCP merge failed: %v", err)
 	}
 
 	// Install JS dependencies (bun or npm)
@@ -159,6 +171,10 @@ func mergeOpencodeConfig(installedPath string, backup map[string]json.RawMessage
 }
 
 func mergeOpencodeConfigWithReporter(installedPath string, backup map[string]json.RawMessage, reporter Reporter) error {
+	return mergeOpencodeConfigForNeurox(installedPath, backup, true, reporter)
+}
+
+func mergeOpencodeConfigForNeurox(installedPath string, backup map[string]json.RawMessage, enabled bool, reporter Reporter) error {
 	data, err := readExistingFile(installedPath)
 	if err != nil {
 		return err
@@ -188,19 +204,29 @@ func mergeOpencodeConfigWithReporter(installedPath string, backup map[string]jso
 			reporter.Warning("could not parse installed MCP config: %v", err)
 		} else {
 			for k, v := range installedMCP {
+				if k == "neurox" && !enabled {
+					continue
+				}
 				backupMCP[k] = v
 			}
 		}
 	}
 
-	// Force neurox entry
-	neuroxEntry := map[string]interface{}{
-		"command": []string{"neurox", "mcp"},
-		"enabled": true,
-		"type":    "local",
+	if enabled {
+		neuroxEntry := map[string]interface{}{"command": []string{"neurox", "mcp"}, "enabled": true, "type": "local"}
+		neuroxJSON, _ := json.Marshal(neuroxEntry)
+		backupMCP["neurox"] = neuroxJSON
+	} else if raw, ok := backupMCP["neurox"]; ok {
+		var entry struct {
+			Command []string `json:"command"`
+			Type    string   `json:"type"`
+		}
+		if json.Unmarshal(raw, &entry) == nil && len(entry.Command) == 2 && entry.Command[0] == "neurox" && entry.Command[1] == "mcp" && entry.Type == "local" {
+			delete(backupMCP, "neurox")
+		} else {
+			reporter.Warning("preserving custom Neurox MCP entry while the Skynex Neurox integration is disabled")
+		}
 	}
-	neuroxJSON, _ := json.Marshal(neuroxEntry)
-	backupMCP["neurox"] = neuroxJSON
 
 	mergedMCP, _ := json.Marshal(backupMCP)
 	installed["mcp"] = mergedMCP

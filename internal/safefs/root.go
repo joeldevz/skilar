@@ -165,6 +165,13 @@ func ReadFileVerified(root *os.Root, name string, maxBytes int64) ([]byte, error
 	if err != nil {
 		return nil, err
 	}
+	if only, linkErr := singleLinkFile(f); linkErr != nil || !only {
+		_ = f.Close()
+		if linkErr != nil {
+			return nil, linkErr
+		}
+		return nil, fmt.Errorf("refusing hard-linked file %q", name)
+	}
 	data, readErr := io.ReadAll(io.LimitReader(f, maxBytes+1))
 	stat, statErr := f.Stat()
 	closeErr := f.Close()

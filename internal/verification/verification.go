@@ -87,6 +87,15 @@ func (r *Runner) Run(ctx context.Context, workflowID string, seal gitcandidate.C
 			_, _ = r.Store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateReplanRequired, IdempotencyKey: transitionKey("drift", w.StateVersion)})
 			return Result{}, errors.New("verification: candidate drifted before freeze")
 		}
+		if err = r.Store.UpdateRecoveryBasis(workflowID, func(b *workflow.RecoveryBasis) {
+			b.Seal = seal
+			b.CandidatePolicy = r.Policy
+			b.CandidateTreeOID = existing.Record.TreeOID
+			b.CandidateRecordID = existing.Record.ID
+			b.PolicyHash = existing.Record.PolicyHash
+		}); err != nil {
+			return Result{}, err
+		}
 		_, err = r.Store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateCandidateFrozen, IdempotencyKey: transitionKey("frozen", w.StateVersion)})
 		return existing, err
 	}
@@ -151,6 +160,18 @@ func (r *Runner) Run(ctx context.Context, workflowID string, seal gitcandidate.C
 	}
 	result := Result{Candidate: candidate, Record: record, Floor: floor, Evidence: evidence, Passed: passed}
 	if err = r.persist(workflowID, result); err != nil {
+		return Result{}, err
+	}
+	// A blocker raised from candidate_frozen, reviewing, or receipted resumes
+	// against the candidate lineage rather than a mutation tree, so record it
+	// before the freeze transition can be interrupted.
+	if err = r.Store.UpdateRecoveryBasis(workflowID, func(b *workflow.RecoveryBasis) {
+		b.Seal = seal
+		b.CandidatePolicy = r.Policy
+		b.CandidateTreeOID = record.TreeOID
+		b.CandidateRecordID = record.ID
+		b.PolicyHash = record.PolicyHash
+	}); err != nil {
 		return Result{}, err
 	}
 	if !passed {

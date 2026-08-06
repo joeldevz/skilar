@@ -28,6 +28,28 @@ Detach is Unix-only. On Windows the capability gate rejects the request before a
 
 Only one live job is admitted at a time. A job is considered healthy only when both its durable heartbeat is at most 30 seconds old and its recorded PID is alive, so a crashed worker or a reused PID is reconciled to `failed` instead of blocking the next run. Use `skynex workflow status` to observe state and `skynex workflow resume` to continue a blocked workflow after reconciliation.
 
+`status` and `inspect` open the database read-only and stay read-only while every job of the inspected workflows is healthy. Only when their liveness probe finds an orphaned worker do they reopen read-write to persist that reconciliation: the dead job is failed and the workflow moves to `blocked` with the state it failed from as its resume target. They never mutate the worktree, the candidate, or the execution graph.
+
+`resume` reconciles against a recovery basis that is persisted by the workflow itself: `start` records the context seal and the frozen basis tree, each brokered mutation records its exact pre and post trees, and verification records the candidate record, tree, and policy hash. A workflow created before this basis existed has none, so `resume` fails closed with `workflow: recovery basis artifact is missing`; retry the failed job with the `next` command reported by `status`, or abort it.
+
+An execution interrupted between the broker's durable mutation commit and the slice completion that follows it is repaired on the next run. Reconciliation adopts only slices whose mutation already reached `completed` with its attempt retired and no live attempt remaining, so a still-fenced worker is never displaced, and it then advances a fully executed workflow to verification.
+
+A worker that died mid-apply — after its patch reached the worktree but before the broker committed — is reconciled when its still-live attempt is inherited. Under the worktree lease, the recorded pre and post trees are compared against the live tree: a patch that fully landed is adopted as the completed mutation the broker would have recorded, a worktree still at the basis tree is simply dispatched again, and any other tree fails closed into `integration_conflict` instead of retrying a claim that can never succeed.
+
+Only a process that owns the work may perform that reconciliation. Executing a workflow takes a durable execution fence keyed to a private per-process identity, held by the detached worker and the foreground CLI alike, so two concurrent executions of the same workflow can never share or adopt each other's attempt. The attempt row publishes the worktree owner and fencing token — any second process could reproduce them and heartbeat that lease — but nothing publishes the fence identity. The fence expires 30 seconds after its last heartbeat, so a crashed executor frees the workflow on the same schedule as a dead detached worker.
+
+**The fence is scoped strictly to one workflow ID**, never to the repository or the worktree. Any number of distinct workflows run at the same time against the same repository — including alternative solutions to the same problem, each in its own worktree and branch. Only a second executor of the *same* workflow is refused.
+
+That refusal happens before durable state exists. `run --detach` checks the fence before creating its job record, because a worker spawned into a conflict would finish as failed and a failed job is a durable blocker — queueing against a healthy executor would otherwise abort the very run it collided with. Should a worker still lose that race, or lose a fence it already held, it is recorded as cancelled rather than failed. A displaced worker did not fail; it stopped before mutating, so it never blocks the workflow under whichever executor legitimately owns the fence now.
+
+Exclusivity is re-proven, not assumed: before adopting another executor's mutation and before committing its own, a run revalidates its fence against the durable lease and stops if it has been lost, so a heartbeat that silently lapsed cannot leave two processes both believing they own the workflow.
+
+On top of that fence, a foreground `run` or `review` refuses up front while a healthy detached worker holds the workflow, naming the live job and the exact abort command instead of failing on the fence. The same liveness predicate that retires a dead worker decides it, so a crashed worker never blocks the next run.
+
+`integration_conflict` is a fail-closed sink: no command advances it, so `status` and `inspect` report the exact `skynex workflow abort` invocation as the next action instead of `wait`. `status` prints it on a `NEXT` line even when the workflow has no job record, and `inspect` carries it as `next_action`.
+
+Claiming a slice and moving the workflow from `ready` to `executing` commit together, so an interrupted activation can never leave a `ready` workflow holding an active slice.
+
 A failed detached job is a durable workflow blocker rather than a dead side-car: the workflow moves to `blocked` with the state it failed from recorded as the resume target. Re-running the same `run --detach` or `review --detach` command retries that blocker directly, bypassing candidate recovery because a job failure never claimed a candidate tree change. Retries are bounded to three attempts per workflow and operation. `status` reports `attempt`, `retries_remaining`, a truncated error preview, and a `next` field that is `wait` while the job is healthy, the exact retry command once it is retryable, and `manual_resolution_required` when the attempts are exhausted; `inspect` reports the same attempt accounting for every job of the workflow.
 
 ## Correcting one failed verification check

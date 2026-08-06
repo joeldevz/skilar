@@ -33,6 +33,12 @@ func workflowRunDetached(store *workflow.SQLiteStore, repo, id string, out io.Wr
 	if err := store.ReconcileStaleWorkflowJobs(id, time.Now()); err != nil {
 		return err
 	}
+	// Refuse before a job exists. A worker spawned into a fence conflict would
+	// finish as failed, and a failed job is a durable blocker, so queueing
+	// against a healthy executor would abort the very run it collided with.
+	if err := refuseWhileExecutionFenceIsHeld(store, id); err != nil {
+		return err
+	}
 	w, err := store.Get(id)
 	if err != nil {
 		return err
@@ -186,6 +192,15 @@ func workflowWorker(store *workflow.SQLiteStore, repo string, args []string, out
 	if err != nil {
 		state = workflow.JobFailed
 		message = err.Error()
+		// This worker does not own the workflow: it was refused the execution
+		// fence, or it lost one it held and stopped before mutating. Recording
+		// either as failed would block the workflow under whichever executor
+		// legitimately owns the fence now, turning displacement into a durable
+		// blocker.
+		if workflow.ExecutionDisplaced(err) {
+			state = workflow.JobCancelled
+			message = workflow.JobDisplacedErrorPrefix + err.Error()
+		}
 	}
 	if w.State == workflow.StateAborted {
 		state = workflow.JobCancelled

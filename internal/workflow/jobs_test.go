@@ -84,6 +84,45 @@ func TestTechnicalJobRetryIsBoundedToThreeTotalAttempts(t *testing.T) {
 	}
 }
 
+func TestDisplacedJobsDoNotConsumeTechnicalRetryBudget(t *testing.T) {
+	s, err := OpenSQLite(filepath.Join(t.TempDir(), "workflows.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	executingJobWorkflow(t, s, "wf")
+
+	if _, err = s.CreateWorkflowJobOperation("job-displaced", "wf", "run", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.FinishWorkflowJob("job-displaced", JobCancelled, "", JobDisplacedErrorPrefix+ErrExecutionFenceLost.Error(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.CreateWorkflowJobOperation("job-cancelled", "wf", "run", time.Now().Add(time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.FinishWorkflowJob("job-cancelled", JobCancelled, "", "cancel requested", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.CreateWorkflowJobOperation("job-failed", "wf", "run", time.Now().Add(2*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.FinishWorkflowJob("job-failed", JobFailed, "", "timeout", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	attempts, err := s.WorkflowJobAttempts("wf", "run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts=%d, want 2 (ordinary cancellation and failure)", attempts)
+	}
+	if _, err = s.RetryTechnicalWorkflowJob("wf", "run", time.Now()); err != nil {
+		t.Fatalf("displaced job consumed retry budget: %v", err)
+	}
+}
+
 func TestDetachedJobLifecycleAndTerminalNotificationDeduplication(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "workflows.db")
 	s, err := OpenSQLite(path)

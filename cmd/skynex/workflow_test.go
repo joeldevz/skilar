@@ -139,6 +139,121 @@ func TestWorkflowCLIInspectReconcilesDeadDetachedWorker(t *testing.T) {
 	}
 }
 
+func TestWorkflowCLIStatusListReconcilesFromTheSingleDiagnosticScan(t *testing.T) {
+	repo := workflowRepo(t)
+	store, err := workflow.OpenRepositorySQLite(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	healthy, err := store.Create(workflow.Workflow{ID: "wf-healthy", Route: workflow.RouteSimple, MinimumRisk: workflow.RiskLow, BasisTree: "tree"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead, err := store.Create(workflow.Workflow{ID: "wf-orphan", Route: workflow.RouteSimple, MinimumRisk: workflow.RiskLow, BasisTree: "tree"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, next := range []workflow.State{workflow.StateDiscovering, workflow.StateReady, workflow.StateExecuting} {
+		if dead, err = store.Transition(workflow.Transition{WorkflowID: dead.ID, ExpectedState: dead.State, ExpectedVersion: dead.StateVersion, NextState: next, IdempotencyKey: "setup-" + string(rune('a'+i))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = store.CreateWorkflowJobOperation("job-orphan", dead.ID, "run", time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.StartWorkflowJob("job-orphan", 99999999, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err = runWorkflowCLI([]string{"status"}, repo, &out); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	if !strings.Contains(text, "wf-orphan\tblocked") {
+		t.Fatalf("orphan was not reconciled in the listing: %q", text)
+	}
+	if !strings.Contains(text, healthy.ID+"\t"+string(workflow.StateCreated)) {
+		t.Fatalf("healthy workflow missing from the listing: %q", text)
+	}
+}
+
+func TestIntegrationConflictReportsTheAbortCommandInsteadOfWait(t *testing.T) {
+	repo := workflowRepo(t)
+	store, err := workflow.OpenRepositorySQLite(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := store.Create(workflow.Workflow{ID: "wf-conflict", Route: workflow.RouteSimple, MinimumRisk: workflow.RiskLow, BasisTree: "tree"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, next := range []workflow.State{workflow.StateDiscovering, workflow.StateReady, workflow.StateExecuting, workflow.StateIntegrationConflict} {
+		if w, err = store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: next, IdempotencyKey: "setup-" + string(rune('a'+i))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	want := "skynex workflow abort wf-conflict --idempotency-key abort-wf-conflict"
+
+	var status bytes.Buffer
+	if err = runWorkflowCLI([]string{"status", "wf-conflict"}, repo, &status); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(status.String(), "NEXT\t"+want) {
+		t.Fatalf("status did not report an actionable next: %q", status.String())
+	}
+
+	var inspected bytes.Buffer
+	if err = runWorkflowCLI([]string{"inspect", "wf-conflict"}, repo, &inspected); err != nil {
+		t.Fatal(err)
+	}
+	var inspection workflowInspection
+	if err = json.Unmarshal(inspected.Bytes(), &inspection); err != nil {
+		t.Fatal(err)
+	}
+	if inspection.NextAction != want {
+		t.Fatalf("inspect next_action=%q", inspection.NextAction)
+	}
+}
+
+func TestHealthyWorkflowStillReportsNoNextAction(t *testing.T) {
+	repo := workflowRepo(t)
+	store, err := workflow.OpenRepositorySQLite(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Create(workflow.Workflow{ID: "wf-ok", Route: workflow.RouteSimple, MinimumRisk: workflow.RiskLow, BasisTree: "tree"}); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var status bytes.Buffer
+	if err = runWorkflowCLI([]string{"status", "wf-ok"}, repo, &status); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(status.String(), "NEXT\t") {
+		t.Fatalf("healthy workflow demanded an action: %q", status.String())
+	}
+	var inspected bytes.Buffer
+	if err = runWorkflowCLI([]string{"inspect", "wf-ok"}, repo, &inspected); err != nil {
+		t.Fatal(err)
+	}
+	var inspection workflowInspection
+	if err = json.Unmarshal(inspected.Bytes(), &inspection); err != nil {
+		t.Fatal(err)
+	}
+	if inspection.NextAction != "" {
+		t.Fatalf("inspect next_action=%q", inspection.NextAction)
+	}
+}
+
 func TestWorkflowCommandHelpOutsideRepositoryDoesNotCreateDatabase(t *testing.T) {
 	dir := t.TempDir()
 	commands := []string{"start", "run", "review", "deliver", "status", "inspect", "receipt", "approve", "revoke-approval", "abort", "resume", "replan", "retry-verification", "export", "frontier", "answer", "close-discovery"}

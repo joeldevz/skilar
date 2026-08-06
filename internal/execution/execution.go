@@ -86,42 +86,49 @@ func (s *Scheduler) Start(a Attempt) error {
 		return errors.New("execution: slice is not ready")
 	}
 	allowed, _ := json.Marshal(a.AllowedPaths)
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	res, err := tx.Exec(`UPDATE execution_slice_state SET status='active' WHERE workflow_id=? AND slice_id=? AND status='pending'`, a.WorkflowID, a.SliceID)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		return errors.New("execution: concurrent writer active")
-	}
-	if _, err = tx.Exec(`INSERT INTO mutation_attempts(attempt_id,workflow_id,slice_id,worktree_id,owner,fencing_token,basis_tree,allowed_paths,operation_id,live) VALUES(?,?,?,?,?,?,?,?,?,1)`, a.ID, a.WorkflowID, a.SliceID, a.WorktreeID, a.Owner, a.FencingToken, a.BasisTree, allowed, a.OperationID); err != nil {
-		return err
-	}
-	if err = tx.Commit(); err != nil {
-		return err
-	}
-	w, err := s.store.Get(a.WorkflowID)
-	if err != nil {
-		return err
-	}
-	if w.State == workflow.StateReady {
-		_, err = s.store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateExecuting, IdempotencyKey: fmt.Sprintf("execution:start:v%d", s.graph.Version)})
-	}
-	return err
-}
-func (s *Scheduler) Complete(workflowID, sliceID string) error {
-	return s.store.CompleteExecutionSlice(workflowID, sliceID)
+	return s.store.ActivateExecutionSlice(workflow.MutationActivation{AttemptID: a.ID, WorkflowID: a.WorkflowID, SliceID: a.SliceID, WorktreeID: a.WorktreeID, Owner: a.Owner, FencingToken: a.FencingToken, BasisTree: a.BasisTree, AllowedPaths: allowed, OperationID: a.OperationID, GraphVersion: s.graph.Version})
 }
 
-// ReconcileCompletion closes the historical crash window from versions that
-// persisted the final slice completion separately from the workflow state
-// transition. It is safe to call at the start of every execution pass.
+// ResumeAttempt reconciles a live attempt inherited from a worker that died
+// mid-apply, before the attempt is dispatched again. The caller must already
+// hold the worktree lease for the attempt. A patch that fully landed is adopted
+// as the completed mutation the interrupted broker would have recorded and its
+// post tree is returned; a worktree still at the basis tree returns "" so the
+// attempt is re-dispatched, and anything else fails closed after Recover has
+// raised the integration conflict.
+func (s *Scheduler) ResumeAttempt(b *Broker, a Attempt) (string, error) {
+	outcome, err := b.Recover(a.OperationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	switch outcome {
+	case "post":
+		var post string
+		if err = s.db.QueryRow(`SELECT post_tree FROM mutation_operations WHERE operation_id=? AND workflow_id=?`, a.OperationID, a.WorkflowID).Scan(&post); err != nil {
+			return "", err
+		}
+		if err = s.store.AdoptAppliedMutation(a.WorkflowID, a.SliceID, a.ID, a.OperationID, s.graph.Version); err != nil {
+			return "", err
+		}
+		return post, nil
+	case "unknown":
+		return "", fmt.Errorf("execution: attempt %s left the worktree at an unrecognized tree", a.ID)
+	}
+	return "", nil
+}
+func (s *Scheduler) Complete(workflowID, sliceID string) error {
+	return s.store.CompleteExecutionSlice(workflowID, sliceID, s.graph.Version)
+}
+
+// ReconcileCompletion closes the crash window between the broker's durable
+// mutation commit and the slice and workflow completions that follow it. It
+// adopts slices whose mutation already completed and advances a fully executed
+// workflow, and is safe to call at the start of every execution pass.
 func (s *Scheduler) ReconcileCompletion() (bool, error) {
-	return s.store.ReconcileCompletedExecution(s.graph.WorkflowID)
+	return s.store.ReconcileCompletedExecution(s.graph.WorkflowID, s.graph.Version)
 }
 
 type FileOperation struct {

@@ -40,15 +40,41 @@ type WorkflowNotification struct {
 const WorkflowSessionPresenceTTL = 20 * time.Second
 const MaxWorkflowJobAttempts = 3
 
+const JobDisplacedErrorPrefix = "execution displaced: "
+
 var workflowJobProcessAlive = workflowProcessAlive
 
 type staleWorkflowJob struct{ id, operation string }
+
+type admittedWorkflowJob struct {
+	id, operation string
+	pid           int
+	stale         bool
+}
 
 // HasStaleWorkflowJobs is safe for a read-only diagnostic connection. Callers
 // can use it to decide whether they need to reopen the database for recovery.
 func (s *SQLiteStore) HasStaleWorkflowJobs(workflowID string, now time.Time) (bool, error) {
 	stale, err := s.staleWorkflowJobs(workflowID, now)
 	return len(stale) != 0, err
+}
+
+// LiveWorkflowJob reports the healthy admitted job of a workflow, if any. It
+// uses the same liveness predicate that decides staleness, so a caller that
+// must not disturb a running worker and the reconciler that retires a dead one
+// can never disagree about which jobs are alive.
+func (s *SQLiteStore) LiveWorkflowJob(workflowID string, now time.Time) (WorkflowJob, bool, error) {
+	admitted, err := s.admittedWorkflowJobs(workflowID, now)
+	if err != nil {
+		return WorkflowJob{}, false, err
+	}
+	for _, item := range admitted {
+		if item.stale {
+			continue
+		}
+		return WorkflowJob{ID: item.id, WorkflowID: workflowID, Operation: item.operation, PID: item.pid}, true, nil
+	}
+	return WorkflowJob{}, false, nil
 }
 
 func (s *SQLiteStore) ReconcileStaleWorkflowJobs(workflowID string, now time.Time) error {
@@ -65,12 +91,26 @@ func (s *SQLiteStore) ReconcileStaleWorkflowJobs(workflowID string, now time.Tim
 }
 
 func (s *SQLiteStore) staleWorkflowJobs(workflowID string, now time.Time) ([]staleWorkflowJob, error) {
+	admitted, err := s.admittedWorkflowJobs(workflowID, now)
+	if err != nil {
+		return nil, err
+	}
+	var found []staleWorkflowJob
+	for _, item := range admitted {
+		if item.stale {
+			found = append(found, staleWorkflowJob{item.id, item.operation})
+		}
+	}
+	return found, nil
+}
+
+func (s *SQLiteStore) admittedWorkflowJobs(workflowID string, now time.Time) ([]admittedWorkflowJob, error) {
 	rows, err := s.db.Query(`SELECT id,operation,state,pid,created_at,heartbeat_at FROM workflow_jobs WHERE workflow_id=? AND state IN (?,?,?)`, workflowID, JobQueued, JobRunning, JobCancelRequested)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var found []staleWorkflowJob
+	var found []admittedWorkflowJob
 	for rows.Next() {
 		var id, operation string
 		var state JobState
@@ -100,9 +140,7 @@ func (s *SQLiteStore) staleWorkflowJobs(workflowID string, now time.Time) ([]sta
 			// both its durable heartbeat and its process are current.
 			stale = !fresh || !live
 		}
-		if stale {
-			found = append(found, staleWorkflowJob{id, operation})
-		}
+		found = append(found, admittedWorkflowJob{id: id, operation: operation, pid: pid, stale: stale})
 	}
 	return found, rows.Err()
 }
@@ -281,7 +319,7 @@ func (s *SQLiteStore) RetryTechnicalWorkflowJob(workflowID, operation string, no
 		return Workflow{}, fmt.Errorf("workflow %s latest %s job is not failed", workflowID, operation)
 	}
 	var attempts int
-	if err = s.db.QueryRow(`SELECT COUNT(*) FROM workflow_jobs WHERE workflow_id=? AND operation=?`, workflowID, operation).Scan(&attempts); err != nil {
+	if err = s.db.QueryRow(`SELECT COUNT(*) FROM workflow_jobs WHERE workflow_id=? AND operation=? AND NOT (state=? AND error LIKE ?)`, workflowID, operation, JobCancelled, JobDisplacedErrorPrefix+"%").Scan(&attempts); err != nil {
 		return Workflow{}, err
 	}
 	if attempts >= MaxWorkflowJobAttempts {
@@ -310,7 +348,7 @@ func (s *SQLiteStore) RetryTechnicalWorkflowJob(workflowID, operation string, no
 
 func (s *SQLiteStore) WorkflowJobAttempts(workflowID, operation string) (int, error) {
 	var attempts int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM workflow_jobs WHERE workflow_id=? AND operation=?`, workflowID, operation).Scan(&attempts)
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM workflow_jobs WHERE workflow_id=? AND operation=? AND NOT (state=? AND error LIKE ?)`, workflowID, operation, JobCancelled, JobDisplacedErrorPrefix+"%").Scan(&attempts)
 	return attempts, err
 }
 

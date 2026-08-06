@@ -34,6 +34,10 @@ Only one live job is admitted at a time. A job is considered healthy only when b
 
 An execution interrupted between the broker's durable mutation commit and the slice completion that follows it is repaired on the next run. Reconciliation adopts only slices whose mutation already reached `completed` with its attempt retired and no live attempt remaining, so a still-fenced worker is never displaced, and it then advances a fully executed workflow to verification.
 
+A worker that died mid-apply — after its patch reached the worktree but before the broker committed — is reconciled when its still-live attempt is inherited. Under the worktree lease, the recorded pre and post trees are compared against the live tree: a patch that fully landed is adopted as the completed mutation the broker would have recorded, a worktree still at the basis tree is simply dispatched again, and any other tree fails closed into `integration_conflict` instead of retrying a claim that can never succeed.
+
+Claiming a slice and moving the workflow from `ready` to `executing` commit together, so an interrupted activation can never leave a `ready` workflow holding an active slice.
+
 A failed detached job is a durable workflow blocker rather than a dead side-car: the workflow moves to `blocked` with the state it failed from recorded as the resume target. Re-running the same `run --detach` or `review --detach` command retries that blocker directly, bypassing candidate recovery because a job failure never claimed a candidate tree change. Retries are bounded to three attempts per workflow and operation. `status` reports `attempt`, `retries_remaining`, a truncated error preview, and a `next` field that is `wait` while the job is healthy, the exact retry command once it is retryable, and `manual_resolution_required` when the attempts are exhausted; `inspect` reports the same attempt accounting for every job of the workflow.
 
 ## Correcting one failed verification check

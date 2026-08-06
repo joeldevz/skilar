@@ -257,6 +257,181 @@ func TestExecutionCompletionKeyUsesTheScheduledGraphVersion(t *testing.T) {
 	}
 }
 
+func startedAttempt(t *testing.T, s *Scheduler, seal gitcandidate.ContextSeal, tree string) Attempt {
+	t.Helper()
+	now := time.Now()
+	if _, err := s.store.AcquireLease("worktree:"+seal.WorktreeID, "o", "t", now, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	a := Attempt{ID: "a1", WorkflowID: "wf", SliceID: "slice_a", WorktreeID: seal.WorktreeID, Owner: "o", FencingToken: "t", BasisTree: tree, AllowedPaths: []string{"a.txt"}, OperationID: "op1"}
+	if err := s.Start(a); err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
+func TestResumeAttemptAdoptsAPatchThatLandedBeforeTheCrash(t *testing.T) {
+	repo, store, seal, c := execFixture(t)
+	defer store.Close()
+	s, err := NewScheduler(store, graph())
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := startedAttempt(t, s, seal, c.TreeOID)
+	crash := errors.New("crash after mutation")
+	dying := Broker{Store: store, Seal: seal, Policy: gitcandidate.Policy{}, AfterMutation: func() error { return crash }}
+	env := workflow.ResultEnvelope{WorkflowID: "wf", NodeID: "slice_a", AttemptID: "a1", BaseCandidateOID: c.TreeOID, Status: workflow.AttemptCompleted}
+	patch := WorkerResult{Envelope: env, Patch: PatchArtifact{Operations: []FileOperation{{Path: "a.txt", Data: []byte("new\n")}}}, Owner: "o", FencingToken: "t"}
+	if _, err = dying.Apply(context.Background(), patch); !errors.Is(err, crash) {
+		t.Fatalf("apply=%v", err)
+	}
+	var live int
+	if err = store.Database().QueryRow(`SELECT live FROM mutation_attempts WHERE attempt_id='a1'`).Scan(&live); err != nil || live != 1 {
+		t.Fatalf("live=%d err=%v", live, err)
+	}
+	landed, err := gitcandidate.Freeze(seal, gitcandidate.Policy{})
+	if err != nil || landed.TreeOID == a.BasisTree {
+		t.Fatalf("patch did not land: %s err=%v", landed.TreeOID, err)
+	}
+	// Re-dispatching this attempt would fail its basis check forever, because
+	// the worktree already carries the patch.
+	if _, err = (&Broker{Store: store, Seal: seal, Policy: gitcandidate.Policy{}}).Apply(context.Background(), patch); !errors.Is(err, workflow.ErrStaleResult) {
+		t.Fatalf("redispatch=%v", err)
+	}
+	post, err := s.ResumeAttempt(&Broker{Store: store, Seal: seal, Policy: gitcandidate.Policy{}}, a)
+	if err != nil || post != landed.TreeOID {
+		t.Fatalf("post=%q err=%v", post, err)
+	}
+	var status, sliceStatus string
+	if err = store.Database().QueryRow(`SELECT status FROM mutation_operations WHERE operation_id='op1'`).Scan(&status); err != nil || status != "completed" {
+		t.Fatalf("operation=%q err=%v", status, err)
+	}
+	if err = store.Database().QueryRow(`SELECT live FROM mutation_attempts WHERE attempt_id='a1'`).Scan(&live); err != nil || live != 0 {
+		t.Fatalf("live=%d err=%v", live, err)
+	}
+	if err = store.Database().QueryRow(`SELECT status FROM execution_slice_state WHERE workflow_id='wf' AND slice_id='slice_a'`).Scan(&sliceStatus); err != nil || sliceStatus != "completed" {
+		t.Fatalf("slice=%q err=%v", sliceStatus, err)
+	}
+	ready, err := s.NextReady()
+	if err != nil || ready == nil || ready.ID != "slice_b" {
+		t.Fatalf("ready=%#v err=%v", ready, err)
+	}
+	data, _ := os.ReadFile(filepath.Join(repo, "a.txt"))
+	if string(data) != "new\n" {
+		t.Fatalf("worktree=%q", data)
+	}
+}
+
+func TestResumeAttemptRedispatchesWhenThePatchNeverLanded(t *testing.T) {
+	_, store, seal, c := execFixture(t)
+	defer store.Close()
+	s, err := NewScheduler(store, graph())
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := startedAttempt(t, s, seal, c.TreeOID)
+	crash := errors.New("crash before mutation")
+	dying := Broker{Store: store, Seal: seal, Policy: gitcandidate.Policy{}, AfterIntent: func() error { return crash }}
+	env := workflow.ResultEnvelope{WorkflowID: "wf", NodeID: "slice_a", AttemptID: "a1", BaseCandidateOID: c.TreeOID, Status: workflow.AttemptCompleted}
+	if _, err = dying.Apply(context.Background(), WorkerResult{Envelope: env, Patch: PatchArtifact{Operations: []FileOperation{{Path: "a.txt", Data: []byte("new\n")}}}, Owner: "o", FencingToken: "t"}); !errors.Is(err, crash) {
+		t.Fatalf("apply=%v", err)
+	}
+	post, err := s.ResumeAttempt(&Broker{Store: store, Seal: seal, Policy: gitcandidate.Policy{}}, a)
+	if err != nil || post != "" {
+		t.Fatalf("post=%q err=%v", post, err)
+	}
+	var live int
+	var sliceStatus string
+	if err = store.Database().QueryRow(`SELECT live FROM mutation_attempts WHERE attempt_id='a1'`).Scan(&live); err != nil || live != 1 {
+		t.Fatalf("live=%d err=%v", live, err)
+	}
+	if err = store.Database().QueryRow(`SELECT status FROM execution_slice_state WHERE workflow_id='wf' AND slice_id='slice_a'`).Scan(&sliceStatus); err != nil || sliceStatus != "active" {
+		t.Fatalf("slice=%q err=%v", sliceStatus, err)
+	}
+}
+
+func TestResumeAttemptFailsClosedOnAnUnrecognizedTree(t *testing.T) {
+	repo, store, seal, c := execFixture(t)
+	defer store.Close()
+	s, err := NewScheduler(store, graph())
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := startedAttempt(t, s, seal, c.TreeOID)
+	dying := Broker{Store: store, Seal: seal, Policy: gitcandidate.Policy{}, AfterIntent: func() error { return errors.New("crash") }}
+	env := workflow.ResultEnvelope{WorkflowID: "wf", NodeID: "slice_a", AttemptID: "a1", BaseCandidateOID: c.TreeOID, Status: workflow.AttemptCompleted}
+	_, _ = dying.Apply(context.Background(), WorkerResult{Envelope: env, Patch: PatchArtifact{Operations: []FileOperation{{Path: "a.txt", Data: []byte("new\n")}}}, Owner: "o", FencingToken: "t"})
+	if err = os.WriteFile(filepath.Join(repo, "a.txt"), []byte("third party\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.ResumeAttempt(&Broker{Store: store, Seal: seal, Policy: gitcandidate.Policy{}}, a); err == nil {
+		t.Fatal("adopted an unrecognized tree")
+	}
+	w, getErr := store.Get("wf")
+	if getErr != nil || w.State != workflow.StateIntegrationConflict {
+		t.Fatalf("workflow=%+v err=%v", w, getErr)
+	}
+}
+
+func TestStartCommitsActivationAndTheExecutingTransitionTogether(t *testing.T) {
+	_, store, seal, c := execFixture(t)
+	defer store.Close()
+	w, err := store.Get("wf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, next := range []workflow.State{workflow.StateExecuting, workflow.StateVerifying} {
+		if w, err = store.Transition(workflow.Transition{WorkflowID: w.ID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: next, IdempotencyKey: "drive-" + string(rune('a'+i))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s, err := NewScheduler(store, graph())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if _, err = store.AcquireLease("worktree:"+seal.WorktreeID, "o", "t", now, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Start(Attempt{ID: "a1", WorkflowID: "wf", SliceID: "slice_a", WorktreeID: seal.WorktreeID, Owner: "o", FencingToken: "t", BasisTree: c.TreeOID, AllowedPaths: []string{"a.txt"}, OperationID: "op1"}); err == nil {
+		t.Fatal("activated a slice the workflow state cannot host")
+	}
+	var status string
+	if err = store.Database().QueryRow(`SELECT status FROM execution_slice_state WHERE workflow_id='wf' AND slice_id='slice_a'`).Scan(&status); err != nil || status != "pending" {
+		t.Fatalf("slice=%q err=%v", status, err)
+	}
+	var attempts int
+	if err = store.Database().QueryRow(`SELECT COUNT(*) FROM mutation_attempts WHERE workflow_id='wf'`).Scan(&attempts); err != nil || attempts != 0 {
+		t.Fatalf("attempts=%d err=%v", attempts, err)
+	}
+}
+
+func TestActivationRejectsAMissingGraphVersionBeforeAnyWrite(t *testing.T) {
+	_, store, seal, c := execFixture(t)
+	defer store.Close()
+	unversioned := graph()
+	unversioned.Version = 0
+	s, err := NewScheduler(store, unversioned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if _, err = store.AcquireLease("worktree:"+seal.WorktreeID, "o", "t", now, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Start(Attempt{ID: "a1", WorkflowID: "wf", SliceID: "slice_a", WorktreeID: seal.WorktreeID, Owner: "o", FencingToken: "t", BasisTree: c.TreeOID, AllowedPaths: []string{"a.txt"}, OperationID: "op1"}); err == nil {
+		t.Fatal("activated without a graph version")
+	}
+	var status string
+	if err = store.Database().QueryRow(`SELECT status FROM execution_slice_state WHERE workflow_id='wf' AND slice_id='slice_a'`).Scan(&status); err != nil || status != "pending" {
+		t.Fatalf("slice=%q err=%v", status, err)
+	}
+	w, err := store.Get("wf")
+	if err != nil || w.State != workflow.StateReady {
+		t.Fatalf("workflow=%+v err=%v", w, err)
+	}
+}
+
 func TestBrokerPatchStaleForbiddenAndRecovery(t *testing.T) {
 	repo, store, seal, c := execFixture(t)
 	defer store.Close()

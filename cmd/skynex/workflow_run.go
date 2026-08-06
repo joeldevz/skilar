@@ -301,7 +301,8 @@ func workflowRunContext(ctx context.Context, store *workflow.SQLiteStore, repo s
 			var attempt execution.Attempt
 			var allowedRaw []byte
 			activeErr := store.Database().QueryRow(`SELECT attempt_id,workflow_id,slice_id,worktree_id,owner,fencing_token,basis_tree,allowed_paths,operation_id FROM mutation_attempts WHERE workflow_id=? AND live=1 LIMIT 1`, id).Scan(&attempt.ID, &attempt.WorkflowID, &attempt.SliceID, &attempt.WorktreeID, &attempt.Owner, &attempt.FencingToken, &attempt.BasisTree, &allowedRaw, &attempt.OperationID)
-			if activeErr == nil {
+			inherited := activeErr == nil
+			if inherited {
 				_ = json.Unmarshal(allowedRaw, &attempt.AllowedPaths)
 			} else {
 				ready, nextErr := scheduler.NextReady()
@@ -341,6 +342,27 @@ func workflowRunContext(ctx context.Context, store *workflow.SQLiteStore, repo s
 					if err = waitForWorkflowLease(ctx, store, "worktree:"+seal.WorktreeID, attempt.Owner, attempt.FencingToken, input.Timeout+time.Minute); err != nil {
 						return err
 					}
+				}
+			}
+			// An inherited attempt may belong to a worker that died between
+			// writing the patch and committing it. Reconcile the worktree under
+			// the lease before dispatching the same attempt again.
+			if inherited {
+				adopted, resumeErr := scheduler.ResumeAttempt(&execution.Broker{Store: store, Seal: seal}, attempt)
+				if resumeErr != nil {
+					return resumeErr
+				}
+				if adopted != "" {
+					if err = store.UpdateRecoveryBasis(id, func(b *workflow.RecoveryBasis) {
+						b.Seal = seal
+						b.CandidatePolicy = gitcandidate.Policy{}
+						b.PreTreeOID = attempt.BasisTree
+						b.PostTreeOID = adopted
+					}); err != nil {
+						return err
+					}
+					_, _ = store.Database().Exec(`DELETE FROM leases WHERE resource=? AND owner=? AND fencing_token=?`, "worktree:"+seal.WorktreeID, attempt.Owner, attempt.FencingToken)
+					continue
 				}
 			}
 			adapter := execution.OpenCodeAdapter{Store: store, Options: execution.OpenCodeOptions{Executable: input.Executable, Model: input.Model, Agent: input.Agent, Timeout: input.Timeout}}

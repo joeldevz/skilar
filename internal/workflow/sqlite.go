@@ -680,6 +680,163 @@ func (s *SQLiteStore) Transition(req Transition) (Workflow, error) {
 	return w, nil
 }
 
+var errGraphVersionRequired = errors.New("execution: the scheduled graph version is required")
+
+// MutationActivation is the exact fenced claim a scheduler makes on one slice.
+type MutationActivation struct {
+	AttemptID, WorkflowID, SliceID, WorktreeID string
+	Owner, FencingToken, BasisTree             string
+	AllowedPaths                               []byte
+	OperationID                                string
+	GraphVersion                               uint64
+}
+
+// ActivateExecutionSlice claims a pending slice, records its fenced attempt,
+// and advances a ready workflow to executing in one transaction. Committing the
+// activation and the state transition together prevents a crash between them
+// from leaving a ready workflow holding an active slice, which no later
+// completion could reconcile.
+func (s *SQLiteStore) ActivateExecutionSlice(a MutationActivation) error {
+	if a.GraphVersion == 0 {
+		return errGraphVersionRequired
+	}
+	ctx := context.Background()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err = conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		}
+	}()
+	res, err := conn.ExecContext(ctx, `UPDATE execution_slice_state SET status='active' WHERE workflow_id=? AND slice_id=? AND status='pending'`, a.WorkflowID, a.SliceID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return errors.New("execution: concurrent writer active")
+	}
+	if _, err = conn.ExecContext(ctx, `INSERT INTO mutation_attempts(attempt_id,workflow_id,slice_id,worktree_id,owner,fencing_token,basis_tree,allowed_paths,operation_id,live) VALUES(?,?,?,?,?,?,?,?,?,1)`, a.AttemptID, a.WorkflowID, a.SliceID, a.WorktreeID, a.Owner, a.FencingToken, a.BasisTree, a.AllowedPaths, a.OperationID); err != nil {
+		return err
+	}
+	if err = beginExecutionIfReady(ctx, conn, a.WorkflowID, a.GraphVersion, s.now); err != nil {
+		return err
+	}
+	if _, err = conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+func beginExecutionIfReady(ctx context.Context, conn *sql.Conn, workflowID string, graphVersion uint64, now func() time.Time) error {
+	w, err := scanWorkflow(conn.QueryRowContext(ctx, `SELECT id,state,state_version,route,minimum_risk,basis_tree,resume_target FROM workflows WHERE id=?`, workflowID))
+	if err != nil {
+		return err
+	}
+	if w.State == StateExecuting {
+		return nil
+	}
+	if w.State != StateReady {
+		return fmt.Errorf("execution: cannot activate a slice while workflow is %s", w.State)
+	}
+	key := fmt.Sprintf("execution:start:v%d", graphVersion)
+	req := Transition{WorkflowID: w.ID, ExpectedState: StateReady, ExpectedVersion: w.StateVersion, NextState: StateExecuting, IdempotencyKey: key}
+	var oldReq []byte
+	err = conn.QueryRowContext(ctx, `SELECT request FROM idempotency WHERE workflow_id=? AND key=?`, w.ID, key).Scan(&oldReq)
+	if err == nil {
+		var previous Transition
+		if json.Unmarshal(oldReq, &previous) != nil {
+			return fmt.Errorf("workflow: corrupt idempotency record")
+		}
+		if !sameTransition(previous, req) {
+			return ErrIdempotencyReuse
+		}
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	next := w
+	next.State = StateExecuting
+	next.StateVersion++
+	res, err := conn.ExecContext(ctx, `UPDATE workflows SET state=?,state_version=? WHERE id=? AND state=? AND state_version=?`, next.State, next.StateVersion, next.ID, StateReady, w.StateVersion)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return ErrCASConflict
+	}
+	artifacts, _ := json.Marshal([]string(nil))
+	stamp := now().UTC().Format(time.RFC3339Nano)
+	if _, err = conn.ExecContext(ctx, `INSERT INTO transition_events(workflow_id,from_state,to_state,state_version,idempotency_key,artifact_ids,occurred_at) VALUES(?,?,?,?,?,?,?)`, next.ID, StateReady, StateExecuting, next.StateVersion, key, artifacts, stamp); err != nil {
+		return err
+	}
+	reqJSON, _ := json.Marshal(cloneTransition(req))
+	resultJSON, _ := json.Marshal(next)
+	_, err = conn.ExecContext(ctx, `INSERT INTO idempotency(workflow_id,key,request,result) VALUES(?,?,?,?)`, next.ID, key, reqJSON, resultJSON)
+	return err
+}
+
+// AdoptAppliedMutation completes a slice whose patch is already durably in the
+// worktree but whose broker transaction never committed. The caller must have
+// proven, under the worktree lock, that the live tree is the recorded post
+// tree; this records the same result the interrupted broker would have.
+func (s *SQLiteStore) AdoptAppliedMutation(workflowID, sliceID, attemptID, operationID string, graphVersion uint64) error {
+	if graphVersion == 0 {
+		return errGraphVersionRequired
+	}
+	ctx := context.Background()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err = conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		}
+	}()
+	var status, post string
+	if err = conn.QueryRowContext(ctx, `SELECT status,post_tree FROM mutation_operations WHERE operation_id=? AND workflow_id=?`, operationID, workflowID).Scan(&status, &post); err != nil {
+		return err
+	}
+	if post == "" || (status != "mutated" && status != "completed") {
+		return fmt.Errorf("execution: mutation %s never reached the worktree", operationID)
+	}
+	if _, err = conn.ExecContext(ctx, `UPDATE mutation_operations SET status='completed' WHERE operation_id=? AND status='mutated'`, operationID); err != nil {
+		return err
+	}
+	if _, err = conn.ExecContext(ctx, `UPDATE mutation_attempts SET live=0 WHERE attempt_id=? AND workflow_id=? AND live=1`, attemptID, workflowID); err != nil {
+		return err
+	}
+	res, err := conn.ExecContext(ctx, `UPDATE execution_slice_state SET status='completed' WHERE workflow_id=? AND slice_id=? AND status='active'`, workflowID, sliceID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return errors.New("execution: slice is not active")
+	}
+	if _, err = completeExecutionIfReady(ctx, conn, workflowID, graphVersion, s.now); err != nil {
+		return err
+	}
+	if _, err = conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
 // CompleteExecutionSlice atomically records the terminal slice result and, if
 // it was the final slice, advances the workflow to verification. Keeping these
 // writes in one transaction prevents a dead detached worker from leaving every
@@ -771,6 +928,9 @@ func adoptCompletedMutationSlices(ctx context.Context, conn *sql.Conn, workflowI
 }
 
 func completeExecutionIfReady(ctx context.Context, conn *sql.Conn, workflowID string, graphVersion uint64, now func() time.Time) (bool, error) {
+	if graphVersion == 0 {
+		return false, errGraphVersionRequired
+	}
 	var remaining int
 	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM execution_slice_state WHERE workflow_id=? AND status!='completed'`, workflowID).Scan(&remaining); err != nil {
 		return false, err
@@ -797,9 +957,6 @@ func completeExecutionIfReady(ctx context.Context, conn *sql.Conn, workflowID st
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
 		return false, ErrCASConflict
-	}
-	if graphVersion == 0 {
-		return false, errors.New("execution: completion requires the scheduled graph version")
 	}
 	key := fmt.Sprintf("execution:complete:v%d", graphVersion)
 	artifacts, _ := json.Marshal([]string(nil))

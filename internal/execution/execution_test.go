@@ -143,6 +143,120 @@ func TestSchedulerReconcilesLegacyCompletedExecution(t *testing.T) {
 	}
 }
 
+func TestReconcileAdoptsSliceLeftActiveByCompletedMutation(t *testing.T) {
+	_, store, seal, c := execFixture(t)
+	defer store.Close()
+	s, err := NewScheduler(store, graph())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if _, err = store.AcquireLease("worktree:"+seal.WorktreeID, "owner", "token", now, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Start(Attempt{ID: "a1", WorkflowID: "wf", SliceID: "slice_a", WorktreeID: seal.WorktreeID, Owner: "owner", FencingToken: "token", BasisTree: c.TreeOID, AllowedPaths: []string{"a.txt"}, OperationID: "op1"}); err != nil {
+		t.Fatal(err)
+	}
+	b := Broker{Store: store, Seal: seal, Policy: gitcandidate.Policy{}}
+	env := workflow.ResultEnvelope{WorkflowID: "wf", NodeID: "slice_a", AttemptID: "a1", BaseCandidateOID: c.TreeOID, Status: workflow.AttemptCompleted, EvidenceIDs: []string{"e1"}}
+	if _, err = b.Apply(context.Background(), WorkerResult{Envelope: env, Patch: PatchArtifact{Operations: []FileOperation{{Path: "a.txt", Data: []byte("new\n")}}}, Owner: "owner", FencingToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	// The worker dies here: the mutation is durably committed and its attempt is
+	// retired, but Complete never ran, so the slice is still active.
+	if ready, readyErr := s.NextReady(); readyErr != nil || ready != nil {
+		t.Fatalf("ready=%#v err=%v", ready, readyErr)
+	}
+	repaired, err := s.ReconcileCompletion()
+	if err != nil || !repaired {
+		t.Fatalf("repaired=%v err=%v", repaired, err)
+	}
+	ready, err := s.NextReady()
+	if err != nil || ready == nil || ready.ID != "slice_b" {
+		t.Fatalf("ready=%#v err=%v", ready, err)
+	}
+	w, err := store.Get("wf")
+	if err != nil || w.State != workflow.StateExecuting {
+		t.Fatalf("workflow=%+v err=%v", w, err)
+	}
+	if repaired, err = s.ReconcileCompletion(); err != nil || repaired {
+		t.Fatalf("second reconcile repaired=%v err=%v", repaired, err)
+	}
+}
+
+func TestReconcileNeverAdoptsSliceWithLiveAttempt(t *testing.T) {
+	_, store, seal, c := execFixture(t)
+	defer store.Close()
+	s, err := NewScheduler(store, graph())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if _, err = store.AcquireLease("worktree:"+seal.WorktreeID, "owner", "token", now, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Start(Attempt{ID: "a1", WorkflowID: "wf", SliceID: "slice_a", WorktreeID: seal.WorktreeID, Owner: "owner", FencingToken: "token", BasisTree: c.TreeOID, AllowedPaths: []string{"a.txt"}, OperationID: "op1"}); err != nil {
+		t.Fatal(err)
+	}
+	repaired, err := s.ReconcileCompletion()
+	if err != nil || repaired {
+		t.Fatalf("repaired=%v err=%v", repaired, err)
+	}
+	var status string
+	if err = store.Database().QueryRow(`SELECT status FROM execution_slice_state WHERE workflow_id='wf' AND slice_id='slice_a'`).Scan(&status); err != nil || status != "active" {
+		t.Fatalf("status=%q err=%v", status, err)
+	}
+}
+
+func TestExecutionCompletionKeyUsesTheScheduledGraphVersion(t *testing.T) {
+	_, store, seal, c := execFixture(t)
+	defer store.Close()
+	scheduled := graph()
+	scheduled.Version = 2
+	// A stale persisted graph must not decide the completion lineage; only the
+	// version the scheduler actually loaded may.
+	if _, err := store.Database().Exec(`INSERT INTO execution_graphs(workflow_id,version,graph) VALUES(?,?,?)`, "wf", 1, "{}"); err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewScheduler(store, scheduled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if _, err = store.AcquireLease("worktree:"+seal.WorktreeID, "owner", "token", now, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	first := Attempt{ID: "a1", WorkflowID: "wf", SliceID: "slice_a", WorktreeID: seal.WorktreeID, Owner: "owner", FencingToken: "token", BasisTree: c.TreeOID, AllowedPaths: []string{"a.txt"}, OperationID: "op1"}
+	if err = s.Start(first); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Complete("wf", "slice_a"); err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.ID, second.SliceID, second.OperationID = "a2", "slice_b", "op2"
+	if err = s.Start(second); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Complete("wf", "slice_b"); err != nil {
+		t.Fatal(err)
+	}
+	var key string
+	if err = store.Database().QueryRow(`SELECT idempotency_key FROM transition_events WHERE workflow_id='wf' AND to_state=?`, workflow.StateVerifying).Scan(&key); err != nil {
+		t.Fatal(err)
+	}
+	if key != "execution:complete:v2" {
+		t.Fatalf("completion key=%q", key)
+	}
+	var startKey string
+	if err = store.Database().QueryRow(`SELECT idempotency_key FROM transition_events WHERE workflow_id='wf' AND to_state=?`, workflow.StateExecuting).Scan(&startKey); err != nil {
+		t.Fatal(err)
+	}
+	if startKey != "execution:start:v2" {
+		t.Fatalf("start key=%q", startKey)
+	}
+}
+
 func TestBrokerPatchStaleForbiddenAndRecovery(t *testing.T) {
 	repo, store, seal, c := execFixture(t)
 	defer store.Close()

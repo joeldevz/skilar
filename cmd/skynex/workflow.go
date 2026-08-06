@@ -115,10 +115,17 @@ func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
 			return nil
 		}
 	}
-	readOnly := args[0] == "status" || args[0] == "inspect" || args[0] == "receipt" || args[0] == "export"
+	diagnostic := args[0] == "status" || args[0] == "inspect"
+	var inspectID string
+	if args[0] == "inspect" {
+		if inspectID, err = requiredWorkflowID(args[1:]); err != nil {
+			return err
+		}
+	}
+	readOnly := diagnostic || args[0] == "receipt" || args[0] == "export"
 	var store *workflow.SQLiteStore
 	if readOnly {
-		if args[0] == "status" || args[0] == "inspect" {
+		if diagnostic {
 			store, err = workflow.OpenRepositorySQLiteLiveReadOnly(cwd)
 		} else {
 			store, err = workflow.OpenRepositorySQLiteReadOnly(cwd)
@@ -131,14 +138,18 @@ func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
 	}
 	// Keep healthy diagnostics genuinely read-only. If their liveness probe
 	// finds an orphaned worker, reopen only then so the command can persist the
-	// durable blocker instead of reporting a workflow as executing forever.
-	if readOnly && (args[0] == "status" || args[0] == "inspect") {
-		needsRecovery, probeErr := workflowDiagnosticNeedsRecovery(store, args)
+	// durable blocker instead of reporting a workflow as executing forever. The
+	// probe already enumerated the workflows, so hand that scan to the command
+	// rather than repeating it.
+	var scan workflowDiagnosticScan
+	if readOnly && diagnostic {
+		probe, probeErr := workflowDiagnosticProbe(store, args, inspectID)
 		if probeErr != nil {
 			store.Close()
 			return probeErr
 		}
-		if needsRecovery {
+		scan = probe
+		if probe.needsRecovery {
 			store.Close()
 			store, err = workflow.OpenRepositorySQLite(cwd)
 			if err != nil {
@@ -172,13 +183,9 @@ func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
 	case "close-discovery":
 		return workflowCloseDiscovery(store, args[1:], out)
 	case "status":
-		return workflowStatus(store, args[1:], out)
+		return workflowStatus(store, args[1:], out, scan)
 	case "inspect":
-		id, err := requiredWorkflowID(args[1:])
-		if err != nil {
-			return err
-		}
-		return workflowInspect(store, reviews, id, out)
+		return workflowInspect(store, reviews, inspectID, out)
 	case "receipt":
 		return workflowReceipt(reviews, args[1:], out)
 	case "abort":
@@ -194,43 +201,59 @@ func runWorkflowCLI(args []string, cwd string, out io.Writer) error {
 	}
 }
 
-func workflowDiagnosticNeedsRecovery(store *workflow.SQLiteStore, args []string) (bool, error) {
-	var ids []string
+// workflowDiagnosticScan carries the workflow enumeration a diagnostic probe
+// already performed, so the command it precedes does not repeat it.
+type workflowDiagnosticScan struct {
+	ids           []string
+	enumerated    bool
+	needsRecovery bool
+}
+
+func workflowDiagnosticProbe(store *workflow.SQLiteStore, args []string, inspectID string) (workflowDiagnosticScan, error) {
+	var scan workflowDiagnosticScan
 	switch args[0] {
 	case "inspect":
-		id, err := requiredWorkflowID(args[1:])
-		if err != nil {
-			return false, err
-		}
-		ids = []string{id}
+		scan.ids = []string{inspectID}
 	case "status":
 		if len(args) > 1 {
-			ids = []string{args[1]}
+			scan.ids = []string{args[1]}
 		} else {
-			rows, err := store.Database().Query(`SELECT id FROM workflows`)
+			ids, err := allWorkflowIDs(store)
 			if err != nil {
-				return false, err
+				return workflowDiagnosticScan{}, err
 			}
-			defer rows.Close()
-			for rows.Next() {
-				var id string
-				if err = rows.Scan(&id); err != nil {
-					return false, err
-				}
-				ids = append(ids, id)
-			}
-			if err = rows.Err(); err != nil {
-				return false, err
-			}
+			scan.ids = ids
+			scan.enumerated = true
 		}
 	}
-	for _, id := range ids {
+	for _, id := range scan.ids {
 		stale, err := store.HasStaleWorkflowJobs(id, time.Now())
-		if err != nil || stale {
-			return stale, err
+		if err != nil {
+			return workflowDiagnosticScan{}, err
+		}
+		if stale {
+			scan.needsRecovery = true
+			break
 		}
 	}
-	return false, nil
+	return scan, nil
+}
+
+func allWorkflowIDs(store *workflow.SQLiteStore) ([]string, error) {
+	rows, err := store.Database().Query(`SELECT id FROM workflows ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 func workflowCommandKnown(command string) bool {
@@ -294,7 +317,7 @@ Commands:
 Run skynex workflow <command> --help for command-specific options.`)
 }
 
-func workflowStatus(store *workflow.SQLiteStore, args []string, out io.Writer) error {
+func workflowStatus(store *workflow.SQLiteStore, args []string, out io.Writer, scan workflowDiagnosticScan) error {
 	if len(args) > 0 {
 		if err := store.ReconcileStaleWorkflowJobs(args[0], time.Now()); err != nil {
 			return err
@@ -329,28 +352,19 @@ func workflowStatus(store *workflow.SQLiteStore, args []string, out io.Writer) e
 		}
 		return nil
 	}
-	rows, err := store.Database().Query(`SELECT id FROM workflows ORDER BY id`)
-	if err != nil {
-		return err
-	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err = rows.Scan(&id); err != nil {
-			rows.Close()
+	ids := scan.ids
+	if !scan.enumerated {
+		var err error
+		if ids, err = allWorkflowIDs(store); err != nil {
 			return err
 		}
-		ids = append(ids, id)
-	}
-	if err = rows.Close(); err != nil {
-		return err
 	}
 	for _, id := range ids {
-		if err = store.ReconcileStaleWorkflowJobs(id, time.Now()); err != nil {
+		if err := store.ReconcileStaleWorkflowJobs(id, time.Now()); err != nil {
 			return err
 		}
 	}
-	rows, err = store.Database().Query(`SELECT id,state,state_version,route,minimum_risk FROM workflows ORDER BY id`)
+	rows, err := store.Database().Query(`SELECT id,state,state_version,route,minimum_risk FROM workflows ORDER BY id`)
 	if err != nil {
 		return err
 	}

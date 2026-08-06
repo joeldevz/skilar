@@ -133,6 +133,15 @@ func workflowStart(store *workflow.SQLiteStore, repo string, args []string, out 
 	if _, err = store.Create(workflow.Workflow{ID: id, Route: workflow.RouteSimple, MinimumRisk: workflow.RiskLow, BasisTree: candidate.TreeOID}); err != nil {
 		return err
 	}
+	// Persist the recovery basis before any state that can block exists, so a
+	// blocker created later always has an exact tree to reconcile against.
+	if err = store.UpdateRecoveryBasis(id, func(b *workflow.RecoveryBasis) {
+		b.Seal = seal
+		b.CandidatePolicy = gitcandidate.Policy{}
+		b.PreTreeOID = candidate.TreeOID
+	}); err != nil {
+		return err
+	}
 	var override *orchestration.RouteOverride
 	if route, exists := flagValue(args, "--route"); exists {
 		actor, aok := flagValue(args, "--override-actor")
@@ -349,7 +358,16 @@ func workflowRunContext(ctx context.Context, store *workflow.SQLiteStore, repo s
 			if err != nil {
 				return err
 			}
-			if _, err = (&execution.Broker{Store: store, Seal: seal}).Apply(context.Background(), result); err != nil {
+			post, err := (&execution.Broker{Store: store, Seal: seal}).Apply(context.Background(), result)
+			if err != nil {
+				return err
+			}
+			if err = store.UpdateRecoveryBasis(id, func(b *workflow.RecoveryBasis) {
+				b.Seal = seal
+				b.CandidatePolicy = gitcandidate.Policy{}
+				b.PreTreeOID = attempt.BasisTree
+				b.PostTreeOID = post
+			}); err != nil {
 				return err
 			}
 			if err = scheduler.Complete(id, attempt.SliceID); err != nil {

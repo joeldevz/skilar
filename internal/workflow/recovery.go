@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -34,6 +35,52 @@ func (s *SQLiteStore) SaveRecoveryBasis(workflowID string, b RecoveryBasis) erro
 	_, err = s.db.Exec(`INSERT INTO recovery_bases(workflow_id,basis) VALUES(?,?) ON CONFLICT(workflow_id) DO UPDATE SET basis=excluded.basis`, workflowID, raw)
 	return err
 }
+
+// UpdateRecoveryBasis merges new lineage into the persisted recovery basis
+// under one immediate transaction. Every stage that changes what a resume must
+// reconcile against records it here, so a blocked workflow always has a basis
+// and never has to fabricate one.
+func (s *SQLiteStore) UpdateRecoveryBasis(workflowID string, mutate func(*RecoveryBasis)) error {
+	if mutate == nil {
+		return errors.New("workflow: recovery basis mutation is required")
+	}
+	ctx := context.Background()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err = conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		}
+	}()
+	var current RecoveryBasis
+	var raw []byte
+	if err = conn.QueryRowContext(ctx, `SELECT basis FROM recovery_bases WHERE workflow_id=?`, workflowID).Scan(&raw); err == nil {
+		_ = json.Unmarshal(raw, &current)
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	mutate(&current)
+	updated, err := json.Marshal(current)
+	if err != nil {
+		return err
+	}
+	if _, err = conn.ExecContext(ctx, `INSERT INTO recovery_bases(workflow_id,basis) VALUES(?,?) ON CONFLICT(workflow_id) DO UPDATE SET basis=excluded.basis`, workflowID, updated); err != nil {
+		return err
+	}
+	if _, err = conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
 func (s *SQLiteStore) RecoveryBasis(workflowID string) (RecoveryBasis, error) {
 	var raw []byte
 	if err := s.db.QueryRow(`SELECT basis FROM recovery_bases WHERE workflow_id=?`, workflowID).Scan(&raw); err != nil {

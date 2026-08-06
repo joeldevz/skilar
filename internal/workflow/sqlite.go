@@ -683,8 +683,10 @@ func (s *SQLiteStore) Transition(req Transition) (Workflow, error) {
 // CompleteExecutionSlice atomically records the terminal slice result and, if
 // it was the final slice, advances the workflow to verification. Keeping these
 // writes in one transaction prevents a dead detached worker from leaving every
-// slice completed while the workflow remains in executing.
-func (s *SQLiteStore) CompleteExecutionSlice(workflowID, sliceID string) error {
+// slice completed while the workflow remains in executing. graphVersion is the
+// version of the execution graph the caller is actually scheduling, so the
+// completion transition shares the exact lineage of its start transition.
+func (s *SQLiteStore) CompleteExecutionSlice(workflowID, sliceID string, graphVersion uint64) error {
 	ctx := context.Background()
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
@@ -707,7 +709,7 @@ func (s *SQLiteStore) CompleteExecutionSlice(workflowID, sliceID string) error {
 	if n, _ := res.RowsAffected(); n != 1 {
 		return errors.New("execution: slice is not active")
 	}
-	if _, err = completeExecutionIfReady(ctx, conn, workflowID, s.now); err != nil {
+	if _, err = completeExecutionIfReady(ctx, conn, workflowID, graphVersion, s.now); err != nil {
 		return err
 	}
 	if _, err = conn.ExecContext(ctx, "COMMIT"); err != nil {
@@ -717,9 +719,13 @@ func (s *SQLiteStore) CompleteExecutionSlice(workflowID, sliceID string) error {
 	return nil
 }
 
-// ReconcileCompletedExecution repairs workflows created before final-slice
-// completion became atomic. It does not change a partially executed workflow.
-func (s *SQLiteStore) ReconcileCompletedExecution(workflowID string) (bool, error) {
+// ReconcileCompletedExecution repairs an execution interrupted between the
+// broker's durable mutation commit and the slice or workflow completion that
+// used to follow it in a separate transaction. It adopts only slices whose
+// mutation already reached 'completed' with its attempt retired, so no fencing
+// decision is re-made here, and it does not change a partially executed
+// workflow.
+func (s *SQLiteStore) ReconcileCompletedExecution(workflowID string, graphVersion uint64) (bool, error) {
 	ctx := context.Background()
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
@@ -735,7 +741,11 @@ func (s *SQLiteStore) ReconcileCompletedExecution(workflowID string) (bool, erro
 			_, _ = conn.ExecContext(ctx, "ROLLBACK")
 		}
 	}()
-	advanced, err := completeExecutionIfReady(ctx, conn, workflowID, s.now)
+	repaired, err := adoptCompletedMutationSlices(ctx, conn, workflowID)
+	if err != nil {
+		return false, err
+	}
+	advanced, err := completeExecutionIfReady(ctx, conn, workflowID, graphVersion, s.now)
 	if err != nil {
 		return false, err
 	}
@@ -743,10 +753,24 @@ func (s *SQLiteStore) ReconcileCompletedExecution(workflowID string) (bool, erro
 		return false, err
 	}
 	committed = true
-	return advanced, nil
+	return repaired || advanced, nil
 }
 
-func completeExecutionIfReady(ctx context.Context, conn *sql.Conn, workflowID string, now func() time.Time) (bool, error) {
+// adoptCompletedMutationSlices completes every slice left 'active' by a worker
+// that died after the broker committed its mutation. The mutation must have
+// reached 'completed' with its own attempt already retired, and the slice must
+// have no live attempt at all, so a slice whose worker is still fenced and
+// running is never adopted.
+func adoptCompletedMutationSlices(ctx context.Context, conn *sql.Conn, workflowID string) (bool, error) {
+	res, err := conn.ExecContext(ctx, `UPDATE execution_slice_state SET status='completed' WHERE workflow_id=? AND status='active' AND slice_id IN (SELECT a.slice_id FROM mutation_attempts a JOIN mutation_operations o ON o.operation_id=a.operation_id AND o.workflow_id=a.workflow_id WHERE a.workflow_id=? AND a.live=0 AND o.status='completed') AND slice_id NOT IN (SELECT l.slice_id FROM mutation_attempts l WHERE l.workflow_id=? AND l.live=1)`, workflowID, workflowID, workflowID)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+func completeExecutionIfReady(ctx context.Context, conn *sql.Conn, workflowID string, graphVersion uint64, now func() time.Time) (bool, error) {
 	var remaining int
 	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM execution_slice_state WHERE workflow_id=? AND status!='completed'`, workflowID).Scan(&remaining); err != nil {
 		return false, err
@@ -774,9 +798,8 @@ func completeExecutionIfReady(ctx context.Context, conn *sql.Conn, workflowID st
 	if n, _ := res.RowsAffected(); n != 1 {
 		return false, ErrCASConflict
 	}
-	var graphVersion uint64
-	if err = conn.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),1) FROM execution_graphs WHERE workflow_id=?`, workflowID).Scan(&graphVersion); err != nil {
-		return false, err
+	if graphVersion == 0 {
+		return false, errors.New("execution: completion requires the scheduled graph version")
 	}
 	key := fmt.Sprintf("execution:complete:v%d", graphVersion)
 	artifacts, _ := json.Marshal([]string(nil))

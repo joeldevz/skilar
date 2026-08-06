@@ -75,6 +75,56 @@ func TestWorkflowStartRunToCandidateFrozen(t *testing.T) {
 	}
 }
 
+func TestWorkflowPersistsRecoveryBasisSoBlockedResumeSucceeds(t *testing.T) {
+	if !workflow.ResumeSupported() {
+		t.Skip("resume requires exclusive worktree locking")
+	}
+	repo, store := cliWorkflowRepo(t)
+	defer store.Close()
+	fake := cliFakeOpenCode(t, "test \"$(cat a.txt)\" = base")
+	args := []string{"--id", "wf", "--request", "change a", "--accept", "test \"$(cat a.txt)\" = new", "--check", "test -f a.txt", "--path", "a.txt", "--opencode", fake, "--timeout", "2s"}
+	if err := workflowStart(store, repo, args, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	started, err := store.RecoveryBasis("wf")
+	if err != nil {
+		t.Fatalf("start did not persist a recovery basis: %v", err)
+	}
+	if started.Seal.RepositoryRoot != repo || started.PreTreeOID == "" {
+		t.Fatalf("basis=%+v", started)
+	}
+	if err = workflowRun(store, repo, []string{"wf"}, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	basis, err := store.RecoveryBasis("wf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if basis.PostTreeOID == "" || basis.PostTreeOID == started.PreTreeOID {
+		t.Fatalf("mutation trees were not recorded: %+v", basis)
+	}
+	if basis.CandidateRecordID == "" || basis.CandidateTreeOID == "" || basis.PolicyHash == "" {
+		t.Fatalf("candidate lineage was not recorded: %+v", basis)
+	}
+	if basis.Seal.RepositoryRoot != repo || basis.PreTreeOID == "" {
+		t.Fatalf("merge dropped the start lineage: %+v", basis)
+	}
+	w, err := store.Get("wf")
+	if err != nil || w.State != workflow.StateCandidateFrozen {
+		t.Fatalf("workflow=%+v err=%v", w, err)
+	}
+	if _, err = store.Transition(workflow.Transition{WorkflowID: "wf", ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateBlocked, ResumeTarget: workflow.StateCandidateFrozen, IdempotencyKey: "block", ArtifactIDs: []string{"blocker-1"}}); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := store.Resume(context.Background(), repo, workflow.ResumeRequest{WorkflowID: "wf", BlockerID: "blocker-1", IdempotencyKey: "resume"})
+	if err != nil {
+		t.Fatalf("resume failed with a persisted basis: %v", err)
+	}
+	if resumed.State != workflow.StateCandidateFrozen {
+		t.Fatalf("resumed=%s", resumed.State)
+	}
+}
+
 func TestWorkflowRetryVerificationReplacesOnlyFailedCheckAndPreservesCandidate(t *testing.T) {
 	repo, store := cliWorkflowRepo(t)
 	defer store.Close()

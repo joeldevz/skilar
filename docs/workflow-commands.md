@@ -28,6 +28,12 @@ Detach is Unix-only. On Windows the capability gate rejects the request before a
 
 Only one live job is admitted at a time. A job is considered healthy only when both its durable heartbeat is at most 30 seconds old and its recorded PID is alive, so a crashed worker or a reused PID is reconciled to `failed` instead of blocking the next run. Use `skynex workflow status` to observe state and `skynex workflow resume` to continue a blocked workflow after reconciliation.
 
+`status` and `inspect` open the database read-only and stay read-only while every job of the inspected workflows is healthy. Only when their liveness probe finds an orphaned worker do they reopen read-write to persist that reconciliation: the dead job is failed and the workflow moves to `blocked` with the state it failed from as its resume target. They never mutate the worktree, the candidate, or the execution graph.
+
+`resume` reconciles against a recovery basis that is persisted by the workflow itself: `start` records the context seal and the frozen basis tree, each brokered mutation records its exact pre and post trees, and verification records the candidate record, tree, and policy hash. A workflow created before this basis existed has none, so `resume` fails closed with `workflow: recovery basis artifact is missing`; retry the failed job with the `next` command reported by `status`, or abort it.
+
+An execution interrupted between the broker's durable mutation commit and the slice completion that follows it is repaired on the next run. Reconciliation adopts only slices whose mutation already reached `completed` with its attempt retired and no live attempt remaining, so a still-fenced worker is never displaced, and it then advances a fully executed workflow to verification.
+
 A failed detached job is a durable workflow blocker rather than a dead side-car: the workflow moves to `blocked` with the state it failed from recorded as the resume target. Re-running the same `run --detach` or `review --detach` command retries that blocker directly, bypassing candidate recovery because a job failure never claimed a candidate tree change. Retries are bounded to three attempts per workflow and operation. `status` reports `attempt`, `retries_remaining`, a truncated error preview, and a `next` field that is `wait` while the job is healthy, the exact retry command once it is retryable, and `manual_resolution_required` when the attempts are exhausted; `inspect` reports the same attempt accounting for every job of the workflow.
 
 ## Correcting one failed verification check

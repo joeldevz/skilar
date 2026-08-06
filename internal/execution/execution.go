@@ -114,14 +114,15 @@ func (s *Scheduler) Start(a Attempt) error {
 	return err
 }
 func (s *Scheduler) Complete(workflowID, sliceID string) error {
-	return s.store.CompleteExecutionSlice(workflowID, sliceID)
+	return s.store.CompleteExecutionSlice(workflowID, sliceID, s.graph.Version)
 }
 
-// ReconcileCompletion closes the historical crash window from versions that
-// persisted the final slice completion separately from the workflow state
-// transition. It is safe to call at the start of every execution pass.
+// ReconcileCompletion closes the crash window between the broker's durable
+// mutation commit and the slice and workflow completions that follow it. It
+// adopts slices whose mutation already completed and advances a fully executed
+// workflow, and is safe to call at the start of every execution pass.
 func (s *Scheduler) ReconcileCompletion() (bool, error) {
-	return s.store.ReconcileCompletedExecution(s.graph.WorkflowID)
+	return s.store.ReconcileCompletedExecution(s.graph.WorkflowID, s.graph.Version)
 }
 
 type FileOperation struct {

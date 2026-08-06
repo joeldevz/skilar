@@ -97,9 +97,9 @@ func OpenSQLiteReadOnly(path string) (*SQLiteStore, error) {
 		db.Close()
 		return nil, err
 	}
-	if version != 18 {
+	if version != 19 {
 		db.Close()
-		return nil, fmt.Errorf("workflow database schema %d requires writable migration to schema 18", version)
+		return nil, fmt.Errorf("workflow database schema %d requires writable migration to schema 19", version)
 	}
 	return s, nil
 }
@@ -155,9 +155,9 @@ func OpenSQLiteLiveReadOnly(path string) (*SQLiteStore, error) {
 		db.Close()
 		return nil, err
 	}
-	if version != 18 {
+	if version != 19 {
 		db.Close()
-		return nil, fmt.Errorf("workflow database schema %d requires writable migration to schema 18", version)
+		return nil, fmt.Errorf("workflow database schema %d requires writable migration to schema 19", version)
 	}
 	return s, nil
 }
@@ -197,10 +197,10 @@ func (s *SQLiteStore) migrate() error {
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		return err
 	}
-	if version > 18 {
-		return fmt.Errorf("workflow database schema %d is newer than supported schema 18", version)
+	if version > 19 {
+		return fmt.Errorf("workflow database schema %d is newer than supported schema 19", version)
 	}
-	if version == 18 {
+	if version == 19 {
 		return nil
 	}
 	if version == 0 {
@@ -479,6 +479,45 @@ CREATE TABLE IF NOT EXISTS verification_contract_revisions (
 			return err
 		}
 		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+	if version < 19 {
+		const schemaV19 = `
+CREATE TABLE IF NOT EXISTS execution_contract_revisions (
+  workflow_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  contract BLOB NOT NULL,
+  parent_version INTEGER NOT NULL,
+  invalidation_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(workflow_id,version)
+);
+CREATE TABLE IF NOT EXISTS replan_revisions (
+  workflow_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  invalidation_id TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  request BLOB NOT NULL,
+  result BLOB NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(workflow_id,version),
+  UNIQUE(workflow_id,idempotency_key)
+);`
+		tx, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if _, err = tx.Exec(schemaV19); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(`PRAGMA user_version=19`); err != nil {
+			return err
+		}
+		if err = tx.Commit(); err != nil {
 			return err
 		}
 	}

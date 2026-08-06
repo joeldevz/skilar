@@ -256,7 +256,7 @@ func TestHealthyWorkflowStillReportsNoNextAction(t *testing.T) {
 
 func TestWorkflowCommandHelpOutsideRepositoryDoesNotCreateDatabase(t *testing.T) {
 	dir := t.TempDir()
-	commands := []string{"start", "run", "review", "deliver", "status", "inspect", "receipt", "approve", "revoke-approval", "abort", "resume", "export", "frontier", "answer", "close-discovery"}
+	commands := []string{"start", "run", "review", "deliver", "status", "inspect", "receipt", "approve", "revoke-approval", "abort", "resume", "replan", "retry-verification", "export", "frontier", "answer", "close-discovery"}
 	for _, command := range commands {
 		t.Run(command, func(t *testing.T) {
 			var out bytes.Buffer

@@ -77,7 +77,7 @@ func validateLensOutput(raw []byte, out *lensOutput) string {
 	return ""
 }
 
-func (r *OpenCodeReviewRunner) persistMalformed(workflowID, lens string, raw []byte, detail string) {
+func (r *OpenCodeReviewRunner) persistMalformed(workflowID, candidateID, lens string, raw []byte, detail string) {
 	redacted := (&artifactstore.Store{}).Redact(raw)
 	if len(redacted) > 4096 {
 		redacted = redacted[:4096]
@@ -86,7 +86,7 @@ func (r *OpenCodeReviewRunner) persistMalformed(workflowID, lens string, raw []b
 	if len(preview) > 4096 {
 		preview = preview[:4096]
 	}
-	_, _ = r.Store.Database().Exec(`UPDATE review_invocations SET status='malformed',error_preview=? WHERE id=?`, preview, "review:"+workflowID+":"+lens)
+	_, _ = r.Store.Database().Exec(`UPDATE review_invocations SET status='malformed',error_preview=? WHERE id=?`, preview, reviewInvocationID(workflowID, candidateID, lens))
 }
 
 type Finding struct {
@@ -146,7 +146,7 @@ func (r *OpenCodeReviewRunner) Run(ctx context.Context, workflowID string) (Rece
 		}
 	}
 	if w.State == workflow.StateCandidateFrozen {
-		w, err = r.Store.Transition(workflow.Transition{WorkflowID: workflowID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateReviewing, IdempotencyKey: "review:start:v1"})
+		w, err = r.Store.Transition(workflow.Transition{WorkflowID: workflowID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateReviewing, IdempotencyKey: reviewTransitionKey("start", w.StateVersion)})
 		if err != nil {
 			return Receipt{}, err
 		}
@@ -175,7 +175,7 @@ func (r *OpenCodeReviewRunner) Run(ctx context.Context, workflowID string) (Rece
 	if drift, e := gitcandidate.DetectDrift(verified.Candidate, gitcandidate.Policy{}); e != nil {
 		return Receipt{}, e
 	} else if drift.Any() {
-		_, _ = r.Store.Transition(workflow.Transition{WorkflowID: workflowID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateReplanRequired, IdempotencyKey: "review:drift:v1"})
+		_, _ = r.Store.Transition(workflow.Transition{WorkflowID: workflowID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateReplanRequired, IdempotencyKey: reviewTransitionKey("drift", w.StateVersion)})
 		return Receipt{}, ErrCandidateMismatch
 	}
 	semanticRaw, err := r.invoke(ctx, workflowID, verified.Record, "semantic", semanticPrompt())
@@ -184,7 +184,7 @@ func (r *OpenCodeReviewRunner) Run(ctx context.Context, workflowID string) (Rece
 	}
 	var semantic semanticOutput
 	if detail := validateSemanticOutput(semanticRaw, &semantic); detail != "" {
-		r.persistMalformed(workflowID, "semantic", semanticRaw, detail)
+		r.persistMalformed(workflowID, verified.Record.ID, "semantic", semanticRaw, detail)
 		return Receipt{}, fmt.Errorf("%w: %s", ErrMalformedReview, detail)
 	}
 	if err = r.persistCheckpoint(workflowID, verified.Record, "semantic", semanticPrompt(), semanticRaw); err != nil {
@@ -211,6 +211,7 @@ func (r *OpenCodeReviewRunner) Run(ctx context.Context, workflowID string) (Rece
 		lenses = []Lens{LensRisk, LensReadability, LensReliability, LensResilience}
 	}
 	severe := false
+	var severeFindingIDs []string
 	for _, lens := range lenses {
 		lensRaw, invokeErr := r.invoke(ctx, workflowID, verified.Record, string(lens), lensPrompt(lens))
 		if invokeErr != nil {
@@ -218,7 +219,7 @@ func (r *OpenCodeReviewRunner) Run(ctx context.Context, workflowID string) (Rece
 		}
 		var output lensOutput
 		if detail := validateLensOutput(lensRaw, &output); detail != "" {
-			r.persistMalformed(workflowID, string(lens), lensRaw, detail)
+			r.persistMalformed(workflowID, verified.Record.ID, string(lens), lensRaw, detail)
 			return Receipt{}, fmt.Errorf("%w: %s", ErrMalformedReview, detail)
 		}
 		if err = r.persistCheckpoint(workflowID, verified.Record, string(lens), lensPrompt(lens), lensRaw); err != nil {
@@ -231,7 +232,7 @@ func (r *OpenCodeReviewRunner) Run(ctx context.Context, workflowID string) (Rece
 			// Model-provided IDs are untrusted labels, not global authority. Keep
 			// them only as source metadata and assign an engine-owned identity.
 			f.SourceID = f.ID
-			f.ID = fmt.Sprintf("finding:%s:%s:%d", workflowID, lens, i)
+			f.ID = fmt.Sprintf("finding:%s:%s:%s:%d", workflowID, verified.Record.ID, lens, i)
 			item, _ := json.Marshal(f)
 			var existingWorkflow, existingTree string
 			var existingItem []byte
@@ -247,11 +248,12 @@ func (r *OpenCodeReviewRunner) Run(ctx context.Context, workflowID string) (Rece
 			evidence = append(evidence, Evidence{ID: eid, Kind: EvidenceReview, CandidateRecordID: verified.Record.ID, CandidateTreeOID: verified.Record.TreeOID, PolicyHash: verified.Record.PolicyHash, Digest: hash(item), Lens: lens})
 			if f.Severity == "severe" && f.Reproducible && f.CandidateCaused {
 				severe = true
+				severeFindingIDs = append(severeFindingIDs, f.ID)
 			}
 		}
 	}
 	if severe {
-		_, _ = r.Store.Transition(workflow.Transition{WorkflowID: workflowID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateReplanRequired, IdempotencyKey: "review:severe:v1"})
+		_, _ = r.Store.Transition(workflow.Transition{WorkflowID: workflowID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateReplanRequired, IdempotencyKey: reviewTransitionKey("severe", w.StateVersion), ArtifactIDs: severeFindingIDs})
 		return Receipt{}, errors.New("review: severe reproducible candidate-caused finding")
 	}
 	for _, e := range evidence {
@@ -275,8 +277,16 @@ func (r *OpenCodeReviewRunner) Run(ctx context.Context, workflowID string) (Rece
 		}
 	}
 	w, _ = r.Store.Get(workflowID)
-	_, err = r.Store.Transition(workflow.Transition{WorkflowID: workflowID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateReceipted, IdempotencyKey: "review:receipted:v1", ArtifactIDs: []string{receipt.ID}})
+	_, err = r.Store.Transition(workflow.Transition{WorkflowID: workflowID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateReceipted, IdempotencyKey: reviewTransitionKey("receipted", w.StateVersion), ArtifactIDs: []string{receipt.ID}})
 	return receipt, err
+}
+
+func reviewTransitionKey(kind string, stateVersion uint64) string {
+	return fmt.Sprintf("review:%s:v1:sv%d", kind, stateVersion)
+}
+
+func reviewInvocationID(workflowID, candidateID, lens string) string {
+	return "review:" + workflowID + ":" + candidateID + ":" + lens
 }
 
 func (r *OpenCodeReviewRunner) verificationEvidence(c CandidateRecord) ([]Evidence, error) {
@@ -302,6 +312,7 @@ func (r *OpenCodeReviewRunner) verificationEvidence(c CandidateRecord) ([]Eviden
 }
 
 func (r *OpenCodeReviewRunner) invoke(parent context.Context, workflowID string, c CandidateRecord, lens, prompt string) ([]byte, error) {
+	invocationID := reviewInvocationID(workflowID, c.ID, lens)
 	promptHash := hash([]byte(prompt))
 	modelIdentity := r.modelIdentity()
 	checkpointID := hash([]byte(workflowID + "\x00" + c.TreeOID + "\x00" + c.PolicyHash + "\x00" + lens + "\x00" + modelIdentity + "\x00" + promptHash))
@@ -311,7 +322,8 @@ func (r *OpenCodeReviewRunner) invoke(parent context.Context, workflowID string,
 	}
 	// Recover a result durably written after process completion but before the
 	// caller validated/checkpointed it. Validation still happens in Run.
-	if err := r.Store.Database().QueryRow(`SELECT result_json FROM review_invocations WHERE id=? AND workflow_id=? AND candidate_tree=? AND lens=? AND model=? AND prompt_hash=? AND policy_hash=? AND status='completed' AND length(result_json)>0`, "review:"+workflowID+":"+lens, workflowID, c.TreeOID, lens, modelIdentity, promptHash, c.PolicyHash).Scan(&cached); err == nil {
+	legacyInvocationID := "review:" + workflowID + ":" + lens
+	if err := r.Store.Database().QueryRow(`SELECT result_json FROM review_invocations WHERE id IN (?,?) AND workflow_id=? AND candidate_tree=? AND lens=? AND model=? AND prompt_hash=? AND policy_hash=? AND status='completed' AND length(result_json)>0 ORDER BY CASE id WHEN ? THEN 0 ELSE 1 END LIMIT 1`, invocationID, legacyInvocationID, workflowID, c.TreeOID, lens, modelIdentity, promptHash, c.PolicyHash, invocationID).Scan(&cached); err == nil {
 		// review_invocations stores the raw process result; the fresh path
 		// returns it redacted, so a resumed run must produce the same bytes or
 		// the receipt digest would not be reproducible across an interruption.
@@ -379,7 +391,7 @@ func (r *OpenCodeReviewRunner) invoke(parent context.Context, workflowID string,
 		preview := (&artifactstore.Store{}).Redact(snapshot)
 		for attempt := 0; attempt < 3; attempt++ {
 			stamp := time.Now().UTC().Format(time.RFC3339Nano)
-			if _, updateErr := r.Store.Database().Exec(`UPDATE review_invocations SET last_activity_at=?,heartbeat_at=?,error_preview=? WHERE id=? AND status='running'`, stamp, stamp, string(preview), "review:"+workflowID+":"+lens); updateErr == nil {
+			if _, updateErr := r.Store.Database().Exec(`UPDATE review_invocations SET last_activity_at=?,heartbeat_at=?,error_preview=? WHERE id=? AND status='running'`, stamp, stamp, string(preview), invocationID); updateErr == nil {
 				break
 			}
 			time.Sleep(5 * time.Millisecond)
@@ -398,7 +410,7 @@ func (r *OpenCodeReviewRunner) invoke(parent context.Context, workflowID string,
 	}
 	configureReviewProcess(cmd)
 	start := time.Now().UTC()
-	id := "review:" + workflowID + ":" + lens
+	id := invocationID
 	_, err = r.Store.Database().Exec(`INSERT OR REPLACE INTO review_invocations(id,workflow_id,candidate_tree,lens,model,status,output_digest,started_at,finished_at,error_preview,pid,heartbeat_at,last_activity_at,result_json,prompt_hash,policy_hash) VALUES(?,?,?,?,?,'running','',?,'','',0,?,?,'',?,?)`, id, workflowID, c.TreeOID, lens, modelIdentity, start.Format(time.RFC3339Nano), start.Format(time.RFC3339Nano), start.Format(time.RFC3339Nano), promptHash, c.PolicyHash)
 	if err != nil {
 		return nil, err

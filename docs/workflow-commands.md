@@ -60,6 +60,16 @@ The candidate is refrozen and compared before and after the replacement run; any
 
 `--idempotency-key` is required: repeating a key replays the recorded revision instead of creating a second one, and reusing a key with a different check, replacement, actor, or reason is rejected. A replacement that also fails makes the command fail and leaves the workflow in the failed verification state rather than freezing a candidate.
 
+## Replanning in place
+
+`workflow replan` revises a workflow in `replan_required` without inventing a successor workflow ID:
+
+```text
+skynex workflow replan --id WORKFLOW_ID --finding-id FINDING_OR_EVIDENCE_ID --plan-file PLAN.json --actor ACTOR --reason TEXT --idempotency-key KEY
+```
+
+The invalidation ID must belong to the workflow's persisted review findings or to the transition that entered `replan_required`. The replacement plan is validated before one transaction appends a new execution-graph and contract revision, updates the runnable input, clears only derived slice state, revokes current approvals/receipt authority, and advances the same workflow to `ready`. Historical graphs, contracts, findings, attempts, evidence, receipts, and revocations remain inspectable. Repeating the same idempotency key replays the original result; a changed request with the same key is rejected.
+
 ## Notifications
 
 `notifications claim | ack | release | presence` is the terminal-notification channel that the OpenCode plugin polls, so a workflow that reaches a terminal state surfaces in the session that owns it.

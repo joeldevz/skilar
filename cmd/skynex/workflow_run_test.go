@@ -51,7 +51,10 @@ func cliFakeOpenCodeFor(t *testing.T, prefix, workflowID string) string {
 	path := filepath.Join(t.TempDir(), "opencode")
 	body := "#!/bin/sh\nset -eu\n" + prefix + `
 tree=$(git write-tree)
-printf '{"envelope":{"WorkflowID":"` + workflowID + `","NodeID":"slice_main","AttemptID":"` + workflowID + `:slice_main","BaseCandidateOID":"%s","Status":"completed","EvidenceIDs":["fake"]},"patch":{"Operations":[{"Path":"a.txt","Data":"bmV3Cg==","Mode":384}]}}' "$tree" > "$SKYNEX_RESULT_FILE"
+node=slice_main
+attempt=` + workflowID + `:slice_main
+case "$*" in *` + workflowID + `:v2:slice_repair*) node=slice_repair; attempt=` + workflowID + `:v2:slice_repair;; esac
+printf '{"envelope":{"WorkflowID":"` + workflowID + `","NodeID":"%s","AttemptID":"%s","BaseCandidateOID":"%s","Status":"completed","EvidenceIDs":["fake"]},"patch":{"Operations":[{"Path":"a.txt","Data":"bmV3Cg==","Mode":384}]}}' "$node" "$attempt" "$tree" > "$SKYNEX_RESULT_FILE"
 `
 	if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
 		t.Fatal(err)
@@ -627,6 +630,81 @@ func TestWorkflowRetryVerificationFailingAgainStaysRetryableAndNeverFreezes(t *t
 	var invocations int
 	if err = store.Database().QueryRow(`SELECT COUNT(*) FROM opencode_invocations WHERE workflow_id='wf'`).Scan(&invocations); err != nil || invocations != 1 {
 		t.Fatalf("coder reran: invocations=%d err=%v", invocations, err)
+	}
+}
+
+func TestWorkflowReplanPreservesLineageAndReplaysIdempotently(t *testing.T) {
+	repo, store := cliWorkflowRepo(t)
+	defer store.Close()
+	fake := cliFakeOpenCode(t, "true")
+	args := []string{"--id", "wf", "--request", "change a", "--accept", "old acceptance", "--check", "false", "--path", "a.txt", "--opencode", fake, "--timeout", "2s"}
+	if err := workflowStart(store, repo, args, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := workflowRun(store, repo, []string{"wf"}, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	w, _ := store.Get("wf")
+	if w.State != workflow.StateReplanRequired {
+		t.Fatalf("state=%s", w.State)
+	}
+	events, err := store.Events("wf")
+	if err != nil || len(events) == 0 || len(events[len(events)-1].ArtifactIDs) == 0 {
+		t.Fatalf("events=%+v err=%v", events, err)
+	}
+	invalidationID := events[len(events)-1].ArtifactIDs[0]
+	plan := filepath.Join(t.TempDir(), "plan.json")
+	if err = os.WriteFile(plan, []byte(`{"slices":[{"ID":"slice_repair","Title":"repair finding","acceptance_criteria":["true"],"paths":["a.txt"],"checks":["true"]}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	replanArgs := []string{"--id", "wf", "--finding-id", invalidationID, "--plan-file", plan, "--actor", "tester", "--reason", "repair verified failure", "--idempotency-key", "replan:v1"}
+	start := make(chan struct{})
+	type replanResult struct {
+		out string
+		err error
+	}
+	results := make(chan replanResult, 2)
+	for range 2 {
+		go func() {
+			<-start
+			var out bytes.Buffer
+			results <- replanResult{out: out.String(), err: workflowReplan(store, replanArgs, &out)}
+		}()
+	}
+	close(start)
+	for range 2 {
+		result := <-results
+		if result.err != nil {
+			t.Fatalf("concurrent idempotent replan: %v", result.err)
+		}
+	}
+	if err = workflowReplan(store, replanArgs, &bytes.Buffer{}); err != nil {
+		t.Fatalf("later idempotent replay: %v", err)
+	}
+	conflict := append([]string(nil), replanArgs...)
+	for i := range conflict {
+		if conflict[i] == "repair verified failure" {
+			conflict[i] = "different repair"
+		}
+	}
+	if err = workflowReplan(store, conflict, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "conflicts") {
+		t.Fatalf("conflicting replay err=%v", err)
+	}
+	var graphs, revisions int
+	_ = store.Database().QueryRow(`SELECT COUNT(*) FROM execution_graphs WHERE workflow_id='wf'`).Scan(&graphs)
+	_ = store.Database().QueryRow(`SELECT COUNT(*) FROM replan_revisions WHERE workflow_id='wf'`).Scan(&revisions)
+	if graphs != 2 || revisions != 1 {
+		t.Fatalf("graphs=%d revisions=%d", graphs, revisions)
+	}
+	if err = workflowRun(store, repo, []string{"wf"}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("run revised graph: %v", err)
+	}
+	if w, _ = store.Get("wf"); w.State != workflow.StateCandidateFrozen {
+		t.Fatalf("revised state=%s", w.State)
+	}
+	var inspection bytes.Buffer
+	if err = workflowInspect(store, review.NewSQLiteStore(store.Database()), "wf", &inspection); err != nil || !strings.Contains(inspection.String(), `"replan_revisions"`) {
+		t.Fatalf("inspection=%s err=%v", inspection.String(), err)
 	}
 }
 

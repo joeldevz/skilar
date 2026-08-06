@@ -227,12 +227,14 @@ func TestSQLiteMigratesExistingV1SchemaToCurrent(t *testing.T) {
 	}
 	defer store.Close()
 	var version int
-	if err = store.Database().QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 18 {
+	if err = store.Database().QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 19 {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
-	var table string
-	if err = store.Database().QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='receipt_authority'`).Scan(&table); err != nil || table != "receipt_authority" {
-		t.Fatalf("table=%q err=%v", table, err)
+	for _, expected := range []string{"receipt_authority", "execution_contract_revisions", "replan_revisions"} {
+		var table string
+		if err = store.Database().QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, expected).Scan(&table); err != nil || table != expected {
+			t.Fatalf("table=%q expected=%q err=%v", table, expected, err)
+		}
 	}
 }
 
@@ -355,7 +357,7 @@ func TestSchema18BackfillsResultTransportForInFlightWorkflows(t *testing.T) {
 		t.Fatalf("in-flight workflow disturbed: %+v err=%v", w, err)
 	}
 	var version int
-	if err = store.Database().QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 18 {
+	if err = store.Database().QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 19 {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 }

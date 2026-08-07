@@ -36,6 +36,10 @@
             ]
           },
           "uniqueItems": true
+        },
+        "neuroxEnabled": {
+          "type": "boolean",
+          "description": "Whether the optional Neurox integration is enabled"
         }
       }
     },

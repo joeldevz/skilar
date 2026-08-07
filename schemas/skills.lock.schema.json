@@ -28,7 +28,6 @@
           "requestedVersion",
           "resolvedVersion",
           "commit",
-          "repoUrl",
           "targets"
         ],
         "properties": {
@@ -46,8 +45,18 @@
           },
           "commit": {
             "type": "string",
-            "description": "Exact commit SHA",
-            "pattern": "^[a-f0-9]{40}$"
+            "description": "Exact commit SHA or trusted local source sentinel",
+            "anyOf": [
+              {
+                "pattern": "^[a-f0-9]{40}$"
+              },
+              {
+                "enum": [
+                  "embedded",
+                  "unknown-"
+                ]
+              }
+            ]
           },
           "repoUrl": {
             "type": "string",

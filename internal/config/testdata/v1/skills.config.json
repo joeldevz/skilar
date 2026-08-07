@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "defaults": {
+    "interactive": false,
+    "targets": [
+      "claude",
+      "opencode"
+    ],
+    "neuroxEnabled": true
+  },
+  "packages": {
+    "skills": {
+      "version": "latest",
+      "targets": [
+        "claude",
+        "opencode"
+      ]
+    }
+  },
+  "external": {
+    "preserve": "fixture-v1"
+  }
+}

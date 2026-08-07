@@ -281,67 +281,71 @@ func allWorkflowIDs(store *workflow.SQLiteStore) ([]string, error) {
 	return ids, rows.Err()
 }
 
-func workflowCommandKnown(command string) bool {
-	switch command {
-	case "start", "run", "worker", "notifications", "review", "deliver", "approve", "revoke-approval", "frontier", "answer", "close-discovery", "status", "inspect", "receipt", "abort", "resume", "retry-verification", "replan", "export":
-		return true
+type workflowCommandSpec struct {
+	Name, Summary, Usage string
+	Hidden               bool
+}
+
+// workflowCommands is the canonical public command contract. Command
+// recognition and both help surfaces are derived from this registry so adding
+// a command cannot silently omit its usage or documentation. The worker entry
+// point remains registered but hidden because it is spawned internally.
+var workflowCommands = []workflowCommandSpec{
+	{Name: "start", Summary: "Create a simple, planned, or discovery workflow", Usage: "Usage: skynex workflow start --id ID --request TEXT --path PATH --check COMMAND --accept COMMAND [--route simple|planned|discovery] [--plan-file FILE] [--wayfinder-file FILE] [--override-actor ACTOR --override-reason REASON] [--model MODEL] [--agent AGENT] [--opencode PATH] [--timeout DURATION]\nSimple requires --id, --request, and repeatable --path, --check, --accept. Planned requires --plan-file. Discovery requires --wayfinder-file."},
+	{Name: "run", Summary: "Execute ready slices with OpenCode and verify the result", Usage: "Usage: skynex workflow run WORKFLOW_ID [--detach]"},
+	{Name: "notifications", Summary: "Claim or acknowledge terminal workflow notifications", Usage: "Usage: skynex workflow notifications claim --consumer SESSION_ID | ack|release --id ID --claim-token TOKEN"},
+	{Name: "review", Summary: "Review a frozen candidate and issue its receipt", Usage: "Usage: skynex workflow review --id WORKFLOW_ID [--detach]"},
+	{Name: "deliver", Summary: "Commit the exact receipt-authorized candidate tree", Usage: "Usage: skynex workflow deliver --id WORKFLOW_ID --message TEXT --idempotency-key KEY [--author-name NAME --author-email EMAIL]"},
+	{Name: "status", Summary: "List workflows or show one workflow", Usage: "Usage: skynex workflow status [WORKFLOW_ID]"},
+	{Name: "inspect", Summary: "Show workflow events, inputs, approvals, and authority", Usage: "Usage: skynex workflow inspect WORKFLOW_ID"},
+	{Name: "receipt", Summary: "Show the current or a historical receipt", Usage: "Usage: skynex workflow receipt WORKFLOW_ID | --id RECEIPT_ID"},
+	{Name: "approve", Summary: "Approve an exact high-risk action basis", Usage: "Usage: skynex workflow approve --id WORKFLOW_ID --action ACTION --actor ACTOR --reason TEXT [--expires DURATION]"},
+	{Name: "revoke-approval", Summary: "Revoke a current approval", Usage: "Usage: skynex workflow revoke-approval --id WORKFLOW_ID --action ACTION --actor ACTOR --reason TEXT"},
+	{Name: "abort", Summary: "Stop work and revoke attempts, leases, and approvals", Usage: "Usage: skynex workflow abort WORKFLOW_ID --idempotency-key KEY"},
+	{Name: "resume", Summary: "Reconcile and resume a blocked workflow", Usage: "Usage: skynex workflow resume WORKFLOW_ID --blocker-id ID --idempotency-key KEY"},
+	{Name: "retry-verification", Summary: "Replace one failed check and verify the same candidate", Usage: "Usage: skynex workflow retry-verification --id WORKFLOW_ID --check-id EVIDENCE_ID --replacement COMMAND --actor ACTOR --reason TEXT --idempotency-key KEY"},
+	{Name: "replan", Summary: "Revise a failed plan in place while preserving lineage", Usage: "Usage: skynex workflow replan --id WORKFLOW_ID --finding-id FINDING_ID --plan-file PLAN.json --actor ACTOR --reason TEXT --idempotency-key KEY"},
+	{Name: "export", Summary: "Export a workflow summary or receipt", Usage: "Usage: skynex workflow export WORKFLOW_ID --out PATH"},
+	{Name: "frontier", Summary: "Show the next blocking discovery question", Usage: "Usage: skynex workflow frontier --id WORKFLOW_ID"},
+	{Name: "answer", Summary: "Record an attributed discovery answer", Usage: "Usage: skynex workflow answer --id WORKFLOW_ID --node NODE_ID --answer TEXT --actor ACTOR"},
+	{Name: "close-discovery", Summary: "Close discovery with an explicit execution plan", Usage: "Usage: skynex workflow close-discovery --id WORKFLOW_ID --plan-file FILE"},
+	{Name: "worker", Usage: "Usage: skynex workflow worker WORKFLOW_ID --job JOB_ID", Hidden: true},
+}
+
+func workflowCommand(command string) (workflowCommandSpec, bool) {
+	for _, spec := range workflowCommands {
+		if spec.Name == command {
+			return spec, true
+		}
 	}
-	return false
+	return workflowCommandSpec{}, false
+}
+
+func workflowCommandKnown(command string) bool {
+	_, ok := workflowCommand(command)
+	return ok
 }
 
 func printWorkflowCommandUsage(command string, out io.Writer) error {
-	usage := map[string]string{
-		"start":              "Usage: skynex workflow start --id ID --request TEXT --path PATH --check COMMAND --accept COMMAND [--route simple|planned|discovery] [--plan-file FILE] [--wayfinder-file FILE] [--override-actor ACTOR --override-reason REASON] [--model MODEL] [--agent AGENT] [--opencode PATH] [--timeout DURATION]\nSimple requires --id, --request, and repeatable --path, --check, --accept. Planned requires --plan-file. Discovery requires --wayfinder-file.",
-		"run":                "Usage: skynex workflow run WORKFLOW_ID [--detach]",
-		"notifications":      "Usage: skynex workflow notifications claim --consumer SESSION_ID | ack|release --id ID --claim-token TOKEN",
-		"review":             "Usage: skynex workflow review --id WORKFLOW_ID [--detach]",
-		"deliver":            "Usage: skynex workflow deliver --id WORKFLOW_ID --message TEXT --idempotency-key KEY [--author-name NAME --author-email EMAIL]",
-		"status":             "Usage: skynex workflow status [WORKFLOW_ID]",
-		"inspect":            "Usage: skynex workflow inspect WORKFLOW_ID",
-		"receipt":            "Usage: skynex workflow receipt WORKFLOW_ID | --id RECEIPT_ID",
-		"approve":            "Usage: skynex workflow approve --id WORKFLOW_ID --action ACTION --actor ACTOR --reason TEXT [--expires DURATION]",
-		"revoke-approval":    "Usage: skynex workflow revoke-approval --id WORKFLOW_ID --action ACTION --actor ACTOR --reason TEXT",
-		"abort":              "Usage: skynex workflow abort WORKFLOW_ID --idempotency-key KEY",
-		"resume":             "Usage: skynex workflow resume WORKFLOW_ID --blocker-id ID --idempotency-key KEY",
-		"retry-verification": "Usage: skynex workflow retry-verification --id WORKFLOW_ID --check-id EVIDENCE_ID --replacement COMMAND --actor ACTOR --reason TEXT --idempotency-key KEY",
-		"replan":             "Usage: skynex workflow replan --id WORKFLOW_ID --finding-id FINDING_ID --plan-file PLAN.json --actor ACTOR --reason TEXT --idempotency-key KEY",
-		"export":             "Usage: skynex workflow export WORKFLOW_ID --out PATH",
-		"frontier":           "Usage: skynex workflow frontier --id WORKFLOW_ID",
-		"answer":             "Usage: skynex workflow answer --id WORKFLOW_ID --node NODE_ID --answer TEXT --actor ACTOR",
-		"close-discovery":    "Usage: skynex workflow close-discovery --id WORKFLOW_ID --plan-file FILE",
-	}
-	value, ok := usage[command]
+	spec, ok := workflowCommand(command)
 	if !ok {
 		return fmt.Errorf("unknown workflow command %q", command)
 	}
-	fmt.Fprintln(out, value)
+	fmt.Fprintln(out, spec.Usage)
 	return nil
 }
 
 func printWorkflowUsage(out io.Writer) {
-	fmt.Fprintln(out, `Usage: skynex workflow <command> [options]
-
-Commands:
-  start               Create a simple, planned, or discovery workflow
-  run                 Execute ready slices with OpenCode and verify the result
-  notifications       Claim or acknowledge terminal workflow notifications
-  review              Review a frozen candidate and issue its receipt
-  deliver             Commit the exact receipt-authorized candidate tree
-  status              List workflows or show one workflow
-  inspect             Show workflow events, inputs, approvals, and authority
-  receipt             Show the current or a historical receipt
-  approve             Approve an exact high-risk action basis
-  revoke-approval     Revoke a current approval
-  abort               Stop work and revoke attempts, leases, and approvals
-  resume              Reconcile and resume a blocked workflow
-  retry-verification  Replace one failed check and verify the same candidate
-  replan              Revise a failed plan in place while preserving lineage
-  export              Export a workflow summary or receipt
-  frontier            Show the next blocking discovery question
-  answer              Record an attributed discovery answer
-  close-discovery     Close discovery with an explicit execution plan
-
-Run skynex workflow <command> --help for command-specific options.`)
+	fmt.Fprintln(out, "Usage: skynex workflow <command> [options]")
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "Commands:")
+	for _, spec := range workflowCommands {
+		if !spec.Hidden {
+			fmt.Fprintf(out, "  %-19s %s\n", spec.Name, spec.Summary)
+		}
+	}
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "Run skynex workflow <command> --help for command-specific options.")
 }
 
 func workflowStatus(store *workflow.SQLiteStore, args []string, out io.Writer, scan workflowDiagnosticScan) error {

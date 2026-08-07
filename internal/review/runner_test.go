@@ -112,7 +112,8 @@ func TestReviewRecoversCompletedResultWrittenBeforeCallerCheckpoint(t *testing.T
 		t.Fatal(err)
 	}
 	candidate := CandidateRecord{WorkflowID: "wf", TreeOID: "tree", PolicyHash: "policy"}
-	prompt := semanticPrompt()
+	floor := RiskFloor{Risk: RiskLow}
+	prompt := semanticPrompt(floor)
 	raw := []byte(`{"requested_risk":"low","selected_lens":"","justification":"recovered"}`)
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	_, err = store.Database().Exec(`INSERT INTO review_invocations(id,workflow_id,candidate_tree,lens,model,status,output_digest,started_at,finished_at,error_preview,pid,heartbeat_at,last_activity_at,result_json,prompt_hash,policy_hash) VALUES('review:wf:semantic','wf','tree','semantic','model','completed','digest',?,?,'',42,?,?,?,?,'policy')`, now, now, now, now, raw, hash([]byte(prompt)))
@@ -125,7 +126,7 @@ func TestReviewRecoversCompletedResultWrittenBeforeCallerCheckpoint(t *testing.T
 		t.Fatalf("got=%q err=%v", got, err)
 	}
 	var parsed semanticOutput
-	if detail := validateSemanticOutput(got, &parsed); detail != "" {
+	if detail := validateSemanticOutput(got, floor, &parsed); detail != "" {
 		t.Fatal(detail)
 	}
 	if err := runner.persistCheckpoint("wf", candidate, "semantic", prompt, got); err != nil {
@@ -134,5 +135,22 @@ func TestReviewRecoversCompletedResultWrittenBeforeCallerCheckpoint(t *testing.T
 	var checkpoints int
 	if err := store.Database().QueryRow(`SELECT COUNT(*) FROM review_checkpoints WHERE workflow_id='wf'`).Scan(&checkpoints); err != nil || checkpoints != 1 {
 		t.Fatalf("checkpoints=%d err=%v", checkpoints, err)
+	}
+}
+
+func TestSemanticPromptCarriesDeterministicMinimumAndRejectsLowerOutput(t *testing.T) {
+	floor := RiskFloor{Risk: RiskMedium, Depth: DepthOneLens}
+	prompt := semanticPrompt(floor)
+	if !strings.Contains(prompt, `deterministic minimum risk is "medium"`) || !strings.Contains(prompt, `MUST be "medium" or higher`) {
+		t.Fatalf("prompt does not carry the risk floor: %s", prompt)
+	}
+	var output semanticOutput
+	detail := validateSemanticOutput([]byte(`{"requested_risk":"low","selected_lens":"","justification":"small change"}`), floor, &output)
+	if !strings.Contains(detail, `below deterministic minimum "medium"`) {
+		t.Fatalf("detail=%q", detail)
+	}
+	detail = validateSemanticOutput([]byte(`{"requested_risk":"medium","selected_lens":"reliability","justification":"respect floor"}`), floor, &output)
+	if detail != "" {
+		t.Fatalf("valid medium assessment rejected: %s", detail)
 	}
 }

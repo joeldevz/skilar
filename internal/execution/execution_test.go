@@ -13,6 +13,25 @@ import (
 	"time"
 )
 
+func TestApplyPatchNormalizesUntrustedAgentModes(t *testing.T) {
+	root := t.TempDir()
+	if err := applyPatch(root, PatchArtifact{Operations: []FileOperation{
+		{Path: "regular.txt", Data: []byte("regular"), Mode: 0o204},
+		{Path: "script.sh", Data: []byte("#!/bin/sh\n"), Mode: 0o001},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]os.FileMode{"regular.txt": 0o600, "script.sh": 0o700} {
+		info, err := os.Stat(filepath.Join(root, path))
+		if err != nil || info.Mode().Perm() != want {
+			t.Fatalf("%s mode=%v want=%v err=%v", path, info.Mode().Perm(), want, err)
+		}
+	}
+	if _, err := normalizedFileMode(os.ModeSymlink | 0o777); err == nil {
+		t.Fatal("special file mode accepted")
+	}
+}
+
 func execFixture(t *testing.T) (string, *workflow.SQLiteStore, gitcandidate.ContextSeal, gitcandidate.Candidate) {
 	t.Helper()
 	repo := filepath.Join(t.TempDir(), "repo")

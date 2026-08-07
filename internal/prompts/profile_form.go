@@ -76,11 +76,6 @@ var simpleGroups = []simpleGroup{
 		desc:   "Execute tasks: plan, code, verify, review",
 		agents: []string{"tech-planner", "product-planner", "coder", "verifier", "test-reviewer", "security", "skill-validator"},
 	},
-	{
-		key:    "Advisor",
-		desc:   "Senior strategic consultant (use best model)",
-		agents: []string{"advisor"},
-	},
 }
 
 type agentConfig struct {
@@ -99,13 +94,12 @@ var agentDescriptions = map[string]string{
 	"test-reviewer":       "Reviews test quality",
 	"security":            "Adversarial security judge",
 	"skill-validator":     "Validates code conventions",
-	"advisor":             "Senior strategic consultant",
 }
 
 var agentList = []string{
 	"orchestrator", "skynex-orchestrator", "tech-planner", "product-planner",
 	"coder", "manager", "verifier",
-	"test-reviewer", "security", "skill-validator", "advisor",
+	"test-reviewer", "security", "skill-validator",
 }
 
 // ---------------------------------------------------------------------------
@@ -360,7 +354,7 @@ func (m profileWizard) viewModeSelect() string {
 		desc  string
 		hint  string
 	}{
-		{"Simple", "Set one model per role", "Orchestrator · Workers · Advisor"},
+		{"Simple", "Set one model per role", "Orchestrator · Workers"},
 		{"Advanced", "Set model per agent individually", "10 agents: orchestrator, coder, tech-planner..."},
 	}
 

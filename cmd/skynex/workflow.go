@@ -65,6 +65,12 @@ func workflowNextAction(state workflow.State, id string, jobState workflow.JobSt
 		}
 		return "manual_resolution_required"
 	}
+	if jobState == workflow.JobWaitingApproval {
+		if operation == "review" {
+			return fmt.Sprintf("skynex workflow approve --id %s --action review --actor ACTOR --reason TEXT", id)
+		}
+		return "human_approval_required"
+	}
 	return "wait"
 }
 
@@ -358,6 +364,9 @@ func workflowStatus(store *workflow.SQLiteStore, args []string, out io.Writer, s
 			return err
 		}
 		fmt.Fprintf(out, "WORKFLOW\tSTATE\tVERSION\tROUTE\tRISK\n%s\t%s\t%d\t%s\t%s\n", w.ID, w.State, w.StateVersion, w.Route, w.MinimumRisk)
+		if authoritativeWorkflowState(w.State) {
+			return nil
+		}
 		var job workflow.WorkflowJob
 		var created, started, heartbeat, finished string
 		err = store.Database().QueryRow(`SELECT id,workflow_id,session_id,operation,state,pid,created_at,started_at,heartbeat_at,finished_at,terminal_state,error FROM workflow_jobs WHERE workflow_id=? ORDER BY created_at DESC LIMIT 1`, w.ID).Scan(&job.ID, &job.WorkflowID, &job.SessionID, &job.Operation, &job.State, &job.PID, &created, &started, &heartbeat, &finished, &job.TerminalState, &job.Error)
@@ -436,7 +445,7 @@ func workflowInspect(store *workflow.SQLiteStore, reviews *review.SQLiteStore, i
 				if j.RetriesRemaining < 0 {
 					j.RetriesRemaining = 0
 				}
-				if action := workflowNextAction(w.State, id, workflow.JobState(j.State), j.Operation, j.RetriesRemaining); action != "wait" {
+				if action := workflowNextAction(w.State, id, workflow.JobState(j.State), j.Operation, j.RetriesRemaining); action != "wait" && !authoritativeWorkflowState(w.State) {
 					j.NextAction = action
 					inspection.NextAction = action
 				}
@@ -734,6 +743,10 @@ func flagValue(args []string, name string) (string, bool) {
 }
 func terminal(state workflow.State) bool {
 	return state == workflow.StateDelivered || state == workflow.StateAborted || state == workflow.StateFailed
+}
+
+func authoritativeWorkflowState(state workflow.State) bool {
+	return state == workflow.StateReceipted || terminal(state)
 }
 func writeJSON(out io.Writer, value any) error {
 	encoder := json.NewEncoder(out)

@@ -28,7 +28,6 @@ Esta skill DEBE usar Neurox para memoria persistente:
 var skillMap = map[string][]string{
 	"orchestrator":        {"security"},
 	"skynex-orchestrator": {"security"},
-	"advisor":             {},
 	"product-planner":     {"prd"},
 	"tech-planner":        {"prd", "nestjs-patterns", "typescript-advanced-types"},
 	"coder":               {"nestjs-patterns", "typescript-advanced-types"},

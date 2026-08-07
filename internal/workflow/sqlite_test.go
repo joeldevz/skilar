@@ -1,12 +1,14 @@
 package workflow
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -272,6 +274,62 @@ func downgradeToSchema17(t *testing.T, store *SQLiteStore) {
 		if _, err := store.Database().Exec(statement); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestCurrentSchemaRejectsMissingRequiredTableBeforeWorkflowMutation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "workflows.db")
+	store, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Create(Workflow{ID: "preserved", Route: RouteSimple, MinimumRisk: RiskLow}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Database().Exec(`DROP TABLE verification_run_history`); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = OpenSQLite(path)
+	var compatibility *CompatibilityError
+	if !errors.As(err, &compatibility) {
+		t.Fatalf("expected compatibility error, got %v", err)
+	}
+	if compatibility.DatabaseSchema != CurrentSchemaVersion || !slices.Contains(compatibility.MissingObjects, "verification_run_history") {
+		t.Fatalf("compatibility=%+v", compatibility)
+	}
+
+	raw, openErr := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=ro&immutable=1")
+	if openErr != nil {
+		t.Fatal(openErr)
+	}
+	defer raw.Close()
+	var count int
+	if err = raw.QueryRow(`SELECT COUNT(*) FROM workflows WHERE id='preserved'`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("workflow changed during rejected open: count=%d err=%v", count, err)
+	}
+}
+
+func TestReadOnlySchemaMismatchReturnsStructuredCompatibilityDiagnostic(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "workflows.db")
+	store, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Database().Exec(`PRAGMA user_version=99`); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = OpenSQLiteReadOnly(path)
+	encoded, ok := CompatibilityJSON(err)
+	if !ok || !bytes.Contains(encoded, []byte(`"database_schema": 99`)) || !bytes.Contains(encoded, []byte(`"database_path"`)) || !bytes.Contains(encoded, []byte(`"hint"`)) {
+		t.Fatalf("diagnostic=%s err=%v", encoded, err)
 	}
 }
 

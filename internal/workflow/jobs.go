@@ -20,6 +20,7 @@ const (
 	JobSucceeded       JobState = "succeeded"
 	JobFailed          JobState = "failed"
 	JobCancelled       JobState = "cancelled"
+	JobWaitingApproval JobState = "waiting_approval"
 )
 
 type WorkflowJob struct {
@@ -244,7 +245,7 @@ func (s *SQLiteStore) HeartbeatWorkflowJob(id string, now time.Time) error {
 }
 
 func (s *SQLiteStore) FinishWorkflowJob(id string, state JobState, terminal, message string, now time.Time) error {
-	if state != JobSucceeded && state != JobFailed && state != JobCancelled {
+	if state != JobSucceeded && state != JobFailed && state != JobCancelled && state != JobWaitingApproval {
 		return fmt.Errorf("invalid terminal job state %q", state)
 	}
 	tx, err := s.db.Begin()
@@ -257,7 +258,7 @@ func (s *SQLiteStore) FinishWorkflowJob(id string, state JobState, terminal, mes
 	if err = tx.QueryRow(`SELECT workflow_id,operation,state FROM workflow_jobs WHERE id=?`, id).Scan(&workflowID, &operation, &previous); err != nil {
 		return err
 	}
-	if previous == JobSucceeded || previous == JobFailed || previous == JobCancelled {
+	if previous == JobSucceeded || previous == JobFailed || previous == JobCancelled || previous == JobWaitingApproval {
 		return tx.Commit()
 	}
 	var realTerminal State
@@ -288,7 +289,7 @@ func (s *SQLiteStore) FinishWorkflowJob(id string, state JobState, terminal, mes
 		}
 	}
 	terminal = string(realTerminal)
-	if _, err = tx.Exec(`UPDATE workflow_jobs SET state=?,terminal_state=?,error=?,finished_at=?,heartbeat_at=? WHERE id=? AND state NOT IN (?,?,?)`, state, terminal, message, dbTime(now), dbTime(now), id, JobSucceeded, JobFailed, JobCancelled); err != nil {
+	if _, err = tx.Exec(`UPDATE workflow_jobs SET state=?,terminal_state=?,error=?,finished_at=?,heartbeat_at=? WHERE id=? AND state NOT IN (?,?,?,?)`, state, terminal, message, dbTime(now), dbTime(now), id, JobSucceeded, JobFailed, JobCancelled, JobWaitingApproval); err != nil {
 		return err
 	}
 	nid := "notification:" + id
@@ -348,7 +349,7 @@ func (s *SQLiteStore) RetryTechnicalWorkflowJob(workflowID, operation string, no
 
 func (s *SQLiteStore) WorkflowJobAttempts(workflowID, operation string) (int, error) {
 	var attempts int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM workflow_jobs WHERE workflow_id=? AND operation=? AND NOT (state=? AND error LIKE ?)`, workflowID, operation, JobCancelled, JobDisplacedErrorPrefix+"%").Scan(&attempts)
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM workflow_jobs WHERE workflow_id=? AND operation=? AND state!=? AND NOT (state=? AND error LIKE ?)`, workflowID, operation, JobWaitingApproval, JobCancelled, JobDisplacedErrorPrefix+"%").Scan(&attempts)
 	return attempts, err
 }
 

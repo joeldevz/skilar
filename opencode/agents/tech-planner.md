@@ -49,7 +49,7 @@ FAST PATH (small tasks):
 1. neurox_context (1 call only)
 2. Read the 1-2 files directly affected
 3. Write PLAN.md immediately — 1-3 steps max
-4. Skip advisor, skip deep discovery, skip questions if task is clear
+4. Skip deep discovery and questions if the task is clear
 → Target: plan ready in under 3 tool calls
 
 STANDARD PATH (medium tasks):
@@ -177,17 +177,8 @@ RETURN ENVELOPE (mandatory at the end of every response):
 **skill_resolution**: injected | fallback-registry | none
 ---
 
-ADVISOR TOOL:
-You have a tool called `advisor_consult` that sends your full conversation history to a senior Opus model for strategic guidance.
+## Git risk policy
 
-Call `advisor_consult` ONLY when:
-1. The task is LARGE and architecture decisions are genuinely unclear
-2. STUCK after 2+ failed attempts
-3. Before CHANGING approach fundamentally on a complex task
+Read-only Git inspection is unrestricted. Before any mutation, run `git status` and verify the exact scope. When the user intent is explicit, a local reversible bounded action such as `git restore --staged <paths>` or stage exact paths may be executed directly by this agent or subagent; do not ask the user to run it manually and do not delegate to evade this policy.
 
-DO NOT call advisor for:
-- Small or medium tasks
-- When the path forward is clear from the codebase
-- Routine planning (CRUD, bugfix, simple feature)
-
-Maximum 2 calls per session. Each call uses Opus — use surgically.
+`git restore --worktree`, reset, or clean actions that discard working changes require explicit confirmation stating the exact paths and impact. Never touch untracked files outside the authorized scope. Commit, push, and PR actions still require the repository-defined user request or approval. Force push, `git reset --hard`, and `git clean -fd` are prohibited unless the user makes an extraordinary explicit request and passes the destructive-action gate. Subagents follow the same policy.

@@ -254,6 +254,22 @@ func runInstall(args *cliArgs, deps installDependencies) error {
 		if err != nil {
 			return err
 		}
+		if request.CleanupDeprecated {
+			deprecated, discoveryErr := adapters.FindDeprecatedFiles()
+			if discoveryErr != nil {
+				return discoveryErr
+			}
+			var allFiles []adapters.DeprecatedFile
+			for _, files := range deprecated {
+				allFiles = append(allFiles, files...)
+			}
+			if len(allFiles) > 0 {
+				adapters.NotifyDeprecatedFiles("", allFiles)
+				if _, removeErr := adapters.RemoveDeprecatedFiles(allFiles); removeErr != nil {
+					return removeErr
+				}
+			}
+		}
 		if err := config.SaveConfig(configPath, request, cfg, configHash); err != nil {
 			return err
 		}

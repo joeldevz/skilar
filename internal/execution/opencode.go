@@ -67,7 +67,10 @@ func (a *OpenCodeAdapter) Run(ctx context.Context, request OpenCodeRequest) (Wor
 	}
 	idleTimeout := a.Options.IdleTimeout
 	if idleTimeout <= 0 {
-		idleTimeout = 2 * time.Minute
+		// OpenCode can remain silent while an active provider request is in
+		// flight. Until the adapter has a provider-level activity signal, the
+		// command timeout is the authoritative default watchdog.
+		idleTimeout = timeout + time.Second
 	}
 	limit := a.Options.MaxOutputBytes
 	if limit <= 0 {
@@ -136,7 +139,11 @@ func (a *OpenCodeAdapter) Run(ctx context.Context, request OpenCodeRequest) (Wor
 	cmd := exec.CommandContext(runCtx, executable, args...)
 	configureOpenCodeProcess(cmd)
 	cmd.Dir = worktree
-	cmd.Env = sanitizedEnv(resultFile)
+	runtimeEnv, err := openCodeRuntimeEnv(parent, resultFile)
+	if err != nil {
+		return WorkerResult{}, err
+	}
+	cmd.Env = runtimeEnv
 	started := time.Now().UTC()
 	if err = a.persistInvocationRunning(request, args, started); err != nil {
 		return WorkerResult{}, err
@@ -358,7 +365,32 @@ func safeArtifactID(id string) bool {
 	}
 	return true
 }
-func sanitizedEnv(result string) []string {
+func openCodeRuntimeEnv(parent, result string) ([]string, error) {
+	runtimeData := filepath.Join(parent, "xdg-data")
+	runtimeCache := filepath.Join(parent, "xdg-cache")
+	runtimeState := filepath.Join(parent, "xdg-state")
+	for _, path := range []string{runtimeData, runtimeCache, runtimeState} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			return nil, fmt.Errorf("execution: OpenCode runtime directory: %w", err)
+		}
+	}
+	targetData := filepath.Join(runtimeData, "opencode")
+	if err := os.MkdirAll(targetData, 0o700); err != nil {
+		return nil, fmt.Errorf("execution: OpenCode data directory: %w", err)
+	}
+	sourceData := filepath.Join(os.Getenv("HOME"), ".local", "share", "opencode")
+	for _, name := range []string{"account.json", "auth.json", "mcp-auth.json"} {
+		raw, err := os.ReadFile(filepath.Join(sourceData, name))
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("execution: OpenCode identity %s: %w", name, err)
+		}
+		if err = os.WriteFile(filepath.Join(targetData, name), raw, 0o600); err != nil {
+			return nil, fmt.Errorf("execution: OpenCode identity %s: %w", name, err)
+		}
+	}
 	allowed := []string{"PATH", "HOME", "TMPDIR", "XDG_CONFIG_HOME", "OPENCODE_CONFIG_CONTENT"}
 	var env []string
 	for _, key := range allowed {
@@ -366,7 +398,13 @@ func sanitizedEnv(result string) []string {
 			env = append(env, key+"="+value)
 		}
 	}
-	return append(env, "SKYNEX_RESULT_FILE="+result)
+	env = append(env,
+		"XDG_DATA_HOME="+runtimeData,
+		"XDG_CACHE_HOME="+runtimeCache,
+		"XDG_STATE_HOME="+runtimeState,
+		"SKYNEX_RESULT_FILE="+result,
+	)
+	return env, nil
 }
 func gitCommand(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)

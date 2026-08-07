@@ -31,7 +31,6 @@ var AgentOrder = []string{
 	"test-reviewer",
 	"security",
 	"skill-validator",
-	"advisor",
 }
 
 // SimpleGroups organizes agents into logical groups for simple mode.
@@ -46,7 +45,6 @@ var SimpleGroups = map[string][]string{
 		"security",
 		"skill-validator",
 	},
-	"advisor": {"advisor"},
 }
 
 // BuiltinTiers defines predefined tier profiles.
@@ -64,7 +62,6 @@ var BuiltinTiers = map[string]*Profile{
 			"test-reviewer":       "anthropic/claude-haiku-4-5",
 			"security":            "anthropic/claude-haiku-4-5",
 			"skill-validator":     "anthropic/claude-haiku-4-5",
-			"advisor":             "anthropic/claude-opus-4-6",
 		},
 	},
 	"balanced": {
@@ -80,7 +77,6 @@ var BuiltinTiers = map[string]*Profile{
 			"test-reviewer":       "anthropic/claude-haiku-4-5",
 			"security":            "anthropic/claude-haiku-4-5",
 			"skill-validator":     "anthropic/claude-haiku-4-5",
-			"advisor":             "anthropic/claude-opus-4-6",
 		},
 	},
 	"premium": {
@@ -96,7 +92,6 @@ var BuiltinTiers = map[string]*Profile{
 			"test-reviewer":       "anthropic/claude-haiku-4-5",
 			"security":            "anthropic/claude-sonnet-4-6",
 			"skill-validator":     "anthropic/claude-haiku-4-5",
-			"advisor":             "anthropic/claude-opus-4-6",
 		},
 	},
 }
@@ -153,6 +148,7 @@ func Load(name string) (*Profile, error) {
 	if err := json.Unmarshal(data, &p); err != nil {
 		return nil, fmt.Errorf("failed to parse profile %q: %w", name, err)
 	}
+	delete(p.Models, "advisor")
 
 	return &p, nil
 }
@@ -179,6 +175,7 @@ func Save(p *Profile) error {
 	if p.Models == nil {
 		p.Models = make(map[string]string)
 	}
+	delete(p.Models, "advisor")
 
 	data, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {

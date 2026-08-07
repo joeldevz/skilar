@@ -12,6 +12,7 @@ import (
 	"github.com/joeldevz/skynex/internal/gitcandidate"
 	"github.com/joeldevz/skynex/internal/review"
 	"github.com/joeldevz/skynex/internal/workflow"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -278,6 +279,18 @@ func runCommand(parent context.Context, dir, tree, kind string, c Command, timeo
 	buffer := &limitBuffer{limit: limit}
 	cmd := exec.CommandContext(ctx, c.Name, c.Args...)
 	cmd.Dir = dir
+	// Managed verification must not inherit a host Go cache that becomes
+	// read-only inside the candidate sandbox. A tree-scoped cache also prevents
+	// unrelated candidates from sharing compiled artifacts.
+	cacheKey := tree
+	if len(cacheKey) > 16 {
+		cacheKey = cacheKey[:16]
+	}
+	goCache := filepath.Join(os.TempDir(), "skynex-verification", cacheKey, "go-build")
+	if mkdirErr := os.MkdirAll(goCache, 0o700); mkdirErr != nil {
+		return Evidence{}, fmt.Errorf("verification: prepare Go build cache: %w", mkdirErr)
+	}
+	cmd.Env = environmentWith(os.Environ(), "GOCACHE", goCache)
 	cmd.Stdout = buffer
 	cmd.Stderr = buffer
 	err := cmd.Run()
@@ -294,6 +307,17 @@ func runCommand(parent context.Context, dir, tree, kind string, c Command, timeo
 	item := Evidence{ID: "ve_" + hex.EncodeToString(idSum[:]), Kind: kind, CandidateTree: tree, Command: c.Name, Args: append([]string(nil), c.Args...), ExitCode: exit, OutputDigest: hex.EncodeToString(sum[:]), StartedAt: started, FinishedAt: time.Now().UTC(), Truncated: buffer.truncated}
 	item.output = append([]byte(nil), buffer.Bytes()...)
 	return item, err
+}
+
+func environmentWith(environment []string, key, value string) []string {
+	prefix := key + "="
+	result := make([]string, 0, len(environment)+1)
+	for _, item := range environment {
+		if !strings.HasPrefix(item, prefix) {
+			result = append(result, item)
+		}
+	}
+	return append(result, prefix+value)
 }
 func candidateChanges(repo, base, candidate string) ([]review.Change, error) {
 	cmd := exec.Command("git", "diff", "--name-only", "-z", base, candidate)

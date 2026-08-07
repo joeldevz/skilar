@@ -129,8 +129,14 @@ func Freeze(seal ContextSeal, policy Policy) (Candidate, error) {
 		return Candidate{}, err
 	}
 	// First overlay every tracked worktree edit/deletion, including tracked export paths.
-	if _, err = gitRun(seal.RepositoryRoot, env, "add", "-u", "--", "."); err != nil {
+	tracked, err := gitRun(seal.RepositoryRoot, env, "ls-files", "-z")
+	if err != nil {
 		return Candidate{}, err
+	}
+	if len(tracked) != 0 {
+		if _, err = gitRun(seal.RepositoryRoot, env, "add", "-u", "--", "."); err != nil {
+			return Candidate{}, err
+		}
 	}
 	// Then add eligible untracked files. Generated exports remain out of candidate
 	// scope unless they were already tracked by the base tree. Avoid naming children

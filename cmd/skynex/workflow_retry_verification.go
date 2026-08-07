@@ -102,16 +102,20 @@ func workflowRetryVerification(store *workflow.SQLiteStore, args []string, out i
 			break
 		}
 	}
-	if failed == nil || failed.Kind != "check" || failed.ExitCode == 0 || failed.Command != "sh" || len(failed.Args) != 2 || failed.Args[0] != "-c" {
-		return errors.New("retry-verification requires the exact failed check evidence id")
+	if failed == nil || (failed.Kind != "check" && failed.Kind != "acceptance") || failed.ExitCode == 0 || failed.Command != "sh" || len(failed.Args) != 2 || failed.Args[0] != "-c" {
+		return errors.New("retry-verification requires the exact failed verification evidence id")
 	}
 	oldCommand := failed.Args[1]
 	var input workflowRunInput
 	if err := json.Unmarshal(inputRaw, &input); err != nil {
 		return err
 	}
+	commands := &input.Checks
+	if failed.Kind == "acceptance" {
+		commands = &input.Acceptance
+	}
 	match := -1
-	for i, command := range input.Checks {
+	for i, command := range *commands {
 		if command == oldCommand {
 			if match >= 0 {
 				return errors.New("retry-verification cannot replace an ambiguous duplicate check")
@@ -129,7 +133,7 @@ func workflowRetryVerification(store *workflow.SQLiteStore, args []string, out i
 	if current.TreeOID != previous.Candidate.TreeOID {
 		return fmt.Errorf("retry-verification candidate changed: expected %s got %s", previous.Candidate.TreeOID, current.TreeOID)
 	}
-	input.Checks[match] = replacement
+	(*commands)[match] = replacement
 	updatedInput, err := json.Marshal(input)
 	if err != nil {
 		return err

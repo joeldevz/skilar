@@ -34,6 +34,10 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := validateCurrentSchema(db, path, CurrentSchemaVersion); err != nil {
+		db.Close()
+		return nil, err
+	}
 	// A concurrently installed older Skynex binary can still write a legacy
 	// run input after the database has already reached schema 18. Repair that
 	// mixed-version state on every writable open so frozen candidates do not
@@ -97,9 +101,13 @@ func OpenSQLiteReadOnly(path string) (*SQLiteStore, error) {
 		db.Close()
 		return nil, err
 	}
-	if version != 19 {
+	if version != CurrentSchemaVersion {
 		db.Close()
-		return nil, fmt.Errorf("workflow database schema %d requires writable migration to schema 19", version)
+		return nil, compatibilityError(path, version, nil)
+	}
+	if err = validateCurrentSchema(db, path, version); err != nil {
+		db.Close()
+		return nil, err
 	}
 	return s, nil
 }
@@ -155,9 +163,13 @@ func OpenSQLiteLiveReadOnly(path string) (*SQLiteStore, error) {
 		db.Close()
 		return nil, err
 	}
-	if version != 19 {
+	if version != CurrentSchemaVersion {
 		db.Close()
-		return nil, fmt.Errorf("workflow database schema %d requires writable migration to schema 19", version)
+		return nil, compatibilityError(path, version, nil)
+	}
+	if err = validateCurrentSchema(db, path, version); err != nil {
+		db.Close()
+		return nil, err
 	}
 	return s, nil
 }
@@ -197,11 +209,11 @@ func (s *SQLiteStore) migrate() error {
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		return err
 	}
-	if version > 19 {
-		return fmt.Errorf("workflow database schema %d is newer than supported schema 19", version)
+	if version > CurrentSchemaVersion {
+		return compatibilityError(s.path, version, nil)
 	}
-	if version == 19 {
-		return nil
+	if version == CurrentSchemaVersion {
+		return validateCurrentSchema(s.db, s.path, version)
 	}
 	if version == 0 {
 		const schemaV1 = `

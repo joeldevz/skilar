@@ -122,6 +122,45 @@ func workflowStart(store *workflow.SQLiteStore, repo string, args []string, out 
 	} else if len(acceptance) == 0 || len(checks) == 0 || len(paths) == 0 {
 		return errors.New("simple start requires explicit --accept, --check, and --path")
 	}
+	var override *orchestration.RouteOverride
+	if route, exists := flagValue(args, "--route"); exists {
+		actor, aok := flagValue(args, "--override-actor")
+		reason, rok := flagValue(args, "--override-reason")
+		if !aok || !rok || actor == "" || reason == "" {
+			return errors.New("route override requires --override-actor and --override-reason")
+		}
+		override = &orchestration.RouteOverride{Route: workflow.Route(route), Actor: actor, Reason: reason, At: time.Now().UTC()}
+	}
+	for _, slice := range planned.Slices {
+		if slice.ID == "" || slice.Title == "" || len(slice.AcceptanceCriteria) == 0 || len(slice.Paths) == 0 || len(slice.Checks) == 0 {
+			return errors.New("planned slices require id, title, acceptance_criteria, paths, and checks")
+		}
+	}
+	// Validate the complete execution graph before creating any durable workflow
+	// state. Field-presence checks alone do not catch invalid IDs, missing
+	// dependencies, or cycles, and those errors must not strand a workflow in
+	// discovering.
+	if routeValue != workflow.RouteDiscovery {
+		preflightGraph := orchestration.ExecutionGraph{WorkflowID: id, Version: 1}
+		if routeValue == workflow.RoutePlanned && len(planned.Slices) > 0 {
+			for _, slice := range planned.Slices {
+				preflightGraph.Slices = append(preflightGraph.Slices, orchestration.Slice{ID: slice.ID, Title: slice.Title, AcceptanceCriteria: slice.AcceptanceCriteria, Dependencies: slice.Dependencies})
+			}
+		} else {
+			preflightGraph.Slices = []orchestration.Slice{{ID: "slice_main", Title: request, AcceptanceCriteria: acceptance}}
+		}
+		if err := orchestration.ValidateExecution(preflightGraph); err != nil {
+			return err
+		}
+	}
+	timeout := 10 * time.Minute
+	if raw, exists := flagValue(args, "--timeout"); exists {
+		var timeoutErr error
+		timeout, timeoutErr = time.ParseDuration(raw)
+		if timeoutErr != nil {
+			return fmt.Errorf("invalid --timeout: %w", timeoutErr)
+		}
+	}
 	seal, err := gitcandidate.CaptureContext(repo)
 	if err != nil {
 		return err
@@ -141,15 +180,6 @@ func workflowStart(store *workflow.SQLiteStore, repo string, args []string, out 
 		b.PreTreeOID = candidate.TreeOID
 	}); err != nil {
 		return err
-	}
-	var override *orchestration.RouteOverride
-	if route, exists := flagValue(args, "--route"); exists {
-		actor, aok := flagValue(args, "--override-actor")
-		reason, rok := flagValue(args, "--override-reason")
-		if !aok || !rok || actor == "" || reason == "" {
-			return errors.New("route override requires --override-actor and --override-reason")
-		}
-		override = &orchestration.RouteOverride{Route: workflow.Route(route), Actor: actor, Reason: reason, At: time.Now().UTC()}
 	}
 	engine := orchestration.NewEngine(store)
 	estimated := 1
@@ -202,9 +232,6 @@ func workflowStart(store *workflow.SQLiteStore, repo string, args []string, out 
 		paths = nil
 		for _, s := range planned.Slices {
 			graph.Slices = append(graph.Slices, orchestration.Slice{ID: s.ID, Title: s.Title, AcceptanceCriteria: s.AcceptanceCriteria, Dependencies: s.Dependencies})
-			if len(s.Paths) == 0 || len(s.Checks) == 0 {
-				return errors.New("planned slices require paths and checks")
-			}
 			configs[s.ID] = sliceRunConfig{Paths: s.Paths, Checks: s.Checks}
 			checks = append(checks, s.Checks...)
 			paths = append(paths, s.Paths...)
@@ -222,13 +249,6 @@ func workflowStart(store *workflow.SQLiteStore, repo string, args []string, out 
 	contract := orchestration.ExecutableContract{Destination: request, AcceptanceCriteria: acceptance}
 	if err = engine.Close(id, orchestration.WayfinderGraph{WorkflowID: id, Version: 1}, contract, graph); err != nil {
 		return err
-	}
-	timeout := 10 * time.Minute
-	if raw, exists := flagValue(args, "--timeout"); exists {
-		timeout, err = time.ParseDuration(raw)
-		if err != nil {
-			return fmt.Errorf("invalid --timeout: %w", err)
-		}
 	}
 	_, modelExplicit := flagValue(args, "--model")
 	_, agentExplicit := flagValue(args, "--agent")
@@ -513,7 +533,11 @@ func workflowRunContext(ctx context.Context, store *workflow.SQLiteStore, repo s
 					}
 				}
 			}
-			result, err := adapter.Run(ctx, execution.OpenCodeRequest{InvocationID: "invoke:" + attempt.ID, Attempt: attempt, Seal: seal, Checks: checks, Prompt: input.Request + "\nAcceptance: " + strings.Join(criteria, "; ")})
+			invocationID, invocationErr := executionInvocationID(store, attempt.ID)
+			if invocationErr != nil {
+				return invocationErr
+			}
+			result, err := adapter.Run(ctx, execution.OpenCodeRequest{InvocationID: invocationID, Attempt: attempt, Seal: seal, Checks: checks, Prompt: input.Request + "\nAcceptance: " + strings.Join(criteria, "; ")})
 			if err != nil {
 				return err
 			}
@@ -566,6 +590,18 @@ func workflowRunContext(ctx context.Context, store *workflow.SQLiteStore, repo s
 	}
 	fmt.Fprintln(out, "candidate frozen; semantic review runner is not configured")
 	return nil
+}
+
+func executionInvocationID(store *workflow.SQLiteStore, attemptID string) (string, error) {
+	base := "invoke:" + attemptID
+	var prior int
+	if err := store.Database().QueryRow(`SELECT COUNT(*) FROM opencode_invocations WHERE attempt_id=?`, attemptID).Scan(&prior); err != nil {
+		return "", err
+	}
+	if prior == 0 {
+		return base, nil
+	}
+	return fmt.Sprintf("%s:retry-%d", base, prior), nil
 }
 
 func waitForWorkflowLease(ctx context.Context, store *workflow.SQLiteStore, resource, owner, token string, duration time.Duration) error {

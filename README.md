@@ -272,7 +272,7 @@ skills/
 
 ### Claude Code
 
-- **11 agentes** en `~/.claude/agents`, incluidos `orchestrator`, `advisor`, `planner`, `manager` y `coder`
+- **10 agentes** en `~/.claude/agents`, incluidos `orchestrator`, `planner`, `manager` y `coder`
 - **8 slash skills** en `~/.claude/skills` con los mismos nombres operativos
 - **Overlay de `CLAUDE.md`** para mantener el mismo workflow
 - **Neurox MCP** configurado en `~/.claude.json`

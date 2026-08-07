@@ -29,15 +29,15 @@ import (
 var ErrMalformedReview = errors.New("review: malformed OpenCode result")
 var ErrReviewIdleTimeout = errors.New("review: OpenCode produced no output before idle timeout")
 
-func semanticPrompt() string {
-	return `Assess risk for the immutable candidate. Write exactly one JSON object and nothing else to $SKYNEX_RESULT_FILE. Schema: {"requested_risk":"low|medium|high","selected_lens":"|risk|readability|reliability|resilience","justification":"non-empty string"}. requested_risk is required. selected_lens is required and non-empty only when requested_risk is medium. No Markdown or code fences.`
+func semanticPrompt(floor RiskFloor) string {
+	return fmt.Sprintf(`Assess risk for the immutable candidate. The deterministic minimum risk is %q and cannot be lowered; requested_risk MUST be %q or higher. Write exactly one JSON object and nothing else to $SKYNEX_RESULT_FILE. Schema: {"requested_risk":"low|medium|high","selected_lens":"|risk|readability|reliability|resilience","justification":"non-empty string"}. requested_risk is required. selected_lens is required and non-empty only when requested_risk is medium. No Markdown or code fences.`, floor.Risk, floor.Risk)
 }
 
 func lensPrompt(lens Lens) string {
 	return fmt.Sprintf(`Review lens %s only for the immutable candidate. Write exactly one JSON object and nothing else to $SKYNEX_RESULT_FILE. Schema: {"findings":[{"id":"optional string","lens":"optional string","severity":"severe|warning|info","message":"non-empty string","reproducible":true|false,"candidate_caused":true|false,"evidence_ids":["string"]}]}. findings is required (empty array allowed). No Markdown or code fences.`, lens)
 }
 
-func validateSemanticOutput(raw []byte, out *semanticOutput) string {
+func validateSemanticOutput(raw []byte, floor RiskFloor, out *semanticOutput) string {
 	if err := json.Unmarshal(raw, out); err != nil {
 		return "invalid JSON: " + err.Error()
 	}
@@ -46,6 +46,9 @@ func validateSemanticOutput(raw []byte, out *semanticOutput) string {
 	}
 	if out.Justification == "" {
 		return "missing justification"
+	}
+	if rank(out.RequestedRisk) < rank(floor.Risk) {
+		return fmt.Sprintf("requested_risk %q is below deterministic minimum %q", out.RequestedRisk, floor.Risk)
 	}
 	validLens := out.SelectedLens == LensRisk || out.SelectedLens == LensReadability || out.SelectedLens == LensReliability || out.SelectedLens == LensResilience
 	if out.RequestedRisk == RiskMedium && !validLens {
@@ -178,19 +181,20 @@ func (r *OpenCodeReviewRunner) Run(ctx context.Context, workflowID string) (Rece
 		_, _ = r.Store.Transition(workflow.Transition{WorkflowID: workflowID, ExpectedState: w.State, ExpectedVersion: w.StateVersion, NextState: workflow.StateReplanRequired, IdempotencyKey: reviewTransitionKey("drift", w.StateVersion)})
 		return Receipt{}, ErrCandidateMismatch
 	}
-	semanticRaw, err := r.invoke(ctx, workflowID, verified.Record, "semantic", semanticPrompt())
+	prompt := semanticPrompt(verified.Floor)
+	semanticRaw, err := r.invoke(ctx, workflowID, verified.Record, "semantic", prompt)
 	if err != nil {
 		return Receipt{}, err
 	}
 	var semantic semanticOutput
-	if detail := validateSemanticOutput(semanticRaw, &semantic); detail != "" {
+	if detail := validateSemanticOutput(semanticRaw, verified.Floor, &semantic); detail != "" {
 		r.persistMalformed(workflowID, verified.Record.ID, "semantic", semanticRaw, detail)
 		return Receipt{}, fmt.Errorf("%w: %s", ErrMalformedReview, detail)
 	}
-	if err = r.persistCheckpoint(workflowID, verified.Record, "semantic", semanticPrompt(), semanticRaw); err != nil {
+	if err = r.persistCheckpoint(workflowID, verified.Record, "semantic", prompt, semanticRaw); err != nil {
 		return Receipt{}, err
 	}
-	assessment, err := AssessSemantic(verified.Record, verified.Floor, SemanticInput{RequestedRisk: semantic.RequestedRisk, SelectedLens: semantic.SelectedLens, Justification: semantic.Justification, ModelProvider: "opencode", ModelID: r.modelIdentity(), PromptTemplateID: "semantic:v1", RenderedRedactedPrompt: "semantic review"}, time.Now())
+	assessment, err := AssessSemantic(verified.Record, verified.Floor, SemanticInput{RequestedRisk: semantic.RequestedRisk, SelectedLens: semantic.SelectedLens, Justification: semantic.Justification, ModelProvider: "opencode", ModelID: r.modelIdentity(), PromptTemplateID: "semantic:v2", RenderedRedactedPrompt: fmt.Sprintf("semantic review; deterministic minimum=%s", verified.Floor.Risk)}, time.Now())
 	if err != nil {
 		return Receipt{}, err
 	}
@@ -380,7 +384,11 @@ func (r *OpenCodeReviewRunner) invoke(parent context.Context, workflowID string,
 	defer unregister()
 	idleTimeout := r.Options.IdleTimeout
 	if idleTimeout <= 0 {
-		idleTimeout = 2 * time.Minute
+		// Stdout silence is not proof of inactivity: OpenCode can spend several
+		// minutes waiting on an active provider request while producing no stream
+		// bytes. Until a runtime-activity signal is available, never let the idle
+		// watchdog expire earlier than the command's authoritative timeout.
+		idleTimeout = timeout + time.Second
 	}
 	activity := make(chan struct{}, 1)
 	output := &reviewRollingBuffer{limit: 4096, onWrite: func(snapshot []byte) {
@@ -399,7 +407,42 @@ func (r *OpenCodeReviewRunner) invoke(parent context.Context, workflowID string,
 	}}
 	cmd := exec.CommandContext(ctx, exe, args...)
 	cmd.Dir = wt
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "SKYNEX_RESULT_FILE=" + result}
+	runtimeData := filepath.Join(parentDir, "xdg-data")
+	runtimeCache := filepath.Join(parentDir, "xdg-cache")
+	runtimeState := filepath.Join(parentDir, "xdg-state")
+	for _, path := range []string{runtimeData, runtimeCache, runtimeState} {
+		if err = os.MkdirAll(path, 0o700); err != nil {
+			return nil, fmt.Errorf("review runtime directory: %w", err)
+		}
+	}
+	// OpenCode stores provider credentials beside its writable runtime database.
+	// Seed only those small identity files; never copy the multi-gigabyte session
+	// database, logs, or tool outputs into the sandbox.
+	sourceData := filepath.Join(os.Getenv("HOME"), ".local", "share", "opencode")
+	targetData := filepath.Join(runtimeData, "opencode")
+	if err = os.MkdirAll(targetData, 0o700); err != nil {
+		return nil, fmt.Errorf("review OpenCode data directory: %w", err)
+	}
+	for _, name := range []string{"account.json", "auth.json", "mcp-auth.json"} {
+		raw, readErr := os.ReadFile(filepath.Join(sourceData, name))
+		if os.IsNotExist(readErr) {
+			continue
+		}
+		if readErr != nil {
+			return nil, fmt.Errorf("review OpenCode identity %s: %w", name, readErr)
+		}
+		if err = os.WriteFile(filepath.Join(targetData, name), raw, 0o600); err != nil {
+			return nil, fmt.Errorf("review OpenCode identity %s: %w", name, err)
+		}
+	}
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + os.Getenv("HOME"),
+		"XDG_DATA_HOME=" + runtimeData,
+		"XDG_CACHE_HOME=" + runtimeCache,
+		"XDG_STATE_HOME=" + runtimeState,
+		"SKYNEX_RESULT_FILE=" + result,
+	}
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err

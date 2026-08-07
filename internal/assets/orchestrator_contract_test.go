@@ -25,6 +25,33 @@ func assertWorkflowOrchestratorContract(t *testing.T, raw []byte) {
 	}
 }
 
+func assertWorkflowOrchestratorEfficiencyContract(t *testing.T, raw []byte) {
+	t.Helper()
+	text := strings.ToLower(string(raw))
+	required := []string{
+		"efficiency and bounded discovery",
+		"minimum evidence needed",
+		"do not create a second prd",
+		"neurox recall is conditional",
+		"one targeted query",
+		"stop discovery as soon as",
+		"do not delegate generic planning",
+		"parallelism is for ready execution slices",
+		"prefer `simple`",
+		"use `planned` only",
+		"`discovery` only while a blocking unknown",
+		"do not continue searching",
+		"never claim that work is running in the background",
+		"`--detach` command succeeds and returns durable job evidence",
+		"do not invent estimates",
+	}
+	for _, value := range required {
+		if !strings.Contains(text, value) {
+			t.Errorf("orchestrator efficiency contract missing %q", value)
+		}
+	}
+}
+
 func assertPRReviewEvidenceContract(t *testing.T, raw []byte) {
 	t.Helper()
 	text := strings.ToLower(string(raw))
@@ -36,7 +63,8 @@ func assertPRReviewEvidenceContract(t *testing.T, raw []byte) {
 		"hypothesis/unverified",
 		"delegated findings are provisional",
 		"primary verification",
-		"neurox.save",
+		"neurox is read-only",
+		"infrastructure-engineer is the only agent permitted to persist neurox memory",
 		"baseline",
 		"base sha",
 	}
@@ -75,7 +103,7 @@ func validPRReviewEvidenceStructure(text string) bool {
 		strings.Index(section, "primary verification"),
 		strings.Index(section, "contradiction resolution"),
 		strings.Index(section, "drafted verdict"),
-		strings.LastIndex(section, "neurox.save"),
+		strings.LastIndex(section, "do not persist them to neurox"),
 	}
 	for index, position := range positions {
 		if position < 0 || (index > 0 && position <= positions[index-1]) {
@@ -88,25 +116,26 @@ func validPRReviewEvidenceStructure(text string) bool {
 func assertPRReviewEvidenceStructure(t *testing.T, text string) {
 	t.Helper()
 	if !validPRReviewEvidenceStructure(text) {
-		t.Error("orchestrator PR review contract must keep all provenance categories inside Evidence Gate and order primary verification, contradiction resolution, drafted verdict, then neurox.save")
+		t.Error("workflow-orchestrator PR review contract must keep all provenance categories inside Evidence Gate and order primary verification, contradiction resolution, drafted verdict, then its read-only Neurox handoff")
 	}
 }
 
 func TestPRReviewEvidenceStructureRejectsGlobalMarkersAndEarlySave(t *testing.T) {
 	text := `independently executed tool-observed author-claimed hypothesis/unverified
 ## PR review Evidence Gate
-call neurox.save, then perform primary verification, resolve contradictions, and draft the verdict`
+do not persist them to neurox, then perform primary verification, resolve contradictions, and draft the verdict`
 	if validPRReviewEvidenceStructure(strings.ToLower(text)) {
 		t.Fatal("accepted provenance outside Evidence Gate and neurox.save before verification/synthesis")
 	}
 }
 
-func TestSourceOrchestratorUsesWorkflowV2Contract(t *testing.T) {
-	raw, err := os.ReadFile(filepath.Join("..", "..", "opencode", "agents", "orchestrator.md"))
+func TestSourceWorkflowOrchestratorUsesWorkflowV2Contract(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "opencode", "agents", "workflow-orchestrator.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertWorkflowOrchestratorContract(t, raw)
+	assertWorkflowOrchestratorEfficiencyContract(t, raw)
 	assertPRReviewEvidenceContract(t, raw)
 	assertDetachedWorkflowContract(t, raw)
 }
@@ -120,11 +149,12 @@ func TestEmbeddedInstallPreservesWorkflowV2Contract(t *testing.T) {
 	if err = ExtractTo(sub, dest); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := os.ReadFile(filepath.Join(dest, "agents", "orchestrator.md"))
+	raw, err := os.ReadFile(filepath.Join(dest, "agents", "workflow-orchestrator.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertWorkflowOrchestratorContract(t, raw)
+	assertWorkflowOrchestratorEfficiencyContract(t, raw)
 	assertPRReviewEvidenceContract(t, raw)
 	assertDetachedWorkflowContract(t, raw)
 }
@@ -296,8 +326,8 @@ func assertContinuousWorkflowPolicy(t *testing.T, raw []byte) {
 	}
 }
 
-func TestSourceAndEmbeddedOrchestratorContinueWithoutPermissionLoops(t *testing.T) {
-	raw, err := os.ReadFile(filepath.Join("..", "..", "opencode", "agents", "orchestrator.md"))
+func TestSourceAndEmbeddedWorkflowOrchestratorContinueWithoutPermissionLoops(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "opencode", "agents", "workflow-orchestrator.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +340,7 @@ func TestSourceAndEmbeddedOrchestratorContinueWithoutPermissionLoops(t *testing.
 	if err := ExtractTo(sub, dest); err != nil {
 		t.Fatal(err)
 	}
-	raw, err = os.ReadFile(filepath.Join(dest, "agents", "orchestrator.md"))
+	raw, err = os.ReadFile(filepath.Join(dest, "agents", "workflow-orchestrator.md"))
 	if err != nil {
 		t.Fatal(err)
 	}

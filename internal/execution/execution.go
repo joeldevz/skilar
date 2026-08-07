@@ -259,9 +259,9 @@ func applyPatch(root string, p PatchArtifact) error {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return err
 		}
-		mode := op.Mode
-		if mode == 0 {
-			mode = 0o600
+		mode, err := normalizedFileMode(op.Mode)
+		if err != nil {
+			return fmt.Errorf("execution: invalid mode for %q: %w", op.Path, err)
 		}
 		if err := os.WriteFile(path, op.Data, mode); err != nil {
 			return err
@@ -271,6 +271,19 @@ func applyPatch(root string, p PatchArtifact) error {
 		}
 	}
 	return nil
+}
+
+func normalizedFileMode(mode os.FileMode) (os.FileMode, error) {
+	if mode&os.ModeType != 0 {
+		return 0, fmt.Errorf("special file type %v is not allowed", mode&os.ModeType)
+	}
+	// Agent-provided numeric modes are untrusted. Git only preserves the
+	// executable bit for regular files, so normalize everything else to
+	// owner-readable/owner-writable sandbox-safe permissions.
+	if mode.Perm()&0o111 != 0 {
+		return 0o700, nil
+	}
+	return 0o600, nil
 }
 func (b *Broker) Recover(operationID string) (string, error) {
 	var pre, post, status, workflowID string

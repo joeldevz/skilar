@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/joeldevz/skynex/internal/approval"
 	"github.com/joeldevz/skynex/internal/review"
 	"github.com/joeldevz/skynex/internal/workflow"
 )
@@ -189,9 +190,14 @@ func workflowWorker(store *workflow.SQLiteStore, repo string, args []string, out
 	w, _ := store.Get(id)
 	state := workflow.JobSucceeded
 	message := ""
+	humanGate := false
 	if err != nil {
 		state = workflow.JobFailed
 		message = err.Error()
+		if errors.Is(err, approval.ErrApprovalRequired) {
+			state = workflow.JobWaitingApproval
+			humanGate = true
+		}
 		// This worker does not own the workflow: it was refused the execution
 		// fence, or it lost one it held and stopped before mutating. Recording
 		// either as failed would block the workflow under whichever executor
@@ -206,6 +212,9 @@ func workflowWorker(store *workflow.SQLiteStore, repo string, args []string, out
 		state = workflow.JobCancelled
 	}
 	finishErr := store.FinishWorkflowJob(jobID, state, string(w.State), message, time.Now())
+	if humanGate {
+		return finishErr
+	}
 	if err != nil {
 		return err
 	}

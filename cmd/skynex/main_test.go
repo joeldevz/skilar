@@ -80,3 +80,19 @@ func TestAdvisorModelFlagIsNotPublicCLIState(t *testing.T) {
 		t.Fatal("retired --advisor-model flag was silently accepted")
 	}
 }
+
+func TestSnapshotsToPruneKeepsTotalRetentionBound(t *testing.T) {
+	for _, test := range []struct {
+		retained int
+		keep     int
+		want     int
+	}{
+		{retained: 5, keep: 3, want: 2},
+		{retained: 3, keep: 3, want: 0},
+		{retained: 2, keep: 3, want: 0},
+	} {
+		if got := snapshotsToPrune(test.retained, test.keep); got != test.want {
+			t.Errorf("snapshotsToPrune(%d, %d) = %d, want %d", test.retained, test.keep, got, test.want)
+		}
+	}
+}

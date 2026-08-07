@@ -84,6 +84,33 @@ func TestTechnicalJobRetryIsBoundedToThreeTotalAttempts(t *testing.T) {
 	}
 }
 
+func TestApprovalGateDoesNotBlockWorkflowOrConsumeRetryBudget(t *testing.T) {
+	s, err := OpenSQLite(filepath.Join(t.TempDir(), "workflows.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	executingJobWorkflow(t, s, "wf")
+	if _, err = s.CreateWorkflowJobOperation("job-gate", "wf", "review", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.FinishWorkflowJob("job-gate", JobWaitingApproval, string(StateExecuting), "approval: exact current approval required", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	w, err := s.Get("wf")
+	if err != nil || w.State != StateExecuting || w.ResumeTarget != "" {
+		t.Fatalf("workflow=%+v err=%v", w, err)
+	}
+	job, err := s.WorkflowJob("job-gate")
+	if err != nil || job.State != JobWaitingApproval {
+		t.Fatalf("job=%+v err=%v", job, err)
+	}
+	attempts, err := s.WorkflowJobAttempts("wf", "review")
+	if err != nil || attempts != 0 {
+		t.Fatalf("attempts=%d err=%v", attempts, err)
+	}
+}
+
 func TestDisplacedJobsDoNotConsumeTechnicalRetryBudget(t *testing.T) {
 	s, err := OpenSQLite(filepath.Join(t.TempDir(), "workflows.db"))
 	if err != nil {

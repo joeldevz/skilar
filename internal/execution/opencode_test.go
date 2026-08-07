@@ -35,6 +35,30 @@ func TestOpenCodePromptContainsExactResultContract(t *testing.T) {
 	}
 }
 
+func TestOpenCodeWorkerGetsWritableIsolatedRuntimeAndCredentials(t *testing.T) {
+	_, store, seal, attempt := openCodeFixture(t)
+	defer store.Close()
+	home := t.TempDir()
+	source := filepath.Join(home, ".local", "share", "opencode")
+	if err := os.MkdirAll(source, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "auth.json"), []byte(`{"provider":"token"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	body := `test -d "$XDG_DATA_HOME/opencode"
+test -d "$XDG_CACHE_HOME"
+test -d "$XDG_STATE_HOME"
+test -w "$XDG_DATA_HOME/opencode"
+test "$(cat "$XDG_DATA_HOME/opencode/auth.json")" = '{"provider":"token"}'
+printf '%s' '` + resultJSON(t, attempt, attempt.BasisTree) + `' > "$SKYNEX_RESULT_FILE"`
+	adapter := OpenCodeAdapter{Store: store, Options: OpenCodeOptions{Executable: fakeOpenCode(t, body), Timeout: time.Second}}
+	if _, err := adapter.Run(context.Background(), OpenCodeRequest{InvocationID: "isolated-runtime", Attempt: attempt, Seal: seal}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestOpenCodeInvocationIsObservableWhileRunning(t *testing.T) {
 	_, store, seal, attempt := openCodeFixture(t)
 	defer store.Close()

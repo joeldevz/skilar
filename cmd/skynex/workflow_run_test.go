@@ -864,6 +864,18 @@ func TestWorkflowStartBenignRequestRemainsSimpleLow(t *testing.T) {
 	}
 }
 
+func TestWorkflowStartValidatesRouteAttributionBeforePersisting(t *testing.T) {
+	repo, store := cliWorkflowRepo(t)
+	defer store.Close()
+	err := workflowStart(store, repo, []string{"--id", "wf-invalid", "--request", "rename heading", "--route", "simple", "--accept", "true", "--check", "true", "--path", "a.txt"}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "route override requires") {
+		t.Fatalf("err=%v", err)
+	}
+	if _, getErr := store.Get("wf-invalid"); !errors.Is(getErr, workflow.ErrNotFound) {
+		t.Fatalf("validation failure persisted workflow: %v", getErr)
+	}
+}
+
 func TestWorkflowRunDetachQueuesWorkerAndReturnsImmediately(t *testing.T) {
 	repo, store := cliWorkflowRepo(t)
 	defer store.Close()
@@ -1875,5 +1887,40 @@ func TestWorkflowPlannedRejectsInvalidDAG(t *testing.T) {
 	err := workflowStart(store, repo, []string{"--id", "wf", "--request", "bad", "--route", "planned", "--override-actor", "t", "--override-reason", "test", "--plan-file", plan}, &bytes.Buffer{})
 	if err == nil {
 		t.Fatal("cycle accepted")
+	}
+	var count int
+	if queryErr := store.Database().QueryRow(`SELECT COUNT(*) FROM workflows WHERE id='wf'`).Scan(&count); queryErr != nil || count != 0 {
+		t.Fatalf("invalid graph left durable workflow count=%d err=%v", count, queryErr)
+	}
+}
+
+func TestWorkflowPlannedRejectsInvalidSliceIDBeforeCreate(t *testing.T) {
+	repo, store := cliWorkflowRepo(t)
+	defer store.Close()
+	plan := filepath.Join(t.TempDir(), "bad-id.json")
+	_ = os.WriteFile(plan, []byte(`{"slices":[{"id":"domain","title":"domain","acceptance_criteria":["true"],"paths":["a.txt"],"checks":["true"]}]}`), 0o600)
+	err := workflowStart(store, repo, []string{"--id", "wf", "--request", "bad", "--route", "planned", "--override-actor", "t", "--override-reason", "test", "--plan-file", plan}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "slice_ prefix") {
+		t.Fatalf("err=%v", err)
+	}
+	var count int
+	if queryErr := store.Database().QueryRow(`SELECT COUNT(*) FROM workflows WHERE id='wf'`).Scan(&count); queryErr != nil || count != 0 {
+		t.Fatalf("invalid slice ID left durable workflow count=%d err=%v", count, queryErr)
+	}
+}
+
+func TestExecutionInvocationIDPreservesRetryHistory(t *testing.T) {
+	_, store := cliWorkflowRepo(t)
+	defer store.Close()
+	first, err := executionInvocationID(store, "wf:slice_13")
+	if err != nil || first != "invoke:wf:slice_13" {
+		t.Fatalf("first=%q err=%v", first, err)
+	}
+	if _, err = store.Database().Exec(`INSERT INTO opencode_invocations(invocation_id,workflow_id,attempt_id,model,command,exit_code,stdout_digest,stderr_digest,evidence_ids,status,started_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, first, "wf", "wf:slice_13", "test", []byte("[]"), 42, "out", "err", []byte("[]"), "failed", time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	retry, err := executionInvocationID(store, "wf:slice_13")
+	if err != nil || retry != "invoke:wf:slice_13:retry-1" {
+		t.Fatalf("retry=%q err=%v", retry, err)
 	}
 }

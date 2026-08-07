@@ -101,6 +101,28 @@ func TestFreezeUsesTemporaryIndexAndCapturesCandidateScope(t *testing.T) {
 	}
 }
 
+func TestFreezeSupportsAnEmptyBaseTree(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	if out, err := exec.Command("git", "init", repo).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+	git(t, repo, "config", "user.email", "test@example.com")
+	git(t, repo, "config", "user.name", "Test")
+	git(t, repo, "commit", "--allow-empty", "-m", "empty base")
+	write(t, filepath.Join(repo, "main.go"), "package main\n", 0o600)
+	seal, err := CaptureContext(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := Freeze(seal, Policy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := entryMap(candidate.Manifest)["main.go"]; !ok {
+		t.Fatalf("empty-base candidate omitted untracked file: %+v", candidate.Manifest)
+	}
+}
+
 func TestFreezeAllowsCompletelyIgnoredSkynexDirectory(t *testing.T) {
 	repo := newRepo(t, "")
 	write(t, filepath.Join(repo, ".gitignore"), ".skynex/\n", 0o600)

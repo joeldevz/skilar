@@ -217,13 +217,7 @@ func handleBackup(args *cliArgs) {
 	if keep == 0 {
 		keep = 3
 	}
-	eligible := 0
-	for _, snapshot := range snapshots {
-		if snapshot.EligibleToPrune {
-			eligible++
-		}
-	}
-	remove := eligible - keep
+	remove := snapshotsToPrune(len(snapshots), keep)
 	if remove <= 0 {
 		fmt.Printf("Pruned: 0; retained: %d\n", len(snapshots))
 		return
@@ -239,6 +233,13 @@ func handleBackup(args *cliArgs) {
 	}
 	remaining, _ := installer.ListSnapshots(stateDir)
 	fmt.Printf("Pruned: %d; retained: %d\n", removed, len(remaining))
+}
+
+func snapshotsToPrune(retained, keep int) int {
+	if retained <= keep {
+		return 0
+	}
+	return retained - keep
 }
 
 type cliArgs struct {

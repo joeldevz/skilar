@@ -592,6 +592,18 @@ func (c *Client) GetMessagesContext(ctx context.Context, sessionID string) ([]Me
 	return messages, nil
 }
 
+// GetMessageContext retrieves one message by its durable identity. The
+// directed endpoint is used to anchor a synchronous prompt response before
+// the complete message listing is reconciled independently.
+func (c *Client) GetMessageContext(ctx context.Context, sessionID, messageID string) (*Message, error) {
+	var message Message
+	path := "/session/" + url.PathEscape(sessionID) + "/message/" + url.PathEscape(messageID)
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &message, http.StatusOK); err != nil {
+		return nil, fmt.Errorf("get message for session %q: %w", sessionID, err)
+	}
+	return &message, nil
+}
+
 // GetSessionStatusesContext returns active session statuses. A session absent
 // from this map is idle.
 func (c *Client) GetSessionStatusesContext(ctx context.Context) (map[string]SessionStatus, error) {

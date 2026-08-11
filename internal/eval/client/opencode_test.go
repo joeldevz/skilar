@@ -62,6 +62,8 @@ func TestClientUsesCurrentSessionAPIAndPreservesTraceFields(t *testing.T) {
 			io.WriteString(w, `[{"id":"ses_child","projectID":"p1","directory":"/fixture/run-1","parentID":"ses_root","title":"child","version":"1.18.16","time":{"created":1002,"updated":1003}}]`)
 		case "GET /session/ses_root/message":
 			io.WriteString(w, "["+currentMessageJSON()+"]")
+		case "GET /session/ses_root/message/msg_assistant":
+			io.WriteString(w, currentMessageJSON())
 		case "GET /session/status":
 			io.WriteString(w, `{"ses_root":{"type":"retry","attempt":2,"message":"rate limited","next":1800}}`)
 		case "GET /experimental/tool/ids":
@@ -101,6 +103,11 @@ func TestClientUsesCurrentSessionAPIAndPreservesTraceFields(t *testing.T) {
 	if err != nil || len(children) != 1 || children[0].ParentID != session.ID {
 		t.Fatalf("children = %#v, err = %v", children, err)
 	}
+	directed, err := c.GetMessageContext(ctx, session.ID, response.Info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertCurrentMessage(t, *directed)
 	messages, err := c.GetMessagesContext(ctx, session.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -151,6 +158,7 @@ func TestClientUsesCurrentSessionAPIAndPreservesTraceFields(t *testing.T) {
 		"POST /session/ses_root/message",
 		"GET /session/ses_root",
 		"GET /session/ses_root/children",
+		"GET /session/ses_root/message/msg_assistant",
 		"GET /session/ses_root/message",
 		"GET /session/status",
 		"GET /experimental/tool/ids",
@@ -221,12 +229,17 @@ func TestVerifyRequiredAPIRequiresMCPStatusEndpoint(t *testing.T) {
 	document := json.RawMessage(`{"paths":{
 		"/session":{"post":{}},"/session/{id}":{"get":{}},
 		"/session/{id}/children":{"get":{}},"/session/{id}/message":{"get":{},"post":{}},
+		"/session/{id}/message/{messageID}":{"get":{}},
 		"/session/status":{"get":{}},"/global/event":{"get":{}},
 		"/experimental/tool/ids":{"get":{}},"/mcp":{"get":{}},"/provider":{"get":{}}
 	}}`)
 	routes, err := VerifyRequiredAPI(document)
-	if err != nil || len(routes) != 10 {
+	if err != nil || len(routes) != 11 {
 		t.Fatalf("VerifyRequiredAPI() = %v, %v", routes, err)
+	}
+	missingDirected := bytes.Replace(document, []byte("\n\t\t\"/session/{id}/message/{messageID}\":{\"get\":{}},"), nil, 1)
+	if _, err := VerifyRequiredAPI(missingDirected); err == nil || !strings.Contains(err.Error(), "GET /session/{}/message/{}") {
+		t.Fatalf("missing directed message GET error = %v", err)
 	}
 	missing := bytes.Replace(document, []byte(`,"/mcp":{"get":{}}`), nil, 1)
 	if _, err := VerifyRequiredAPI(missing); err == nil || !strings.Contains(err.Error(), "GET /mcp") {

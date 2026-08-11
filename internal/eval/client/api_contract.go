@@ -41,13 +41,14 @@ func VerifyRequiredAPI(raw json.RawMessage) ([]string, error) {
 		"/session/{}":            {"GET"},
 		"/session/{}/children":   {"GET"},
 		"/session/{}/message":    {"GET", "POST"},
+		"/session/{}/message/{}": {"GET"},
 		"/session/status":        {"GET"},
 		"/global/event":          {"GET"},
 		"/experimental/tool/ids": {"GET"},
 		"/mcp":                   {"GET"},
 		"/provider":              {"GET"},
 	}
-	verified := make([]string, 0, 10)
+	verified := make([]string, 0, 11)
 	for path, methods := range required {
 		for _, method := range methods {
 			if !available[path][method] {

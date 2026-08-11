@@ -93,6 +93,7 @@ func TestRunnerOpenCodeFactoryHelperProcess(t *testing.T) {
 			"/session":{"post":{}},"/session/{sessionID}":{"get":{}},
 			"/session/{sessionID}/children":{"get":{}},
 			"/session/{sessionID}/message":{"get":{},"post":{}},
+			"/session/{sessionID}/message/{messageID}":{"get":{}},
 			"/session/status":{"get":{}},"/global/event":{"get":{}},
 			"/experimental/tool/ids":{"get":{}},"/mcp":{"get":{}},"/provider":{"get":{}}
 		}}`)

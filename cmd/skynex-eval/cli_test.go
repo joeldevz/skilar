@@ -336,6 +336,7 @@ func TestDoctorOpenAPIContractRequiresEveryRunnerRoute(t *testing.T) {
 		"/session/{sessionID}":{"get":{}},
 		"/session/{sessionID}/children":{"get":{}},
 		"/session/{sessionID}/message":{"get":{},"post":{}},
+		"/session/{sessionID}/message/{messageID}":{"get":{}},
 		"/session/status":{"get":{}},
 		"/global/event":{"get":{}},
 		"/experimental/tool/ids":{"get":{}},
@@ -346,7 +347,7 @@ func TestDoctorOpenAPIContractRequiresEveryRunnerRoute(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(routes) != 10 {
+	if len(routes) != 11 {
 		t.Fatalf("verified routes = %v", routes)
 	}
 	missingMCP := bytes.Replace(document, []byte(`

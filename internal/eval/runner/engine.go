@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -43,8 +44,11 @@ const (
 type evaluationErrorCode string
 
 const (
-	evaluationErrorPostResponseInvalid   evaluationErrorCode = "post_response_invalid"
-	evaluationErrorResponseTraceMismatch evaluationErrorCode = "response_trace_mismatch"
+	evaluationErrorPostResponseInvalid      evaluationErrorCode = "post_response_invalid"
+	evaluationErrorDurableResponseMissing   evaluationErrorCode = "durable_response_missing"
+	evaluationErrorDurableResponseGetFailed evaluationErrorCode = "durable_response_get_failed"
+	evaluationErrorDurableResponseInvalid   evaluationErrorCode = "durable_response_invalid"
+	evaluationErrorMessageListInconsistent  evaluationErrorCode = "message_list_inconsistent"
 )
 
 type codedEvaluationError struct {
@@ -293,15 +297,15 @@ func (e *Engine) Run(ctx context.Context, testCase contracts.Case, request RunRe
 	}
 	response, conversationErr := executeConversation(runCtx, runtimeHandle, session.ID, testCase)
 
+	anchorState := durableResponseAnchorNotAttempted
 	var durableWaitErr error
 	if response != nil && !hasResponseContractError(conversationErr) {
-		// OpenCode can acknowledge the synchronous POST before its message is
-		// visible through the durable history endpoint. Do not let two stable,
-		// empty snapshots make that visibility gap look quiescent.
+		// Anchor the synchronous POST through the directed durable endpoint.
+		// A 404 may be a bounded visibility gap; transport failures and an
+		// identity-invalid message fail closed immediately.
 		anchorCtx, anchorCancel := context.WithTimeout(runCtx, durableResponseMaxWait)
-		if !waitForDurableResponse(anchorCtx, runtimeHandle, session.ID, response) {
-			durableWaitErr = newCodedEvaluationError(evaluationErrorResponseTraceMismatch)
-		}
+		anchorState = waitForDurableResponse(anchorCtx, runtimeHandle, session.ID, response)
+		durableWaitErr = durableResponseAnchorError(anchorState)
 		anchorCancel()
 	}
 	reconcileTimeout, _ := time.ParseDuration(testCase.Trace.Quiescence.Timeout)
@@ -316,7 +320,11 @@ func (e *Engine) Run(ctx context.Context, testCase contracts.Case, request RunRe
 		collectedTrace, traceErr = collector.Reconcile(reconcileCtx, session.ID, nil)
 	}
 	reconcileCancel()
-	responseTraceErr := errors.Join(durableWaitErr, validateDurableResponse(collectedTrace, session.ID, response, conversationErr))
+	var responseTraceErr error
+	if anchorState == durableResponseAnchorValid {
+		responseTraceErr = validateDurableResponse(collectedTrace, session.ID, response, conversationErr)
+	}
+	responseTraceErr = errors.Join(durableWaitErr, responseTraceErr)
 	conversationErr = errors.Join(conversationErr, responseTraceErr)
 	observedProvider, observedModel, modelObservationErr := validateObservedRootModel(collectedTrace, testCase.Agent.Model)
 	// Observed identifiers are untrusted trace data. Publish them only after the
@@ -821,23 +829,39 @@ func validatePostedResponse(response *client.Response, sessionID, parentID, prov
 }
 
 type durableMessageAPI interface {
-	GetMessagesContext(context.Context, string) ([]client.Message, error)
+	GetMessageContext(context.Context, string, string) (*client.Message, error)
 }
 
-func waitForDurableResponse(ctx context.Context, api durableMessageAPI, sessionID string, response *client.Response) bool {
+type durableResponseAnchorState uint8
+
+const (
+	durableResponseAnchorNotAttempted durableResponseAnchorState = iota
+	durableResponseAnchorValid
+	durableResponseAnchorAbsent
+	durableResponseAnchorGetFailed
+	durableResponseAnchorInvalid
+)
+
+func waitForDurableResponse(ctx context.Context, api durableMessageAPI, sessionID string, response *client.Response) durableResponseAnchorState {
 	if ctx == nil || api == nil || response == nil || response.Info.ID == "" {
-		return false
+		return durableResponseAnchorInvalid
 	}
+	seenNotFound := false
 	for {
-		messages, err := api.GetMessagesContext(ctx, sessionID)
+		message, err := api.GetMessageContext(ctx, sessionID, response.Info.ID)
 		if err != nil {
-			return false
-		}
-		switch durableResponseStatus(messages, sessionID, response) {
-		case durableResponseValid:
-			return true
-		case durableResponseInvalid:
-			return false
+			if isDirectedMessageNotFound(err) {
+				seenNotFound = true
+			} else if seenNotFound && ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+				return durableResponseAnchorAbsent
+			} else {
+				return durableResponseAnchorGetFailed
+			}
+		} else {
+			if directedDurableResponseValid(message, sessionID, response) {
+				return durableResponseAnchorValid
+			}
+			return durableResponseAnchorInvalid
 		}
 		timer := time.NewTimer(durableResponsePollInterval)
 		select {
@@ -845,10 +869,35 @@ func waitForDurableResponse(ctx context.Context, api durableMessageAPI, sessionI
 			if !timer.Stop() {
 				<-timer.C
 			}
-			return false
+			return durableResponseAnchorAbsent
 		case <-timer.C:
 		}
 	}
+}
+
+func isDirectedMessageNotFound(err error) bool {
+	var httpErr *client.HTTPError
+	return errors.As(err, &httpErr) && httpErr != nil && httpErr.StatusCode == http.StatusNotFound
+}
+
+func durableResponseAnchorError(state durableResponseAnchorState) error {
+	switch state {
+	case durableResponseAnchorValid, durableResponseAnchorNotAttempted:
+		return nil
+	case durableResponseAnchorAbsent:
+		return newCodedEvaluationError(evaluationErrorDurableResponseMissing)
+	case durableResponseAnchorGetFailed:
+		return newCodedEvaluationError(evaluationErrorDurableResponseGetFailed)
+	default:
+		return newCodedEvaluationError(evaluationErrorDurableResponseInvalid)
+	}
+}
+
+func directedDurableResponseValid(message *client.Message, sessionID string, response *client.Response) bool {
+	if message == nil || response == nil {
+		return false
+	}
+	return durableAssistantMatches(*message, sessionID, response)
 }
 
 type durableResponseState uint8
@@ -878,27 +927,34 @@ func durableResponseStatus(messages []client.Message, sessionID string, response
 		if message.Info.ID != response.Info.ID {
 			continue
 		}
-		info := message.Info
-		if info.Role != "assistant" || info.SessionID != sessionID ||
-			info.ParentID == "" || info.ParentID != response.Info.ParentID ||
-			info.ProviderID != response.Info.ProviderID || info.ModelID != response.Info.ModelID ||
-			info.Error != nil || info.Finish != response.Info.Finish || info.Finish != "stop" || info.Time.Completed == 0 {
+		if !durableAssistantMatches(message, sessionID, response) {
 			return durableResponseInvalid
-		}
-		for _, part := range message.Parts {
-			if part.ID == "" || part.Type == "" || part.SessionID != sessionID || part.MessageID != info.ID {
-				return durableResponseInvalid
-			}
 		}
 		if !parentFound {
-			return durableResponseInvalid
-		}
-		if !sameStablePartIdentities(response.Parts, message.Parts) {
 			return durableResponseInvalid
 		}
 		return durableResponseValid
 	}
 	return durableResponseAbsent
+}
+
+func durableAssistantMatches(message client.Message, sessionID string, response *client.Response) bool {
+	if response == nil || message.Info.ID != response.Info.ID {
+		return false
+	}
+	info := message.Info
+	if info.Role != "assistant" || info.SessionID != sessionID ||
+		info.ParentID == "" || info.ParentID != response.Info.ParentID ||
+		info.ProviderID != response.Info.ProviderID || info.ModelID != response.Info.ModelID ||
+		info.Error != nil || info.Finish != response.Info.Finish || info.Finish != "stop" || info.Time.Completed == 0 {
+		return false
+	}
+	for _, part := range message.Parts {
+		if part.ID == "" || part.Type == "" || part.SessionID != sessionID || part.MessageID != info.ID {
+			return false
+		}
+	}
+	return sameStablePartIdentities(response.Parts, message.Parts)
 }
 
 type stablePartIdentity struct {
@@ -955,7 +1011,7 @@ func validateDurableResponse(collected *trace.Trace, sessionID string, response 
 		return nil
 	}
 	if collected == nil || response == nil {
-		return newCodedEvaluationError(evaluationErrorResponseTraceMismatch)
+		return newCodedEvaluationError(evaluationErrorMessageListInconsistent)
 	}
 	for _, session := range collected.Sessions {
 		if session.Session.ID != sessionID {
@@ -966,7 +1022,7 @@ func validateDurableResponse(collected *trace.Trace, sessionID string, response 
 		}
 		break
 	}
-	return newCodedEvaluationError(evaluationErrorResponseTraceMismatch)
+	return newCodedEvaluationError(evaluationErrorMessageListInconsistent)
 }
 
 func durableFinalResponseText(collected *trace.Trace, sessionID string, response *client.Response, conversationErr error) string {
@@ -1000,7 +1056,16 @@ func evaluationCode(err error) string {
 
 func hasResponseContractError(err error) bool {
 	code := evaluationCode(err)
-	return code == string(evaluationErrorPostResponseInvalid) || code == string(evaluationErrorResponseTraceMismatch)
+	switch evaluationErrorCode(code) {
+	case evaluationErrorPostResponseInvalid,
+		evaluationErrorDurableResponseMissing,
+		evaluationErrorDurableResponseGetFailed,
+		evaluationErrorDurableResponseInvalid,
+		evaluationErrorMessageListInconsistent:
+		return true
+	default:
+		return false
+	}
 }
 
 func traceOptionsForCase(options trace.Options, quiescence contracts.QuiescenceConfig) trace.Options {

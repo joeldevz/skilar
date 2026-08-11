@@ -92,6 +92,7 @@ type fakeRuntime struct {
 
 	response    *client.Response
 	send        func(context.Context, string, client.SendMessageRequest) (*client.Response, error)
+	getMessage  func(context.Context, string, string) (*client.Message, error)
 	getMessages func(context.Context, string) ([]client.Message, error)
 	prompt      map[string]bool
 	events      trace.EventSource
@@ -292,6 +293,24 @@ func (r *fakeRuntime) GetMessagesContext(ctx context.Context, id string) ([]clie
 		return r.getMessages(ctx, id)
 	}
 	return append([]client.Message(nil), r.messages[id]...), nil
+}
+
+func (r *fakeRuntime) GetMessageContext(ctx context.Context, sessionID, messageID string) (*client.Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if r.getMessage != nil {
+		return r.getMessage(ctx, sessionID, messageID)
+	}
+	for _, message := range r.messages[sessionID] {
+		if message.Info.ID != messageID {
+			continue
+		}
+		copy := message
+		copy.Parts = append([]client.Part(nil), message.Parts...)
+		return &copy, nil
+	}
+	return nil, &client.HTTPError{Method: http.MethodGet, StatusCode: http.StatusNotFound}
 }
 
 func (r *fakeRuntime) GetSessionStatusesContext(ctx context.Context) (map[string]client.SessionStatus, error) {
@@ -754,14 +773,21 @@ func TestEngineV1WaitsForDurableResponseBeyondDefaultCollectorGap(t *testing.T) 
 	factory := &fakeRuntimeFactory{build: func(request RuntimeRequest) *fakeRuntime {
 		runtime := newFakeRuntime(request, true, completeMessages("Done successfully; verified."))
 		var firstLookup time.Time
-		runtime.getMessages = func(_ context.Context, id string) ([]client.Message, error) {
+		runtime.getMessage = func(_ context.Context, id, messageID string) (*client.Message, error) {
 			if firstLookup.IsZero() {
 				firstLookup = time.Now()
 			}
 			if time.Since(firstLookup) < 125*time.Millisecond {
-				return nil, nil
+				return nil, &client.HTTPError{Method: http.MethodGet, StatusCode: http.StatusNotFound}
 			}
-			return append([]client.Message(nil), runtime.messages[id]...), nil
+			for _, message := range runtime.messages[id] {
+				if message.Info.ID == messageID {
+					copy := message
+					copy.Parts = append([]client.Part(nil), message.Parts...)
+					return &copy, nil
+				}
+			}
+			return nil, &client.HTTPError{Method: http.MethodGet, StatusCode: http.StatusNotFound}
 		}
 		return runtime
 	}}
@@ -786,25 +812,24 @@ func TestEngineV1WaitsForDurableResponseBeyondDefaultCollectorGap(t *testing.T) 
 
 func TestEngineV1RejectsPostedResponseMissingFromReconciledHistory(t *testing.T) {
 	environment := newTestEnvironment(t, false)
+	lookups := 0
 	factory := &fakeRuntimeFactory{build: func(request RuntimeRequest) *fakeRuntime {
 		runtime := newFakeRuntime(request, true, completeMessages("Done successfully; verified."))
 		runtime.response.Info.ID = "assistant-post"
 		for index := range runtime.response.Parts {
 			runtime.response.Parts[index].MessageID = "assistant-post"
 		}
-		lookups := 0
+		runtime.getMessage = func(_ context.Context, _, _ string) (*client.Message, error) {
+			assistant := client.Message{Info: runtime.response.Info, Parts: append([]client.Part(nil), runtime.response.Parts...)}
+			sent := runtime.sentRequests()
+			if len(sent) != 1 {
+				return nil, fmt.Errorf("unexpected sent request count")
+			}
+			assistant.Info.ParentID = sent[0].MessageID
+			return &assistant, nil
+		}
 		runtime.getMessages = func(_ context.Context, id string) ([]client.Message, error) {
 			lookups++
-			if lookups == 1 {
-				sent := runtime.sentRequests()
-				if len(sent) != 1 {
-					return nil, fmt.Errorf("unexpected sent request count")
-				}
-				assistant := client.Message{Info: runtime.response.Info, Parts: append([]client.Part(nil), runtime.response.Parts...)}
-				assistant.Info.ParentID = sent[0].MessageID
-				user := client.Message{Info: client.ResponseInfo{ID: sent[0].MessageID, SessionID: "root", Role: "user"}}
-				return []client.Message{user, assistant}, nil
-			}
 			return append([]client.Message(nil), runtime.messages[id]...), nil
 		}
 		return runtime
@@ -813,7 +838,7 @@ func TestEngineV1RejectsPostedResponseMissingFromReconciledHistory(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Status != contracts.RunStatusInvalid || result.Error == nil || result.Error.Kind != string(evaluationErrorResponseTraceMismatch) {
+	if result.Status != contracts.RunStatusInvalid || result.Error == nil || result.Error.Kind != string(evaluationErrorMessageListInconsistent) {
 		t.Fatalf("POST/history mismatch result = status %s error %#v", result.Status, result.Error)
 	}
 	if claims := findEvidence(t, result, "claims"); claims.Complete {
@@ -821,6 +846,9 @@ func TestEngineV1RejectsPostedResponseMissingFromReconciledHistory(t *testing.T)
 	}
 	if result.Usage.Tree.Sessions != 1 || result.Usage.Tree.SumInputTokens == 0 {
 		t.Fatalf("best-effort reconciliation lost observed accounting: %#v", result.Usage)
+	}
+	if lookups == 0 {
+		t.Fatal("message listing was not reconciled after the directed anchor")
 	}
 }
 
@@ -875,17 +903,163 @@ func TestEngineV1UnexpectedQuestionKeepsVerifiedDurableClaims(t *testing.T) {
 func TestWaitForDurableResponseDoesNotRetryGETErrors(t *testing.T) {
 	response := &client.Response{Info: client.ResponseInfo{ID: "assistant", ParentID: "msg_user"}}
 	calls := 0
-	runtime := &fakeRuntime{getMessages: func(context.Context, string) ([]client.Message, error) {
+	runtime := &fakeRuntime{getMessage: func(context.Context, string, string) (*client.Message, error) {
 		calls++
 		return nil, errors.New("secret transport detail")
 	}}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if waitForDurableResponse(ctx, runtime, "root", response) {
-		t.Fatal("GET error unexpectedly established durability")
+	if state := waitForDurableResponse(ctx, runtime, "root", response); state != durableResponseAnchorGetFailed {
+		t.Fatalf("GET error state = %v", state)
 	}
 	if calls != 1 {
 		t.Fatalf("GET errors retried %d times, want exactly 1", calls)
+	}
+}
+
+func TestWaitForDurableResponseClassifiesDirectedEndpoint(t *testing.T) {
+	assistant := completeMessages("Done successfully; verified.")[0]
+	assistant.Info.ParentID = "msg_user"
+	response := &client.Response{Info: assistant.Info, Parts: append([]client.Part(nil), assistant.Parts...)}
+	copyMessage := func() *client.Message {
+		copy := assistant
+		copy.Parts = append([]client.Part(nil), assistant.Parts...)
+		return &copy
+	}
+
+	t.Run("404 then durable", func(t *testing.T) {
+		calls := 0
+		runtime := &fakeRuntime{getMessage: func(context.Context, string, string) (*client.Message, error) {
+			calls++
+			if calls == 1 {
+				return nil, &client.HTTPError{Method: http.MethodGet, StatusCode: http.StatusNotFound}
+			}
+			return copyMessage(), nil
+		}}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if state := waitForDurableResponse(ctx, runtime, "root", response); state != durableResponseAnchorValid || calls != 2 {
+			t.Fatalf("state=%v calls=%d", state, calls)
+		}
+	})
+
+	t.Run("404 through local deadline", func(t *testing.T) {
+		calls := 0
+		runtime := &fakeRuntime{getMessage: func(ctx context.Context, _, _ string) (*client.Message, error) {
+			calls++
+			if calls == 1 {
+				return nil, &client.HTTPError{Method: http.MethodGet, StatusCode: http.StatusNotFound}
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}}
+		ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+		defer cancel()
+		if state := waitForDurableResponse(ctx, runtime, "root", response); state != durableResponseAnchorAbsent || calls != 2 {
+			t.Fatalf("state=%v calls=%d", state, calls)
+		}
+	})
+
+	t.Run("500 is not retried", func(t *testing.T) {
+		calls := 0
+		runtime := &fakeRuntime{getMessage: func(context.Context, string, string) (*client.Message, error) {
+			calls++
+			return nil, &client.HTTPError{Method: http.MethodGet, StatusCode: http.StatusInternalServerError, Body: "secret-canary"}
+		}}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if state := waitForDurableResponse(ctx, runtime, "root", response); state != durableResponseAnchorGetFailed || calls != 1 {
+			t.Fatalf("state=%v calls=%d", state, calls)
+		}
+	})
+
+	t.Run("identity mismatch is not retried", func(t *testing.T) {
+		calls := 0
+		runtime := &fakeRuntime{getMessage: func(context.Context, string, string) (*client.Message, error) {
+			calls++
+			message := copyMessage()
+			message.Info.ID = "secret-canary"
+			message.Parts[0].MessageID = "secret-canary"
+			return message, nil
+		}}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if state := waitForDurableResponse(ctx, runtime, "root", response); state != durableResponseAnchorInvalid || calls != 1 {
+			t.Fatalf("state=%v calls=%d", state, calls)
+		}
+	})
+}
+
+func TestEngineV1DirectedAnchorFailuresStillReconcileWithoutLeakingDetails(t *testing.T) {
+	const canary = "directed-anchor-secret-canary"
+	tests := []struct {
+		name    string
+		want    evaluationErrorCode
+		message func(context.Context, *fakeRuntime) (*client.Message, error)
+	}{
+		{
+			name: "missing", want: evaluationErrorDurableResponseMissing,
+			message: func(context.Context, *fakeRuntime) (*client.Message, error) {
+				return nil, &client.HTTPError{Method: http.MethodGet, URL: canary, StatusCode: http.StatusNotFound, Body: canary}
+			},
+		},
+		{
+			name: "get failed", want: evaluationErrorDurableResponseGetFailed,
+			message: func(context.Context, *fakeRuntime) (*client.Message, error) {
+				return nil, &client.HTTPError{Method: http.MethodGet, URL: canary, StatusCode: http.StatusInternalServerError, Body: canary}
+			},
+		},
+		{
+			name: "identity invalid", want: evaluationErrorDurableResponseInvalid,
+			message: func(_ context.Context, runtime *fakeRuntime) (*client.Message, error) {
+				for _, message := range runtime.messages["root"] {
+					if message.Info.Role != "assistant" {
+						continue
+					}
+					copy := message
+					copy.Parts = append([]client.Part(nil), message.Parts...)
+					copy.Info.ID = canary
+					copy.Info.SessionID = canary
+					return &copy, nil
+				}
+				return nil, errors.New("assistant fixture missing")
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			environment := newTestEnvironment(t, false)
+			environment.caseValue.Completion.Timeout = "4s"
+			listCalls := 0
+			factory := &fakeRuntimeFactory{build: func(request RuntimeRequest) *fakeRuntime {
+				runtime := newFakeRuntime(request, true, completeMessages("Done successfully; verified."))
+				runtime.getMessage = func(ctx context.Context, _, _ string) (*client.Message, error) {
+					return test.message(ctx, runtime)
+				}
+				runtime.getMessages = func(_ context.Context, id string) ([]client.Message, error) {
+					listCalls++
+					return append([]client.Message(nil), runtime.messages[id]...), nil
+				}
+				return runtime
+			}}
+			result, err := newTestEngine(t, environment, factory).Run(context.Background(), environment.caseValue, RunRequest{Variant: "candidate", Repetition: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Status != contracts.RunStatusInvalid || result.Error == nil || result.Error.Kind != string(test.want) {
+				t.Fatalf("result status=%s error=%#v", result.Status, result.Error)
+			}
+			if listCalls == 0 || result.Usage.Tree.Sessions != 1 || result.Usage.Tree.SumInputTokens == 0 {
+				t.Fatalf("reconciliation/usage lost: listCalls=%d usage=%#v", listCalls, result.Usage)
+			}
+			encoded, err := json.Marshal(result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Contains(encoded, []byte(canary)) {
+				t.Fatalf("directed endpoint detail leaked: %s", encoded)
+			}
+		})
 	}
 }
 

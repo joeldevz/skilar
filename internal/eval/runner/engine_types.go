@@ -21,6 +21,7 @@ type RuntimeAPI interface {
 	trace.EventSource
 	CreateSessionContext(context.Context, string) (*client.Session, error)
 	SendMessageWithRequestContext(context.Context, string, client.SendMessageRequest) (*client.Response, error)
+	GetMessageContext(context.Context, string, string) (*client.Message, error)
 	GetToolIDsContext(context.Context) ([]string, error)
 }
 
@@ -155,6 +156,10 @@ func (r *openCodeRuntime) GetChildrenContext(ctx context.Context, id string) ([]
 
 func (r *openCodeRuntime) GetMessagesContext(ctx context.Context, id string) ([]client.Message, error) {
 	return r.client.GetMessagesContext(ctx, id)
+}
+
+func (r *openCodeRuntime) GetMessageContext(ctx context.Context, sessionID, messageID string) (*client.Message, error) {
+	return r.client.GetMessageContext(ctx, sessionID, messageID)
 }
 
 func (r *openCodeRuntime) GetSessionStatusesContext(ctx context.Context) (map[string]client.SessionStatus, error) {

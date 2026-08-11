@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -173,17 +174,197 @@ type ResponseInfo struct {
 	Duration time.Duration `json:"-"`
 }
 
+var (
+	errInvalidMessageMetadata    = errors.New("invalid message metadata")
+	errInvalidJSONObject         = errors.New("invalid JSON object")
+	errDuplicateJSONObjectField  = errors.New("JSON object contains a duplicate field")
+	errInvalidUserMessageSummary = errors.New("invalid user message summary")
+	errInvalidAssistantSummary   = errors.New("invalid assistant message summary")
+	errUnsupportedMessageSummary = errors.New("message summary has an unsupported role")
+)
+
 func (i *ResponseInfo) UnmarshalJSON(data []byte) error {
 	type alias ResponseInfo
-	var decoded alias
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	fields, err := decodeUniqueJSONObject(data)
+	if err != nil {
 		return err
+	}
+	summary, hasSummary := fields["summary"]
+	delete(fields, "summary")
+	sanitized, err := json.Marshal(fields)
+	if err != nil {
+		return errInvalidMessageMetadata
+	}
+	var decoded alias
+	if err := json.Unmarshal(sanitized, &decoded); err != nil {
+		return errInvalidMessageMetadata
+	}
+	if hasSummary {
+		switch decoded.Role {
+		case "user":
+			if !validUserMessageSummary(summary) {
+				return errInvalidUserMessageSummary
+			}
+			// User summary prose and diffs are intentionally validated and
+			// discarded. They are not evidence and must never reach a trace.
+			decoded.Summary = false
+		case "assistant":
+			trimmed := bytes.TrimSpace(summary)
+			switch string(trimmed) {
+			case "true":
+				decoded.Summary = true
+			case "false":
+				decoded.Summary = false
+			default:
+				return errInvalidAssistantSummary
+			}
+		default:
+			return errUnsupportedMessageSummary
+		}
 	}
 	*i = ResponseInfo(decoded)
 	if i.Time.Completed >= i.Time.Created && i.Time.Created != 0 {
 		i.Duration = time.Duration(i.Time.Completed-i.Time.Created) * time.Millisecond
 	}
 	return nil
+}
+
+func (i ResponseInfo) MarshalJSON() ([]byte, error) {
+	type alias ResponseInfo
+	copy := i
+	if copy.Role == "user" {
+		copy.Summary = false
+	}
+	return json.Marshal(alias(copy))
+}
+
+func decodeUniqueJSONObject(data []byte) (map[string]json.RawMessage, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	opening, ok := token.(json.Delim)
+	if err != nil || !ok || opening != '{' {
+		return nil, errInvalidJSONObject
+	}
+	fields := make(map[string]json.RawMessage)
+	for decoder.More() {
+		token, err = decoder.Token()
+		key, ok := token.(string)
+		if err != nil || !ok {
+			return nil, errInvalidJSONObject
+		}
+		if _, duplicate := fields[key]; duplicate {
+			return nil, errDuplicateJSONObjectField
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, errInvalidJSONObject
+		}
+		fields[key] = value
+	}
+	token, err = decoder.Token()
+	closing, ok := token.(json.Delim)
+	if err != nil || !ok || closing != '}' || requireJSONEOF(decoder) != nil {
+		return nil, errInvalidJSONObject
+	}
+	return fields, nil
+}
+
+func validUserMessageSummary(data json.RawMessage) bool {
+	fields, err := decodeUniqueJSONObject(data)
+	if err != nil {
+		return false
+	}
+	diffs, hasDiffs := fields["diffs"]
+	if !hasDiffs || !validUserSummaryDiffs(diffs) {
+		return false
+	}
+	for key, value := range fields {
+		switch key {
+		case "title", "body":
+			if !validJSONString(value) {
+				return false
+			}
+		case "diffs":
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func validUserSummaryDiffs(data json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '[' {
+		return false
+	}
+	var diffs []json.RawMessage
+	if err := json.Unmarshal(trimmed, &diffs); err != nil {
+		return false
+	}
+	for _, diff := range diffs {
+		if !validUserSummaryDiff(diff) {
+			return false
+		}
+	}
+	return true
+}
+
+func validUserSummaryDiff(data json.RawMessage) bool {
+	fields, err := decodeUniqueJSONObject(data)
+	if err != nil {
+		return false
+	}
+	additions := false
+	deletions := false
+	for key, value := range fields {
+		switch key {
+		case "file":
+			if !validJSONString(value) {
+				return false
+			}
+		case "patch":
+			if !validJSONString(value) {
+				return false
+			}
+		case "status":
+			var status string
+			if !validJSONString(value) || json.Unmarshal(value, &status) != nil ||
+				(status != "added" && status != "deleted" && status != "modified") {
+				return false
+			}
+		case "additions":
+			additions = validFiniteJSONNumber(value)
+			if !additions {
+				return false
+			}
+		case "deletions":
+			deletions = validFiniteJSONNumber(value)
+			if !deletions {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return additions && deletions
+}
+
+func validJSONString(data json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '"' {
+		return false
+	}
+	var value string
+	return json.Unmarshal(trimmed, &value) == nil
+}
+
+func validFiniteJSONNumber(data json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || (trimmed[0] != '-' && (trimmed[0] < '0' || trimmed[0] > '9')) {
+		return false
+	}
+	var value float64
+	return json.Unmarshal(trimmed, &value) == nil && !math.IsNaN(value) && !math.IsInf(value, 0)
 }
 
 // PartTime covers timestamps used by text, reasoning, retry, and tool parts.

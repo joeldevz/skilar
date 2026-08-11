@@ -174,6 +174,98 @@ func TestClientUsesCurrentSessionAPIAndPreservesTraceFields(t *testing.T) {
 	}
 }
 
+func TestMessageListAcceptsAndDiscardsOfficialUserSummary(t *testing.T) {
+	t.Parallel()
+	const canary = "user-summary-secret-canary"
+	response := `[
+		{"info":{"id":"msg_user","sessionID":"root","role":"user","time":{"created":1},"agent":"build","model":{"providerID":"openai","modelID":"gpt"},"summary":{"title":"` + canary + `","body":"` + canary + `","diffs":[{"file":"` + canary + `","patch":"` + canary + `","additions":1,"deletions":2,"status":"modified"}]}},"parts":[]},
+		{"info":{"id":"msg_assistant","sessionID":"root","role":"assistant","parentID":"msg_user","time":{"created":2,"completed":3},"modelID":"gpt","providerID":"openai","mode":"build","agent":"build","path":{"cwd":"/fixture","root":"/fixture"},"summary":true,"cost":0,"tokens":{"input":1,"output":1,"reasoning":0,"cache":{"read":0,"write":0}},"finish":"stop"},"parts":[]}
+	]`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, response)
+	}))
+	defer server.Close()
+
+	messages, err := New(Config{BaseURL: server.URL}).GetMessagesContext(context.Background(), "root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 2 || messages[0].Info.Role != "user" || messages[0].Info.Summary || !messages[1].Info.Summary {
+		t.Fatalf("decoded summaries = %#v", messages)
+	}
+	encoded, err := json.Marshal(messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(encoded, []byte(canary)) || bytes.Count(encoded, []byte(`"summary":true`)) != 1 {
+		t.Fatalf("user summary survived sanitized round trip: %s", encoded)
+	}
+}
+
+func TestResponseInfoSummaryIsStrictlyRoleAware(t *testing.T) {
+	t.Parallel()
+	const canary = "summary-invalid-secret-canary"
+	validUserSummary := `{"title":"` + canary + `","body":"` + canary + `","diffs":[]}`
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{name: "user boolean", raw: `{"role":"user","summary":true}`},
+		{name: "user null", raw: `{"role":"user","summary":null}`},
+		{name: "user missing diffs", raw: `{"role":"user","summary":{"title":"` + canary + `"}}`},
+		{name: "user title type", raw: `{"role":"user","summary":{"title":7,"diffs":[]}}`},
+		{name: "user diffs type", raw: `{"role":"user","summary":{"diffs":{}}}`},
+		{name: "user diff scalar", raw: `{"role":"user","summary":{"diffs":[7]}}`},
+		{name: "user diff missing count", raw: `{"role":"user","summary":{"diffs":[{"additions":1}]}}`},
+		{name: "user diff count type", raw: `{"role":"user","summary":{"diffs":[{"additions":"1","deletions":0}]}}`},
+		{name: "user diff status", raw: `{"role":"user","summary":{"diffs":[{"additions":1,"deletions":0,"status":"unknown"}]}}`},
+		{name: "user unknown field", raw: `{"role":"user","summary":{"diffs":[],"secret":"` + canary + `"}}`},
+		{name: "assistant object", raw: `{"role":"assistant","summary":` + validUserSummary + `}`},
+		{name: "assistant null", raw: `{"role":"assistant","summary":null}`},
+		{name: "unknown role", raw: `{"role":"other","summary":true}`},
+		{name: "duplicate summary", raw: `{"role":"user","summary":` + validUserSummary + `,"summary":` + validUserSummary + `}`},
+		{name: "duplicate nested field", raw: `{"role":"user","summary":{"title":"` + canary + `","title":"again","diffs":[]}}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var info ResponseInfo
+			err := json.Unmarshal([]byte(test.raw), &info)
+			if err == nil || strings.Contains(err.Error(), canary) {
+				t.Fatalf("invalid summary accepted or leaked content: %v", err)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		raw  string
+		want bool
+	}{
+		{raw: `{"role":"user","summary":` + validUserSummary + `}`, want: false},
+		{raw: `{"role":"assistant","summary":true}`, want: true},
+		{raw: `{"role":"assistant","summary":false}`, want: false},
+	} {
+		var info ResponseInfo
+		if err := json.Unmarshal([]byte(test.raw), &info); err != nil || info.Summary != test.want {
+			t.Fatalf("valid summary decoded as %#v, err=%v", info, err)
+		}
+	}
+}
+
+func TestResponseInfoMarshalNeverEmitsUserSummary(t *testing.T) {
+	t.Parallel()
+	user, err := json.Marshal(ResponseInfo{Role: "user", Summary: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assistant, err := json.Marshal(ResponseInfo{Role: "assistant", Summary: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(user, []byte("summary")) || !bytes.Contains(assistant, []byte(`"summary":true`)) {
+		t.Fatalf("role-aware marshal user=%s assistant=%s", user, assistant)
+	}
+}
+
 func TestGetMessagesContextFollowsOpaqueCursorAndRestoresChronology(t *testing.T) {
 	t.Parallel()
 	const cursor = "opaque+/=?&token"

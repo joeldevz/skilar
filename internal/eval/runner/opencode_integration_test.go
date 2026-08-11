@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/joeldevz/skynex/internal/assets"
 	"github.com/joeldevz/skynex/internal/eval/contracts"
 )
 
@@ -152,6 +153,111 @@ func TestPinnedOpenCodeAcceptsAndEnforcesGeneratedPolicyWithoutModelCall(t *test
 	}
 	if info.ToolCatalogDigest != wantCatalogDigest {
 		t.Fatalf("effective tool catalog digest = %s, want %s for %v", info.ToolCatalogDigest, wantCatalogDigest, toolIDs)
+	}
+}
+
+// OpenCode 1.18.16 omits disabled MCP entries from GET /mcp. Exercise the
+// shipped bundle and its ambient MCP declarations with the public go-run fake,
+// while keeping the transport GET-only so this regression cannot call a model.
+func TestPinnedOpenCodeAcceptsRealBundleWhenDisabledMCPsAreOmittedWithoutModelCall(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "workspace")
+	runPath := filepath.Join(root, "runtime")
+	configRoot := filepath.Join(runPath, "control", "xdg-config")
+	bundle := filepath.Join(configRoot, "opencode")
+	if err := os.MkdirAll(bundle, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	bundleFS, err := assets.OpencodeFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := assets.ExtractTo(bundleFS, bundle); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.CopyFS(workspace, os.DirFS(publicCoordinationFixtureRoot(t))); err != nil {
+		t.Fatal(err)
+	}
+
+	evaluatorBinary := buildEvaluatorBinary(t, root)
+	testCase := contracts.Case{
+		Agent: contracts.AgentConfig{Name: "skynex-orchestrator", Model: "openai/gpt-5.6-terra"},
+		Security: contracts.SecurityConfig{
+			ExecutionMode: contracts.ExecutionTrustedLocal,
+			Network:       contracts.NetworkHostUnisolated,
+		},
+		ToolPolicy: contracts.ToolPolicy{
+			AllowedTools:   []string{"Read", "worker_result"},
+			ForbiddenTools: []string{"Edit", "skynex_workflow", "git_commit", "git_push", "github_pr"},
+			FakeMCPs: []contracts.FakeMCP{{
+				Name: "candidate_drift", Transport: "stdio", Tools: []string{"worker_result"},
+				Command: &contracts.Command{Argv: []string{"go", "run", "./fake-mcp"}},
+				Env:     map[string]string{"SKX_FAKE_SCENARIO": "candidate_drift"},
+			}},
+		},
+	}
+	effective, err := prepareToolPolicyWithProxy(bundle, testCase, nil, evaluatorBinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(effective.DisabledMCPs) == 0 {
+		t.Fatal("real bundle did not retain any disabled ambient MCP declarations")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	binary, err := exec.LookPath("opencode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary, err = filepath.Abs(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rejectedNonGET atomic.Int64
+	runtimeHandle, err := (OpenCodeFactory{
+		Binary: filepath.Clean(binary), ExpectedVersion: "1.18.16", StartupTimeout: 30 * time.Second,
+		Env: map[string]string{"OPENAI_API_KEY": "skynex-eval-no-model-placeholder"},
+		HTTPClient: &http.Client{
+			Transport: getOnlyRoundTripper{base: http.DefaultTransport, rejectedNonGET: &rejectedNonGET},
+			Timeout:   30 * time.Second,
+		},
+	}).Start(ctx, RuntimeRequest{
+		WorkspacePath: workspace, RunPath: runPath, ConfigRoot: configRoot,
+		Case:       testCase,
+		ToolPolicy: effective,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := runtimeHandle.Close(); err != nil {
+			t.Errorf("close real-bundle no-model runtime: %v", err)
+		}
+	}()
+
+	openCode, ok := runtimeHandle.(*openCodeRuntime)
+	if !ok {
+		t.Fatalf("runtime type = %T, want *openCodeRuntime", runtimeHandle)
+	}
+	statuses, err := openCode.client.GetMCPStatusCatalogContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses.Statuses) != 1 || statuses.Statuses["candidate_drift"] != "connected" {
+		t.Fatalf("GET /mcp statuses = %#v, want only connected fake", statuses.Statuses)
+	}
+	for _, name := range effective.DisabledMCPs {
+		if _, reported := statuses.Statuses[name]; reported {
+			t.Fatalf("OpenCode unexpectedly reported disabled ambient MCP %q", name)
+		}
+	}
+	tools := runtimeHandle.PromptTools()
+	if !tools["read"] || !tools["candidate_drift_worker_result"] {
+		t.Fatalf("real-bundle allowed tools are missing: %#v", tools)
+	}
+	if rejectedNonGET.Load() != 0 {
+		t.Fatalf("real-bundle preflight attempted %d non-GET requests", rejectedNonGET.Load())
 	}
 }
 
@@ -315,12 +421,7 @@ func (t getOnlyRoundTripper) RoundTrip(request *http.Request) (*http.Response, e
 
 func buildPublicFakeMCP(t *testing.T, root string) string {
 	t.Helper()
-	_, sourceFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("locate integration test source")
-	}
-	repositoryRoot := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", "..", ".."))
-	sourceDir := filepath.Join(repositoryRoot, "eval", "fixtures", "skynex-orchestrator", "coordination", "fake-mcp")
+	sourceDir := filepath.Join(publicCoordinationFixtureRoot(t), "fake-mcp")
 	binary := filepath.Join(root, "fake-mcp")
 	goHome := filepath.Join(root, "go-home")
 	goCache := filepath.Join(root, "go-cache")
@@ -348,6 +449,16 @@ func buildPublicFakeMCP(t *testing.T, root string) string {
 		t.Fatalf("fake MCP executable has unsafe mode %v", info.Mode())
 	}
 	return binary
+}
+
+func publicCoordinationFixtureRoot(t *testing.T) string {
+	t.Helper()
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate integration test source")
+	}
+	repositoryRoot := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", "..", ".."))
+	return filepath.Join(repositoryRoot, "eval", "fixtures", "skynex-orchestrator", "coordination")
 }
 
 func buildEvaluatorBinary(t *testing.T, root string) string {

@@ -198,30 +198,37 @@ func bindEffectiveRuntimeToolCatalog(effective toolpolicy.Effective, rawRegistry
 }
 
 func verifyRuntimeMCPStatuses(effective toolpolicy.Effective, actual map[string]client.MCPStatus) error {
-	expected := make(map[string]client.MCPStatus, len(effective.EnabledFakes)+len(effective.DisabledMCPs))
+	// OpenCode 1.18.16 omits evaluator-disabled config entries from GET /mcp.
+	// Enabled fakes remain mandatory and connected; a disabled entry is
+	// optional in this status view, but may only report disabled when present.
+	enabled := make(map[string]struct{}, len(effective.EnabledFakes))
 	for _, name := range effective.EnabledFakes {
-		if _, duplicate := expected[name]; duplicate {
+		if _, duplicate := enabled[name]; duplicate {
 			return fmt.Errorf("effective policy contains a duplicate MCP status expectation")
 		}
-		expected[name] = client.MCPStatusConnected
+		enabled[name] = struct{}{}
 	}
+	disabled := make(map[string]struct{}, len(effective.DisabledMCPs))
 	for _, name := range effective.DisabledMCPs {
-		if _, duplicate := expected[name]; duplicate {
+		if _, duplicate := enabled[name]; duplicate {
 			return fmt.Errorf("effective policy contains a duplicate MCP status expectation")
 		}
-		expected[name] = client.MCPStatusDisabled
+		if _, duplicate := disabled[name]; duplicate {
+			return fmt.Errorf("effective policy contains a duplicate MCP status expectation")
+		}
+		disabled[name] = struct{}{}
 	}
-	expectedNames := make([]string, 0, len(expected))
-	for name := range expected {
-		expectedNames = append(expectedNames, name)
+	enabledNames := make([]string, 0, len(enabled))
+	for name := range enabled {
+		enabledNames = append(enabledNames, name)
 	}
-	sort.Strings(expectedNames)
-	for _, name := range expectedNames {
+	sort.Strings(enabledNames)
+	for _, name := range enabledNames {
 		status, exists := actual[name]
 		if !exists {
 			return fmt.Errorf("runtime MCP status is missing for a declared entry")
 		}
-		if status != expected[name] {
+		if status != client.MCPStatusConnected {
 			return fmt.Errorf("runtime MCP status differs from the declared policy")
 		}
 	}
@@ -231,9 +238,16 @@ func verifyRuntimeMCPStatuses(effective toolpolicy.Effective, actual map[string]
 	}
 	sort.Strings(actualNames)
 	for _, name := range actualNames {
-		if _, declared := expected[name]; !declared {
-			return fmt.Errorf("runtime exposes an unexpected MCP entry")
+		if _, declared := enabled[name]; declared {
+			continue
 		}
+		if _, declared := disabled[name]; declared {
+			if actual[name] != client.MCPStatusDisabled {
+				return fmt.Errorf("runtime MCP status differs from the declared policy")
+			}
+			continue
+		}
+		return fmt.Errorf("runtime exposes an unexpected MCP entry")
 	}
 	return nil
 }

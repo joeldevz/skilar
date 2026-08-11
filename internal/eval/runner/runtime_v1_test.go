@@ -208,7 +208,6 @@ func TestBindEffectiveRuntimeToolCatalogIncludesOnlyConnectedFakeBindings(t *tes
 	t.Parallel()
 	effective := runtimeToolPolicyWithFake(t)
 	mcp := client.MCPStatusCatalog{Statuses: map[string]client.MCPStatus{
-		"ambient":         client.MCPStatusDisabled,
 		"candidate_drift": client.MCPStatusConnected,
 	}}
 	promptTools, digest, err := bindEffectiveRuntimeToolCatalog(effective, json.RawMessage(`["read","ambient_unknown"]`), mcp)
@@ -233,6 +232,17 @@ func TestBindEffectiveRuntimeToolCatalogIncludesOnlyConnectedFakeBindings(t *tes
 	}
 }
 
+func TestBindEffectiveRuntimeToolCatalogAcceptsReportedDisabledMCP(t *testing.T) {
+	t.Parallel()
+	effective := runtimeToolPolicyWithFake(t)
+	statuses := map[string]client.MCPStatus{
+		"ambient": client.MCPStatusDisabled, "candidate_drift": client.MCPStatusConnected,
+	}
+	if _, _, err := bindEffectiveRuntimeToolCatalog(effective, json.RawMessage(`["read"]`), client.MCPStatusCatalog{Statuses: statuses}); err != nil {
+		t.Fatalf("reported disabled MCP was rejected: %v", err)
+	}
+}
+
 func TestBindEffectiveRuntimeToolCatalogRejectsMCPStatusDrift(t *testing.T) {
 	t.Parallel()
 	effective := runtimeToolPolicyWithFake(t)
@@ -244,13 +254,13 @@ func TestBindEffectiveRuntimeToolCatalogRejectsMCPStatusDrift(t *testing.T) {
 		{
 			name: "failed enabled fake",
 			statuses: map[string]client.MCPStatus{
-				"ambient": client.MCPStatusDisabled, "candidate_drift": client.MCPStatusFailed,
+				"candidate_drift": client.MCPStatusFailed,
 			},
 			want: `runtime MCP status differs from the declared policy`,
 		},
 		{
 			name:     "missing enabled fake",
-			statuses: map[string]client.MCPStatus{"ambient": client.MCPStatusDisabled},
+			statuses: map[string]client.MCPStatus{},
 			want:     `runtime MCP status is missing for a declared entry`,
 		},
 		{
@@ -264,6 +274,13 @@ func TestBindEffectiveRuntimeToolCatalogRejectsMCPStatusDrift(t *testing.T) {
 			name: "disabled MCP connected",
 			statuses: map[string]client.MCPStatus{
 				"ambient": client.MCPStatusConnected, "candidate_drift": client.MCPStatusConnected,
+			},
+			want: `runtime MCP status differs from the declared policy`,
+		},
+		{
+			name: "disabled MCP failed",
+			statuses: map[string]client.MCPStatus{
+				"ambient": client.MCPStatusFailed, "candidate_drift": client.MCPStatusConnected,
 			},
 			want: `runtime MCP status differs from the declared policy`,
 		},

@@ -1,0 +1,368 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/joeldevz/skynex/schemas/eval-result.schema.json",
+  "title": "Skynex evaluation run result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "case_id",
+    "variant",
+    "repetition",
+    "status",
+    "provenance",
+    "checks",
+    "usage",
+    "coordination",
+    "timing",
+    "evidence",
+    "telemetry_complete",
+    "error"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "run_id": { "$ref": "#/$defs/id" },
+    "case_id": { "$ref": "#/$defs/id" },
+    "variant": { "$ref": "#/$defs/id" },
+    "repetition": { "type": "integer", "minimum": 1, "maximum": 100 },
+    "status": {
+      "enum": ["pass", "fail", "invalid", "inconclusive", "aborted", "infra_error", "budget_exhausted"]
+    },
+    "provenance": { "$ref": "#/$defs/provenance" },
+    "checks": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": { "$ref": "#/$defs/checkResult" }
+    },
+    "usage": { "$ref": "#/$defs/usage" },
+    "coordination": { "$ref": "#/$defs/coordination" },
+    "timing": { "$ref": "#/$defs/timing" },
+    "evidence": { "$ref": "#/$defs/evidence" },
+    "telemetry_complete": { "type": "boolean" },
+    "error": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/runError" }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "pass" } }, "required": ["status"] },
+      "then": {
+        "properties": {
+          "error": { "type": "null" },
+          "checks": {
+            "minItems": 1,
+            "contains": {
+              "type": "object",
+              "properties": { "hard": { "const": true } },
+              "required": ["hard"]
+            },
+            "items": {
+              "if": {
+                "properties": { "hard": { "const": true } },
+                "required": ["hard"]
+              },
+              "then": {
+                "properties": { "evidence_ids": { "minItems": 1 } }
+              }
+            }
+          }
+        },
+        "not": {
+          "properties": {
+            "checks": {
+              "contains": {
+                "type": "object",
+                "properties": {
+                  "hard": { "const": true },
+                  "status": { "not": { "const": "pass" } }
+                },
+                "required": ["hard", "status"]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "provenance": {
+            "properties": {
+              "extensions": {
+                "properties": {
+                  "x-billing-mode": { "const": "chatgpt-subscription" }
+                },
+                "required": ["x-billing-mode"]
+              }
+            },
+            "required": ["extensions"]
+          }
+        },
+        "required": ["provenance"]
+      },
+      "then": {
+        "properties": {
+          "usage": {
+            "properties": {
+              "parent": { "not": { "required": ["cost_usd"] } },
+              "tree": { "not": { "required": ["cost_usd"] } }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,127}$" },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "nonNegativeInteger": { "type": "integer", "minimum": 0 },
+    "nonNegativeNumber": { "type": "number", "minimum": 0 },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "git_sha",
+        "case_digest",
+        "prompt_digest",
+        "config_digest",
+        "fixture_digest",
+        "opencode_version",
+        "model",
+        "provider",
+        "toolset_digest",
+        "pricing_table_digest",
+        "execution_mode",
+        "network",
+        "host"
+      ],
+      "properties": {
+        "git_sha": { "type": "string", "pattern": "^[0-9a-f]{40,64}$" },
+        "case_digest": { "$ref": "#/$defs/digest" },
+        "prompt_digest": { "$ref": "#/$defs/digest" },
+        "config_digest": { "$ref": "#/$defs/digest" },
+        "fixture_digest": { "$ref": "#/$defs/digest" },
+        "opencode_version": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "opencode_api_digest": { "$ref": "#/$defs/digest" },
+        "model": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[^/\\s]+/\\S+$" },
+        "provider": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[^\\s]+$" },
+        "toolset_digest": { "$ref": "#/$defs/digest" },
+        "judge_digest": { "$ref": "#/$defs/digest" },
+        "pricing_table_digest": { "$ref": "#/$defs/digest" },
+        "execution_mode": { "enum": ["trusted-local", "isolated-container"] },
+        "network": { "enum": ["none", "loopback", "registry-allowlist", "provider-proxy-only", "host-unisolated"] },
+        "host": { "$ref": "#/$defs/host" },
+        "extensions": {
+          "type": "object",
+          "propertyNames": { "pattern": "^x-[a-z0-9][a-z0-9_.-]{0,126}$" },
+          "properties": {
+            "x-provider-auth-mode": { "const": "openai-oauth-clean-profile-v1" },
+            "x-billing-mode": { "const": "chatgpt-subscription" },
+            "x-credential-boundary": { "enum": ["runtime-readable", "provider-proxy"] },
+            "x-auth-isolation": { "const": "dedicated-profile-fresh-token-fail-stop-v1" },
+            "x-effective-provider-catalog-digest": { "$ref": "#/$defs/digest" }
+          },
+          "dependentRequired": {
+            "x-provider-auth-mode": ["x-billing-mode", "x-credential-boundary", "x-auth-isolation"],
+            "x-billing-mode": ["x-provider-auth-mode", "x-credential-boundary", "x-auth-isolation"],
+            "x-credential-boundary": ["x-provider-auth-mode", "x-billing-mode", "x-auth-isolation"],
+            "x-auth-isolation": ["x-provider-auth-mode", "x-billing-mode", "x-credential-boundary"]
+          },
+          "additionalProperties": { "type": "string" }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "execution_mode": { "const": "trusted-local" } }, "required": ["execution_mode"] },
+          "then": { "properties": { "network": { "const": "host-unisolated" } } }
+        },
+        {
+          "if": { "properties": { "execution_mode": { "const": "isolated-container" } }, "required": ["execution_mode"] },
+          "then": { "properties": { "network": { "not": { "const": "host-unisolated" } } } }
+        },
+        {
+          "if": {
+            "properties": {
+              "extensions": {
+                "properties": { "x-provider-auth-mode": { "const": "openai-oauth-clean-profile-v1" } },
+                "required": ["x-provider-auth-mode"]
+              }
+            },
+            "required": ["extensions"]
+          },
+          "then": {
+            "properties": {
+              "provider": { "const": "openai" },
+              "model": { "pattern": "^openai/[^\\s]+$" }
+            }
+          }
+        }
+      ]
+    },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "arch"],
+      "properties": {
+        "os": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "arch": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "runtime": { "type": "string", "maxLength": 256 }
+      }
+    },
+    "checkResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "status", "hard", "summary", "requirement_ids", "evidence_ids"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "type": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "status": { "enum": ["pass", "fail", "invalid", "skipped"] },
+        "hard": { "type": "boolean" },
+        "summary": { "type": "string", "maxLength": 65536 },
+        "requirement_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_.:-]{0,127}$" }
+        },
+        "evidence_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "error": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/runError" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "pass" } }, "required": ["status"] },
+          "then": { "properties": { "error": { "type": "null" } } }
+        }
+      ]
+    },
+    "tokenUsage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["first_input_tokens", "peak_input_tokens", "sum_input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"],
+      "properties": {
+        "first_input_tokens": { "$ref": "#/$defs/nonNegativeInteger" },
+        "peak_input_tokens": { "$ref": "#/$defs/nonNegativeInteger" },
+        "sum_input_tokens": { "$ref": "#/$defs/nonNegativeInteger" },
+        "output_tokens": { "$ref": "#/$defs/nonNegativeInteger" },
+        "cache_read_tokens": { "$ref": "#/$defs/nonNegativeInteger" },
+        "cache_write_tokens": { "$ref": "#/$defs/nonNegativeInteger" },
+        "reasoning_tokens": { "$ref": "#/$defs/nonNegativeInteger" },
+        "cost_usd": { "$ref": "#/$defs/nonNegativeNumber" },
+        "calculated_cost_usd": { "$ref": "#/$defs/nonNegativeNumber" }
+      }
+    },
+    "treeUsage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sum_input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "sessions"],
+      "properties": {
+        "sum_input_tokens": { "$ref": "#/$defs/nonNegativeInteger" },
+        "output_tokens": { "$ref": "#/$defs/nonNegativeInteger" },
+        "cache_read_tokens": { "$ref": "#/$defs/nonNegativeInteger" },
+        "cache_write_tokens": { "$ref": "#/$defs/nonNegativeInteger" },
+        "reasoning_tokens": { "$ref": "#/$defs/nonNegativeInteger" },
+        "cost_usd": { "$ref": "#/$defs/nonNegativeNumber" },
+        "calculated_cost_usd": { "$ref": "#/$defs/nonNegativeNumber" },
+        "sessions": { "$ref": "#/$defs/nonNegativeInteger" }
+      }
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["parent", "tree"],
+      "properties": {
+        "parent": { "$ref": "#/$defs/tokenUsage" },
+        "tree": { "$ref": "#/$defs/treeUsage" }
+      }
+    },
+    "coordination": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tool_calls", "subagent_calls", "retries", "repeated_commands", "repeated_reads"],
+      "properties": {
+        "tool_calls": { "$ref": "#/$defs/nonNegativeInteger" },
+        "subagent_calls": { "$ref": "#/$defs/nonNegativeInteger" },
+        "retries": { "$ref": "#/$defs/nonNegativeInteger" },
+        "repeated_commands": { "$ref": "#/$defs/nonNegativeInteger" },
+        "repeated_reads": { "$ref": "#/$defs/nonNegativeInteger" }
+      }
+    },
+    "timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["wall_ms", "model_ms"],
+      "properties": {
+        "wall_ms": { "$ref": "#/$defs/nonNegativeInteger" },
+        "model_ms": { "$ref": "#/$defs/nonNegativeInteger" }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["before_tree", "after_tree", "diff_digest", "trace_digest", "trace_path", "items"],
+      "properties": {
+        "before_tree": { "type": "string", "maxLength": 65536 },
+        "after_tree": { "type": "string", "maxLength": 65536 },
+        "diff_digest": {
+          "oneOf": [
+            { "const": "" },
+            { "$ref": "#/$defs/digest" }
+          ]
+        },
+        "trace_digest": {
+          "oneOf": [
+            { "const": "" },
+            { "$ref": "#/$defs/digest" }
+          ]
+        },
+        "trace_path": { "type": "string", "maxLength": 4096 },
+        "items": {
+          "type": "array",
+          "maxItems": 100000,
+          "items": { "$ref": "#/$defs/evidenceItem" }
+        }
+      }
+    },
+    "evidenceItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "source", "digest", "complete"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "kind": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "source": { "enum": ["evaluator", "provider", "llm_judge"] },
+        "digest": { "$ref": "#/$defs/digest" },
+        "path": { "type": "string", "maxLength": 4096 },
+        "summary": { "type": "string", "maxLength": 65536 },
+        "complete": { "type": "boolean" }
+      }
+    },
+    "runError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "message", "retryable"],
+      "properties": {
+        "kind": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "message": { "type": "string", "minLength": 1, "maxLength": 65536 },
+        "retryable": { "type": "boolean" },
+        "evidence_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        }
+      }
+    }
+  }
+}

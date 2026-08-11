@@ -1,0 +1,494 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/joeldevz/skynex/schemas/eval-case.schema.json",
+  "title": "Skynex evaluation case v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "suite",
+    "requirement_ids",
+    "type",
+    "critical",
+    "agent",
+    "fixture",
+    "setup",
+    "input",
+    "turns",
+    "completion",
+    "oracle",
+    "behavior_checks",
+    "security",
+    "trace",
+    "tool_policy",
+    "runs",
+    "gates"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "id": { "$ref": "#/$defs/id" },
+    "suite": { "$ref": "#/$defs/id" },
+    "requirement_ids": { "$ref": "#/$defs/requirementIDs" },
+    "type": {
+      "enum": ["behavior", "security", "quality", "reliability"]
+    },
+    "critical": { "type": "boolean" },
+    "agent": { "$ref": "#/$defs/agent" },
+    "fixture": { "$ref": "#/$defs/fixture" },
+    "setup": { "$ref": "#/$defs/setup" },
+    "input": { "type": "string", "minLength": 1, "maxLength": 262144 },
+    "turns": {
+      "type": "array",
+      "maxItems": 100,
+      "items": { "$ref": "#/$defs/turn" }
+    },
+    "completion": { "$ref": "#/$defs/completion" },
+    "oracle": { "$ref": "#/$defs/oracle" },
+    "behavior_checks": {
+      "type": "array",
+      "maxItems": 1000,
+      "items": { "$ref": "#/$defs/check" }
+    },
+    "security": { "$ref": "#/$defs/security" },
+    "trace": { "$ref": "#/$defs/trace" },
+    "tool_policy": { "$ref": "#/$defs/toolPolicy" },
+    "runs": { "$ref": "#/$defs/runs" },
+    "gates": { "$ref": "#/$defs/gates" },
+    "llm_judge": { "$ref": "#/$defs/llmJudge" },
+    "metrics": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" }
+    },
+    "extensions": { "$ref": "#/$defs/extensions" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "critical": { "const": true } }, "required": ["critical"] },
+      "then": {
+        "anyOf": [
+          { "properties": { "oracle": { "properties": { "commands": { "minItems": 1 } } } } },
+          { "properties": { "oracle": { "properties": { "expected_changes": { "minItems": 1 } } } } },
+          { "properties": { "oracle": { "properties": { "expected_files": { "minItems": 1 } } } } },
+          { "properties": { "behavior_checks": { "minItems": 1 } } }
+        ]
+      }
+    }
+  ],
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{0,127}$"
+    },
+    "requirementIDs": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z][A-Za-z0-9_.:-]{0,127}$"
+      }
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "description": "A normalized slash-separated path below the fixture root. Semantic validation rejects absolute paths, backslashes, empty segments, dot segments and traversal."
+    },
+    "duration": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 64,
+      "description": "A positive Go duration. Semantic validation enforces the context-specific upper bound."
+    },
+    "extensions": {
+      "type": "object",
+      "propertyNames": { "pattern": "^x-[a-z0-9][a-z0-9_.-]{0,126}$" },
+      "additionalProperties": true
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "model"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "model": { "type": "string", "minLength": 3, "maxLength": 256, "pattern": "^[!-.0-~]+/[!-~]+$" }
+      }
+    },
+    "fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "initial_git", "expected_digest", "git_seed"],
+      "properties": {
+        "source": { "$ref": "#/$defs/relativePath" },
+        "initial_git": { "type": "boolean" },
+        "expected_digest": { "$ref": "#/$defs/digest" },
+        "git_seed": { "$ref": "#/$defs/gitSeed" }
+      }
+    },
+    "gitSeed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tracked", "staged", "untracked", "ignored"],
+      "properties": {
+        "tracked": { "$ref": "#/$defs/gitSeedFiles" },
+        "staged": { "$ref": "#/$defs/gitSeedFiles" },
+        "untracked": { "$ref": "#/$defs/gitSeedFiles" },
+        "ignored": { "$ref": "#/$defs/gitSeedFiles" }
+      }
+    },
+    "gitSeedFiles": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": { "$ref": "#/$defs/gitSeedFile" }
+    },
+    "gitSeedFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "properties": {
+        "path": { "$ref": "#/$defs/relativePath" },
+        "content": { "type": "string", "maxLength": 262144 },
+        "digest": { "$ref": "#/$defs/digest" },
+        "mode": { "enum": ["0644", "0755"] }
+      },
+      "oneOf": [
+        { "required": ["content"], "not": { "required": ["digest"] } },
+        { "required": ["digest"], "not": { "required": ["content"] } }
+      ]
+    },
+    "setup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commands"],
+      "properties": {
+        "commands": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/command" }
+        }
+      }
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["argv", "timeout", "expected_exit"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": { "type": "string", "minLength": 1, "maxLength": 32768 }
+        },
+        "cwd": { "$ref": "#/$defs/relativePath" },
+        "timeout": { "$ref": "#/$defs/duration" },
+        "expected_exit": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": { "type": "integer", "minimum": 0, "maximum": 255 }
+        },
+        "max_output_bytes": { "type": "integer", "minimum": 0, "maximum": 67108864 },
+        "env": {
+          "type": "object",
+          "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "turn": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["answer"],
+      "properties": {
+        "answer": { "type": "string", "minLength": 1, "maxLength": 262144 }
+      }
+    },
+    "completion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_turns", "timeout", "unexpected_question"],
+      "properties": {
+        "max_turns": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "timeout": { "$ref": "#/$defs/duration" },
+        "unexpected_question": { "enum": ["fail", "continue", "stop"] }
+      }
+    },
+    "oracle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commands", "expected_changes", "forbidden_changes", "expected_files", "require_clean_process_tree"],
+      "properties": {
+        "commands": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/command" }
+        },
+        "expected_changes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/relativePath" }
+        },
+        "forbidden_changes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/relativePath" }
+        },
+        "expected_files": {
+          "type": "array",
+          "maxItems": 10000,
+          "items": { "$ref": "#/$defs/expectedFile" }
+        },
+        "require_clean_process_tree": { "type": "boolean" }
+      }
+    },
+    "expectedFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "properties": {
+        "path": { "$ref": "#/$defs/relativePath" },
+        "content": { "type": "string", "maxLength": 262144 },
+        "digest": { "$ref": "#/$defs/digest" },
+        "mode": { "enum": ["0644", "0755"] }
+      },
+      "oneOf": [
+        { "required": ["content"], "not": { "required": ["digest"] } },
+        { "required": ["digest"], "not": { "required": ["content"] } }
+      ]
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "evidence_ids"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "requirement_ids": { "$ref": "#/$defs/requirementIDs" },
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "type": {
+          "enum": [
+            "regex_count",
+            "regex_count_max_per_msg",
+            "contains_any",
+            "contains_all",
+            "not_contains",
+            "not_contains_pattern",
+            "regex_match",
+            "tool_called",
+            "tool_called_min",
+            "tool_not_called",
+            "tool_output_contains_all",
+            "file_written",
+            "tool_call_order",
+            "bash_output_contains",
+            "subagent_count",
+            "no_false_success",
+            "expected_diff",
+            "file_exists",
+            "file_not_exists"
+          ]
+        },
+        "hard": { "type": "boolean" },
+        "pattern": { "type": "string", "maxLength": 32768 },
+        "patterns": {
+          "type": "array",
+          "items": { "type": "string", "maxLength": 32768 }
+        },
+        "value": { "type": ["string", "number", "integer", "boolean"] },
+        "tool": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "path": { "$ref": "#/$defs/relativePath" },
+        "argv": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 32768 }
+        },
+        "min": { "type": "integer", "minimum": 0 },
+        "max": { "type": "integer", "minimum": 0 },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": { "const": "subagent_count" },
+              "min": { "minimum": 1 }
+            },
+            "required": ["type", "min"]
+          },
+          "then": {
+            "properties": { "patterns": { "minItems": 1 } },
+            "required": ["patterns"]
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "tool_output_contains_all" } },
+            "required": ["type"]
+          },
+          "then": {
+            "properties": { "patterns": { "minItems": 1 } },
+            "required": ["tool", "patterns"]
+          }
+        }
+      ]
+    },
+    "security": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["execution_mode", "network", "package_scripts", "allowed_executables", "allowed_write_roots", "retain_trace"],
+      "properties": {
+        "execution_mode": { "enum": ["trusted-local", "isolated-container"] },
+        "network": { "enum": ["none", "loopback", "registry-allowlist", "provider-proxy-only", "host-unisolated"] },
+        "package_scripts": { "type": "boolean" },
+        "allowed_executables": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[A-Za-z0-9_.+-]+$" }
+        },
+        "allowed_write_roots": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/relativePath" }
+        },
+        "allowed_registries": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 2048 }
+        },
+        "retain_trace": { "enum": ["never", "sanitized-on-failure", "sanitized-always"] }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "execution_mode": { "const": "trusted-local" } }, "required": ["execution_mode"] },
+          "then": { "properties": { "network": { "const": "host-unisolated" } } }
+        },
+        {
+          "if": { "properties": { "execution_mode": { "const": "isolated-container" } }, "required": ["execution_mode"] },
+          "then": { "properties": { "network": { "not": { "const": "host-unisolated" } } } }
+        },
+        {
+          "if": { "properties": { "package_scripts": { "const": true } }, "required": ["package_scripts"] },
+          "then": { "properties": { "execution_mode": { "const": "isolated-container" } } }
+        },
+        {
+          "if": { "properties": { "network": { "const": "registry-allowlist" } }, "required": ["network"] },
+          "then": { "required": ["allowed_registries"], "properties": { "allowed_registries": { "minItems": 1 } } },
+          "else": { "not": { "required": ["allowed_registries"] } }
+        }
+      ]
+    },
+    "trace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_bytes", "max_events", "max_event_bytes", "quiescence"],
+      "properties": {
+        "max_bytes": { "type": "integer", "minimum": 1, "maximum": 268435456 },
+        "max_events": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+        "max_event_bytes": { "type": "integer", "minimum": 1, "maximum": 4194304 },
+        "quiescence": { "$ref": "#/$defs/quiescence" }
+      }
+    },
+    "quiescence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "quiet_period", "timeout"],
+      "properties": {
+        "required": { "type": "boolean" },
+        "quiet_period": { "$ref": "#/$defs/duration" },
+        "timeout": { "$ref": "#/$defs/duration" }
+      }
+    },
+    "toolPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowed_tools", "forbidden_tools", "fake_mcps"],
+      "properties": {
+        "allowed_tools": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+        },
+        "forbidden_tools": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+        },
+        "fake_mcps": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/fakeMCP" }
+        }
+      }
+    },
+    "fakeMCP": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "transport", "tools", "command"],
+      "properties": {
+        "name": { "$ref": "#/$defs/id" },
+        "transport": { "const": "stdio" },
+        "tools": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+        },
+        "command": { "$ref": "#/$defs/command" },
+        "url": { "type": "string", "pattern": "^http://(127\\.0\\.0\\.1|localhost):[0-9]+(?:/.*)?$" },
+        "env": {
+          "type": "object",
+          "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+          "additionalProperties": { "type": "string" }
+        }
+      },
+      "not": { "required": ["url"] }
+    },
+    "runs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "aggregation"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "aggregation": { "enum": ["min", "median", "mean"] }
+      }
+    },
+    "gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hard_checks"],
+      "properties": {
+        "hard_checks": { "const": "all" },
+        "max_parent_peak_input_tokens_ratio": { "$ref": "#/$defs/ratio" },
+        "max_tree_input_tokens_ratio": { "$ref": "#/$defs/ratio" },
+        "max_median_cost_ratio": { "$ref": "#/$defs/ratio" },
+        "max_median_duration_ratio": { "$ref": "#/$defs/ratio" },
+        "max_retry_rate_ratio": { "$ref": "#/$defs/ratio" }
+      }
+    },
+    "ratio": { "type": "number", "minimum": 0, "maximum": 100 },
+    "llmJudge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "model", "rubric", "pass_threshold"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "model": { "type": "string", "maxLength": 256 },
+        "rubric": { "type": "string", "maxLength": 262144 },
+        "pass_threshold": { "type": "number", "minimum": 0, "maximum": 10 },
+        "prompt_digest": { "$ref": "#/$defs/digest" }
+      }
+    }
+  }
+}

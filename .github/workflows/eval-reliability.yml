@@ -1,0 +1,74 @@
+name: Eval reliability
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/eval-reliability.yml'
+      - 'cmd/skynex-eval/**'
+      - 'cmd/tools/sync-assets/**'
+      - 'internal/assets/**'
+      - 'internal/eval/**'
+      - 'internal/safefs/**'
+      - 'opencode/**'
+      - 'eval/cases/**'
+      - 'eval/fixtures/**'
+      - 'eval/specs/**'
+      - 'schemas/**'
+      - 'docs/skynex-eval-reliability-plan.md'
+      - 'go.mod'
+      - 'go.sum'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/eval-reliability.yml'
+      - 'cmd/skynex-eval/**'
+      - 'cmd/tools/sync-assets/**'
+      - 'internal/assets/**'
+      - 'internal/eval/**'
+      - 'internal/safefs/**'
+      - 'opencode/**'
+      - 'eval/cases/**'
+      - 'eval/fixtures/**'
+      - 'eval/specs/**'
+      - 'schemas/**'
+      - 'docs/skynex-eval-reliability-plan.md'
+      - 'go.mod'
+      - 'go.sum'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eval-reliability-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deterministic:
+    name: Deterministic harness checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Set up Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Materialize embedded OpenCode assets
+        run: go run ./cmd/tools/sync-assets
+      - name: Validate evaluation contracts and fixtures
+        run: go run ./cmd/skynex-eval validate --suite skynex-orchestrator
+      - name: Vet evaluator and asset contracts
+        run: go vet ./internal/eval/... ./internal/assets ./cmd/skynex-eval ./eval/cases/skynex-orchestrator ./schemas
+      - name: Validate OpenCode source and embedded assets
+        run: go test -count=1 ./internal/assets
+      - name: Run race-enabled evaluator tests
+        run: go test -count=1 -race ./internal/eval/... ./cmd/skynex-eval ./eval/cases/skynex-orchestrator ./schemas
+      - name: Compile the no-model OpenCode integration tag
+        run: go test -count=1 -run '^$' -tags=opencode_integration ./internal/eval/runner
+      - name: Check patch whitespace
+        run: git diff --check
+      - name: Build evaluator
+        run: go build ./cmd/skynex-eval

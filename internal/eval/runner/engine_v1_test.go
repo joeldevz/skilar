@@ -1561,6 +1561,40 @@ func TestEngineV1SendsProviderAndNestedModelIDExplicitly(t *testing.T) {
 	}
 }
 
+func TestEngineV1AcceptsExpectedModelAcrossDelegatedSessionTree(t *testing.T) {
+	environment := newTestEnvironment(t, false)
+	factory := &fakeRuntimeFactory{build: func(request RuntimeRequest) *fakeRuntime {
+		runtime := newFakeRuntime(request, true, completeMessages("Done successfully; verified."))
+		child := client.Session{ID: "child", ParentID: "root", Directory: request.WorkspacePath}
+		runtime.children["root"] = []client.Session{child}
+		runtime.children["child"] = nil
+		runtime.statuses["child"] = client.SessionStatus{Type: "idle"}
+		childMessages := completeMessages("delegated work complete")
+		childMessages[0].Parts = append(childMessages[0].Parts[:1], childMessages[0].Parts[4:]...)
+		childMessages[0].Info.ID = "child-assistant"
+		childMessages[0].Info.SessionID = "child"
+		for index := range childMessages[0].Parts {
+			childMessages[0].Parts[index].ID = fmt.Sprintf("child-part-%d", index)
+			childMessages[0].Parts[index].SessionID = "child"
+			childMessages[0].Parts[index].MessageID = "child-assistant"
+		}
+		runtime.messages["child"] = childMessages
+		return runtime
+	}}
+	engine := newTestEngine(t, environment, factory)
+
+	result, err := engine.Run(context.Background(), environment.caseValue, RunRequest{Variant: "candidate", Repetition: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != contracts.RunStatusPass {
+		t.Fatalf("consistent delegated model tree status = %s, error kind = %v", result.Status, result.Error)
+	}
+	if result.Provenance.Extensions[provenanceExtensionObservedProvider] != "openai" || result.Provenance.Extensions[provenanceExtensionObservedModel] != "gpt-5" {
+		t.Fatalf("observed delegated model provenance = %#v", result.Provenance.Extensions)
+	}
+}
+
 func TestEngineV1RejectsDifferentModelInChildSession(t *testing.T) {
 	environment := newTestEnvironment(t, false)
 	factory := &fakeRuntimeFactory{build: func(request RuntimeRequest) *fakeRuntime {

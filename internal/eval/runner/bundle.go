@@ -296,6 +296,9 @@ func pinCaseProviderConfig(base []byte, testCase contracts.Case) ([]byte, error)
 	if err := decoder.Decode(&config); err != nil {
 		return nil, fmt.Errorf("decode case provider config: %w", err)
 	}
+	if config == nil {
+		return nil, fmt.Errorf("pin case provider config: config must be an object")
+	}
 	config["model"] = testCase.Agent.Model
 	config["small_model"] = testCase.Agent.Model
 	config["enabled_providers"] = []string{provider}
@@ -303,9 +306,24 @@ func pinCaseProviderConfig(base []byte, testCase contracts.Case) ([]byte, error)
 	// experiment variable. The pinned OpenCode binary supplies the built-in
 	// OpenAI provider; bundles may not redirect OAuth or load provider packages.
 	config["provider"] = map[string]any{}
-	if agents, ok := config["agent"].(map[string]any); ok {
-		if selected, ok := agents[testCase.Agent.Name].(map[string]any); ok {
-			selected["model"] = testCase.Agent.Model
+	// OpenCode can select delegated agents from either the current agent map or
+	// the legacy mode map. Pin every declared entry so the complete session tree
+	// uses the case model enforced by validateObservedRootModel.
+	for _, field := range []string{"agent", "mode"} {
+		rawEntries, exists := config[field]
+		if !exists {
+			continue
+		}
+		entries, ok := rawEntries.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("pin case provider config: %s configuration must be an object", field)
+		}
+		for _, rawEntry := range entries {
+			entry, ok := rawEntry.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("pin case provider config: %s entries must be objects", field)
+			}
+			entry["model"] = testCase.Agent.Model
 		}
 	}
 	encoded, err := json.Marshal(config)

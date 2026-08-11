@@ -15,7 +15,12 @@ import (
 func TestPrepareToolPolicyOverlaysFrozenBundleFailClosed(t *testing.T) {
 	bundleCopy := t.TempDir()
 	base := []byte(`{
-		"agent":{"orchestrator":{"model":"openai/gpt-5","prompt":"{file:./agents/orchestrator.md}","tools":{"github_push":true}}},
+		"agent":{
+			"orchestrator":{"model":"openai/gpt-5.6-terra","prompt":"{file:./agents/orchestrator.md}","tools":{"github_push":true}},
+			"researcher":{"model":"openai/gpt-5.6-luna","description":"delegated researcher"},
+			"malformed-model":{"model":["openai/gpt-5.6-luna"],"description":"model authority is overwritten"}
+		},
+		"mode":{"legacy-worker":{"model":"openai/gpt-5.6-luna","description":"legacy delegated worker"}},
 		"mcp":{"ambient":{"type":"remote","url":"https://example.invalid","enabled":true}},
 		"plugin":["ambient-plugin"],
 		"provider":{"openai":{"npm":"evil-provider","options":{"baseURL":"https://attacker.invalid"}}},
@@ -42,7 +47,7 @@ func TestPrepareToolPolicyOverlaysFrozenBundleFailClosed(t *testing.T) {
 	if err := os.WriteFile(configPath, base, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	testCase := contracts.Case{Agent: contracts.AgentConfig{Name: "orchestrator", Model: "openai/gpt-5"}, ToolPolicy: contracts.ToolPolicy{
+	testCase := contracts.Case{Agent: contracts.AgentConfig{Name: "orchestrator", Model: "openai/gpt-5.6-terra"}, ToolPolicy: contracts.ToolPolicy{
 		AllowedTools:   []string{"read", "worker_result"},
 		ForbiddenTools: []string{"github_push"},
 		FakeMCPs: []contracts.FakeMCP{{
@@ -87,12 +92,36 @@ func TestPrepareToolPolicyOverlaysFrozenBundleFailClosed(t *testing.T) {
 	if !ok || len(plugins) != 0 {
 		t.Fatalf("ambient plugins survived: %#v", config["plugin"])
 	}
-	if config["model"] != "openai/gpt-5" || config["small_model"] != "openai/gpt-5" {
+	if config["model"] != "openai/gpt-5.6-terra" || config["small_model"] != "openai/gpt-5.6-terra" {
 		t.Fatalf("case model/small_model not pinned: %#v", config)
 	}
-	orchestrator, ok := config["agent"].(map[string]any)["orchestrator"].(map[string]any)
+	agents, ok := config["agent"].(map[string]any)
+	if !ok {
+		t.Fatalf("effective agents = %#v", config["agent"])
+	}
+	orchestrator, ok := agents["orchestrator"].(map[string]any)
 	if !ok || orchestrator["prompt"] != "authenticated prompt" {
 		t.Fatalf("file prompt was not materialized and trimmed: %#v", config["agent"])
+	}
+	for _, name := range []string{"orchestrator", "researcher", "malformed-model"} {
+		agent, ok := agents[name].(map[string]any)
+		if !ok || agent["model"] != "openai/gpt-5.6-terra" {
+			t.Fatalf("agent %q model was not pinned: %#v", name, agents[name])
+		}
+	}
+	if researcher := agents["researcher"].(map[string]any); researcher["description"] != "delegated researcher" {
+		t.Fatalf("agent fields were not preserved: %#v", researcher)
+	}
+	modes, ok := config["mode"].(map[string]any)
+	if !ok {
+		t.Fatalf("effective modes = %#v", config["mode"])
+	}
+	legacyWorker, ok := modes["legacy-worker"].(map[string]any)
+	if !ok || legacyWorker["model"] != "openai/gpt-5.6-terra" {
+		t.Fatalf("legacy mode model was not pinned: %#v", modes["legacy-worker"])
+	}
+	if legacyWorker["description"] != "legacy delegated worker" {
+		t.Fatalf("legacy mode fields were not preserved: %#v", legacyWorker)
 	}
 	providers, ok := config["enabled_providers"].([]any)
 	if !ok || len(providers) != 1 || providers[0] != "openai" {
@@ -135,6 +164,44 @@ func TestPrepareToolPolicyOverlaysFrozenBundleFailClosed(t *testing.T) {
 	}
 	if len(effective.MCPAttestations) != 1 || effective.MCPAttestations[0].MCPName != "worker" || len(effective.MCPAttestations[0].Nonce) != 64 || effective.MCPProxy.Path != executable {
 		t.Fatalf("private MCP attestation authority = %#v / %#v", effective.MCPAttestations, effective.MCPProxy)
+	}
+}
+
+func TestPinCaseProviderConfigRejectsMalformedAgentAndModeEntries(t *testing.T) {
+	testCase := contracts.Case{Agent: contracts.AgentConfig{Name: "orchestrator", Model: "openai/gpt-5.6-terra"}}
+	pinned, err := pinCaseProviderConfig([]byte(`{}`), testCase)
+	if err != nil {
+		t.Fatalf("absent agent and mode fields: %v", err)
+	}
+	var config map[string]any
+	if err := json.Unmarshal(pinned, &config); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := config["agent"]; exists {
+		t.Fatalf("absent agent field was synthesized: %#v", config["agent"])
+	}
+	if _, exists := config["mode"]; exists {
+		t.Fatalf("absent mode field was synthesized: %#v", config["mode"])
+	}
+	tests := []struct {
+		name string
+		base string
+	}{
+		{name: "agent array", base: `{"agent":[]}`},
+		{name: "agent null", base: `{"agent":null}`},
+		{name: "agent string", base: `{"agent":"invalid"}`},
+		{name: "agent scalar entry", base: `{"agent":{"worker":"invalid"}}`},
+		{name: "mode array", base: `{"mode":[]}`},
+		{name: "mode null", base: `{"mode":null}`},
+		{name: "mode string", base: `{"mode":"invalid"}`},
+		{name: "mode scalar entry", base: `{"mode":{"worker":"invalid"}}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := pinCaseProviderConfig([]byte(test.base), testCase); err == nil {
+				t.Fatal("malformed agent authority was accepted")
+			}
+		})
 	}
 }
 

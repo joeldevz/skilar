@@ -145,29 +145,6 @@ func modelDurationMS(collected *trace.Trace) int64 {
 	return total
 }
 
-func finalResponseText(collected *trace.Trace, rootID, fallback string) string {
-	for _, session := range collected.Sessions {
-		if session.Session.ID != rootID {
-			continue
-		}
-		for i := len(session.Messages) - 1; i >= 0; i-- {
-			if session.Messages[i].Info.Role != "assistant" {
-				continue
-			}
-			var text strings.Builder
-			for _, part := range session.Messages[i].Parts {
-				if part.Type == "text" {
-					text.WriteString(part.Text)
-				}
-			}
-			if text.Len() != 0 {
-				return text.String()
-			}
-		}
-	}
-	return fallback
-}
-
 func buildDeterministicInputs(testCase contracts.Case, before, after sandbox.Snapshot, setupResults, oracleResults []sandbox.CommandResult, collected *trace.Trace, finalText string, info RuntimeInfo, sourceUnchanged, bundleUnchanged bool, conversationErr, traceErr, modelObservationErr, snapshotErr, sourceErr, bundleErr error) (judges.Evidence, judges.Policy, []contracts.EvidenceItem, string) {
 	items := make([]contracts.EvidenceItem, 0)
 	processClean := true
@@ -216,9 +193,17 @@ func buildDeterministicInputs(testCase contracts.Case, before, after sandbox.Sna
 	behavior, eventItems := behaviorEvidence(collected)
 	items = append(items, eventItems...)
 	items = append(items, digestEvidence("behavior", "behavior", behavior, behavior.Complete))
-	claims := &judges.ClaimEvidence{EvidenceID: "claims", Complete: finalText != "", FinalResponse: finalText}
+	claims := &judges.ClaimEvidence{
+		EvidenceID:    "claims",
+		Complete:      finalText != "" && !hasResponseContractError(conversationErr) && modelObservationErr == nil && traceStructurallyComplete(collected),
+		FinalResponse: finalText,
+	}
 	if conversationErr != nil {
-		claims.Facts = append(claims.Facts, judges.ClaimFact{EvidenceID: "claims", Name: "conversation", Claimed: "complete", Observed: conversationErr.Error()})
+		code := evaluationCode(conversationErr)
+		if code == "" {
+			code = "conversation_failed"
+		}
+		claims.Facts = append(claims.Facts, judges.ClaimFact{EvidenceID: "claims", Name: "conversation", Claimed: "complete", Observed: code})
 	}
 	items = append(items, digestEvidence("claims", "final-response", claims, claims.Complete))
 

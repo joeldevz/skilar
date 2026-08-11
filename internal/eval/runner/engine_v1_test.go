@@ -90,15 +90,16 @@ type fakeRuntime struct {
 	messages map[string][]client.Message
 	statuses map[string]client.SessionStatus
 
-	response  *client.Response
-	send      func(context.Context, string, client.SendMessageRequest) (*client.Response, error)
-	prompt    map[string]bool
-	events    trace.EventSource
-	eventHTTP *httptest.Server
-	sent      []client.SendMessageRequest
-	closeErr  error
-	closed    bool
-	mu        sync.Mutex
+	response    *client.Response
+	send        func(context.Context, string, client.SendMessageRequest) (*client.Response, error)
+	getMessages func(context.Context, string) ([]client.Message, error)
+	prompt      map[string]bool
+	events      trace.EventSource
+	eventHTTP   *httptest.Server
+	sent        []client.SendMessageRequest
+	closeErr    error
+	closed      bool
+	mu          sync.Mutex
 }
 
 func newFakeRuntime(request RuntimeRequest, writeMarker bool, messages []client.Message) *fakeRuntime {
@@ -128,9 +129,29 @@ func newFakeRuntime(request RuntimeRequest, writeMarker bool, messages []client.
 		prompt:   prompt,
 	}
 	runtime.eventHTTP, runtime.events = newHealthyFakeGlobalEventSource(root)
-	response := client.Response{Info: client.ResponseInfo{ID: "response", SessionID: "root", Role: "assistant", Finish: "stop", Time: client.MessageTime{Created: 1, Completed: 2}}, Parts: []client.Part{{Type: "text", Text: "Done successfully; verified."}}}
-	runtime.response = &response
-	runtime.send = func(ctx context.Context, _ string, _ client.SendMessageRequest) (*client.Response, error) {
+	for index := len(messages) - 1; index >= 0; index-- {
+		if messages[index].Info.Role != "assistant" {
+			continue
+		}
+		response := client.Response{Info: messages[index].Info, Parts: append([]client.Part(nil), messages[index].Parts...)}
+		runtime.response = &response
+		break
+	}
+	if runtime.response == nil {
+		providerID, modelID, err := contracts.ParseModelSelection(request.Case.Agent.Model)
+		if err != nil {
+			panic(err)
+		}
+		runtime.response = &client.Response{
+			Info: client.ResponseInfo{
+				ID: "assistant-1", SessionID: "root", Role: "assistant", Finish: "stop",
+				ProviderID: providerID, ModelID: modelID,
+				Time: client.MessageTime{Created: 1, Completed: 2},
+			},
+			Parts: []client.Part{{ID: "text-1", SessionID: "root", MessageID: "assistant-1", Type: "text", Text: "Done successfully; verified."}},
+		}
+	}
+	runtime.send = func(ctx context.Context, _ string, promptRequest client.SendMessageRequest) (*client.Response, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -140,6 +161,24 @@ func newFakeRuntime(request RuntimeRequest, writeMarker bool, messages []client.
 			}
 		}
 		copy := *runtime.response
+		copy.Parts = append([]client.Part(nil), runtime.response.Parts...)
+		if copy.Info.ParentID == "" {
+			copy.Info.ParentID = promptRequest.MessageID
+		}
+		parentPresent := false
+		for _, message := range runtime.messages["root"] {
+			parentPresent = parentPresent || message.Info.ID == promptRequest.MessageID
+		}
+		if !parentPresent {
+			runtime.messages["root"] = append(runtime.messages["root"], client.Message{Info: client.ResponseInfo{
+				ID: promptRequest.MessageID, SessionID: "root", Role: "user", Time: client.MessageTime{Created: 1},
+			}})
+		}
+		for messageIndex := range runtime.messages["root"] {
+			if runtime.messages["root"][messageIndex].Info.ID == copy.Info.ID && runtime.messages["root"][messageIndex].Info.ParentID == "" {
+				runtime.messages["root"][messageIndex].Info.ParentID = promptRequest.MessageID
+			}
+		}
 		return &copy, nil
 	}
 	return runtime
@@ -248,6 +287,9 @@ func (r *fakeRuntime) GetChildrenContext(ctx context.Context, id string) ([]clie
 func (r *fakeRuntime) GetMessagesContext(ctx context.Context, id string) ([]client.Message, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if r.getMessages != nil {
+		return r.getMessages(ctx, id)
 	}
 	return append([]client.Message(nil), r.messages[id]...), nil
 }
@@ -518,6 +560,307 @@ func TestEngineV1PassesExpectedNonZeroSetupAndGreenOracle(t *testing.T) {
 	unknown, unknownPresent := sent[0].Tools["ambient_unknown"]
 	if sent[0].Agent != "orchestrator" || !sent[0].Tools["bash"] || !sent[0].Tools["edit"] || sent[0].Tools["git_push"] || !wildcardPresent || wildcard || !unknownPresent || unknown {
 		t.Fatalf("fail-closed prompt request = %#v", sent[0])
+	}
+}
+
+func TestValidatePostedResponseRequiresBoundTerminalAssistant(t *testing.T) {
+	newResponse := func() *client.Response {
+		message := completeMessages("Done successfully; verified.")[0]
+		message.Info.ParentID = "msg_user"
+		return &client.Response{Info: message.Info, Parts: append([]client.Part(nil), message.Parts...)}
+	}
+	tests := []struct {
+		name   string
+		nil    bool
+		mutate func(*client.Response)
+	}{
+		{name: "nil", nil: true},
+		{name: "non-assistant", mutate: func(response *client.Response) { response.Info.Role = "user" }},
+		{name: "missing message id", mutate: func(response *client.Response) { response.Info.ID = "" }},
+		{name: "session mismatch", mutate: func(response *client.Response) { response.Info.SessionID = "other" }},
+		{name: "parent mismatch", mutate: func(response *client.Response) { response.Info.ParentID = "msg_stale" }},
+		{name: "provider mismatch", mutate: func(response *client.Response) { response.Info.ProviderID = "other" }},
+		{name: "model mismatch", mutate: func(response *client.Response) { response.Info.ModelID = "other" }},
+		{name: "assistant error", mutate: func(response *client.Response) { response.Info.Error = &client.ErrorInfo{Name: "secret-canary"} }},
+		{name: "missing completion", mutate: func(response *client.Response) { response.Info.Time.Completed = 0 }},
+		{name: "tool calls finish", mutate: func(response *client.Response) { response.Info.Finish = "tool-calls" }},
+		{name: "error finish", mutate: func(response *client.Response) { response.Info.Finish = "error" }},
+		{name: "content filter finish", mutate: func(response *client.Response) { response.Info.Finish = "content-filter" }},
+		{name: "unknown finish", mutate: func(response *client.Response) { response.Info.Finish = "future-value" }},
+		{name: "missing part id", mutate: func(response *client.Response) { response.Parts[0].ID = "" }},
+		{name: "part session mismatch", mutate: func(response *client.Response) { response.Parts[0].SessionID = "other" }},
+		{name: "part message mismatch", mutate: func(response *client.Response) { response.Parts[0].MessageID = "other" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var response *client.Response
+			if !test.nil {
+				response = newResponse()
+				if test.mutate != nil {
+					test.mutate(response)
+				}
+			}
+			err := validatePostedResponse(response, "root", "msg_user", "openai", "gpt-5")
+			if code := evaluationCode(err); code != string(evaluationErrorPostResponseInvalid) {
+				t.Fatalf("error code = %q, want %q (error %v)", code, evaluationErrorPostResponseInvalid, err)
+			}
+			if strings.Contains(err.Error(), "secret-canary") {
+				t.Fatalf("raw response error escaped allowlisted code: %v", err)
+			}
+		})
+	}
+
+	if err := validatePostedResponse(newResponse(), "root", "msg_user", "openai", "gpt-5"); err != nil {
+		t.Fatalf("valid terminal assistant rejected: %v", err)
+	}
+}
+
+func TestDurableResponseMustEqualPostedEnvelopeAndParts(t *testing.T) {
+	newMessages := func() ([]client.Message, *client.Response) {
+		assistant := completeMessages("Done successfully; verified.")[0]
+		assistant.Info.ParentID = "msg_user"
+		user := client.Message{Info: client.ResponseInfo{ID: "msg_user", SessionID: "root", Role: "user"}}
+		response := &client.Response{Info: assistant.Info, Parts: append([]client.Part(nil), assistant.Parts...)}
+		return []client.Message{user, assistant}, response
+	}
+	tests := []struct {
+		name   string
+		mutate func([]client.Message)
+	}{
+		{name: "missing parent user", mutate: func(messages []client.Message) { messages[0].Info.ID = "msg_other" }},
+		{name: "wrong parent", mutate: func(messages []client.Message) { messages[1].Info.ParentID = "msg_other" }},
+		{name: "wrong finish", mutate: func(messages []client.Message) { messages[1].Info.Finish = "tool-calls" }},
+		{name: "changed parts", mutate: func(messages []client.Message) { messages[1].Parts[4].Text = "different" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			messages, response := newMessages()
+			test.mutate(messages)
+			if status := durableResponseStatus(messages, "root", response); status != durableResponseInvalid {
+				t.Fatalf("durable status = %v, want invalid", status)
+			}
+		})
+	}
+	messages, response := newMessages()
+	if status := durableResponseStatus(messages, "root", response); status != durableResponseValid {
+		t.Fatalf("matching durable response status = %v", status)
+	}
+}
+
+func TestEngineV1RejectsPostedUserTextBeforeFollowupOrClaims(t *testing.T) {
+	const canary = "post-only-secret-canary?"
+	environment := newTestEnvironment(t, false)
+	environment.caseValue.Completion.MaxTurns = 2
+	environment.caseValue.Turns = []contracts.Turn{{Answer: "answer"}}
+	factory := &fakeRuntimeFactory{build: func(request RuntimeRequest) *fakeRuntime {
+		runtime := newFakeRuntime(request, true, completeMessages("Done successfully; verified."))
+		runtime.response.Info.Role = "user"
+		for index := range runtime.response.Parts {
+			if runtime.response.Parts[index].Type == "text" {
+				runtime.response.Parts[index].Text = canary
+			}
+		}
+		return runtime
+	}}
+	result, err := newTestEngine(t, environment, factory).Run(context.Background(), environment.caseValue, RunRequest{Variant: "candidate", Repetition: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != contracts.RunStatusInvalid || result.Error == nil || result.Error.Kind != string(evaluationErrorPostResponseInvalid) {
+		t.Fatalf("invalid POST result = status %s error %#v", result.Status, result.Error)
+	}
+	if sent := factory.lastRuntime(t).sentRequests(); len(sent) != 1 {
+		t.Fatalf("invalid question-like response triggered %d POSTs, want 1", len(sent))
+	}
+	if claims := findEvidence(t, result, "claims"); claims.Complete {
+		t.Fatalf("invalid POST completed claims: %#v", claims)
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(encoded, []byte(canary)) {
+		t.Fatalf("POST-only text persisted: %s", encoded)
+	}
+}
+
+func TestEngineV1RejectsStaleAssistantOnSecondTurn(t *testing.T) {
+	environment := newTestEnvironment(t, false)
+	environment.caseValue.Completion.MaxTurns = 2
+	environment.caseValue.Turns = []contracts.Turn{{Answer: "continue"}}
+	factory := &fakeRuntimeFactory{build: func(request RuntimeRequest) *fakeRuntime {
+		runtime := newFakeRuntime(request, true, completeMessages("Need more information?"))
+		originalSend := runtime.send
+		var first *client.Response
+		runtime.send = func(ctx context.Context, sessionID string, input client.SendMessageRequest) (*client.Response, error) {
+			response, err := originalSend(ctx, sessionID, input)
+			if err != nil {
+				return response, err
+			}
+			if first == nil {
+				copy := *response
+				copy.Parts = append([]client.Part(nil), response.Parts...)
+				first = &copy
+				return response, nil
+			}
+			copy := *first
+			copy.Parts = append([]client.Part(nil), first.Parts...)
+			return &copy, nil
+		}
+		return runtime
+	}}
+	result, err := newTestEngine(t, environment, factory).Run(context.Background(), environment.caseValue, RunRequest{Variant: "candidate", Repetition: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != contracts.RunStatusInvalid || result.Error == nil || result.Error.Kind != string(evaluationErrorPostResponseInvalid) {
+		t.Fatalf("stale second-turn assistant result = status %s error %#v", result.Status, result.Error)
+	}
+	sent := factory.lastRuntime(t).sentRequests()
+	if len(sent) != 2 || sent[0].MessageID == "" || sent[1].MessageID == "" || sent[0].MessageID == sent[1].MessageID {
+		t.Fatalf("turn request IDs = %#v", sent)
+	}
+}
+
+func TestEngineV1WaitsForDurableResponseBeyondDefaultCollectorGap(t *testing.T) {
+	environment := newTestEnvironment(t, false)
+	environment.caseValue.Trace.Quiescence.QuietPeriod = "1s"
+	environment.caseValue.Trace.Quiescence.Timeout = "1500ms"
+	factory := &fakeRuntimeFactory{build: func(request RuntimeRequest) *fakeRuntime {
+		runtime := newFakeRuntime(request, true, completeMessages("Done successfully; verified."))
+		var firstLookup time.Time
+		runtime.getMessages = func(_ context.Context, id string) ([]client.Message, error) {
+			if firstLookup.IsZero() {
+				firstLookup = time.Now()
+			}
+			if time.Since(firstLookup) < 125*time.Millisecond {
+				return nil, nil
+			}
+			return append([]client.Message(nil), runtime.messages[id]...), nil
+		}
+		return runtime
+	}}
+	config := newTestEngineConfig(t, environment, factory)
+	config.TraceOptions = trace.Options{}
+	engine, err := NewEngine(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	result, err := engine.Run(context.Background(), environment.caseValue, RunRequest{Variant: "candidate", Repetition: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != contracts.RunStatusPass {
+		t.Fatalf("delayed durable response result = status %s error %#v", result.Status, result.Error)
+	}
+	if elapsed := time.Since(started); elapsed < 100*time.Millisecond {
+		t.Fatalf("durable response was not polled beyond the old 50ms gap: %v", elapsed)
+	}
+}
+
+func TestEngineV1RejectsPostedResponseMissingFromReconciledHistory(t *testing.T) {
+	environment := newTestEnvironment(t, false)
+	factory := &fakeRuntimeFactory{build: func(request RuntimeRequest) *fakeRuntime {
+		runtime := newFakeRuntime(request, true, completeMessages("Done successfully; verified."))
+		runtime.response.Info.ID = "assistant-post"
+		for index := range runtime.response.Parts {
+			runtime.response.Parts[index].MessageID = "assistant-post"
+		}
+		lookups := 0
+		runtime.getMessages = func(_ context.Context, id string) ([]client.Message, error) {
+			lookups++
+			if lookups == 1 {
+				sent := runtime.sentRequests()
+				if len(sent) != 1 {
+					return nil, fmt.Errorf("unexpected sent request count")
+				}
+				assistant := client.Message{Info: runtime.response.Info, Parts: append([]client.Part(nil), runtime.response.Parts...)}
+				assistant.Info.ParentID = sent[0].MessageID
+				user := client.Message{Info: client.ResponseInfo{ID: sent[0].MessageID, SessionID: "root", Role: "user"}}
+				return []client.Message{user, assistant}, nil
+			}
+			return append([]client.Message(nil), runtime.messages[id]...), nil
+		}
+		return runtime
+	}}
+	result, err := newTestEngine(t, environment, factory).Run(context.Background(), environment.caseValue, RunRequest{Variant: "candidate", Repetition: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != contracts.RunStatusInvalid || result.Error == nil || result.Error.Kind != string(evaluationErrorResponseTraceMismatch) {
+		t.Fatalf("POST/history mismatch result = status %s error %#v", result.Status, result.Error)
+	}
+	if claims := findEvidence(t, result, "claims"); claims.Complete {
+		t.Fatalf("POST/history mismatch completed claims: %#v", claims)
+	}
+	if result.Usage.Tree.Sessions != 1 || result.Usage.Tree.SumInputTokens == 0 {
+		t.Fatalf("best-effort reconciliation lost observed accounting: %#v", result.Usage)
+	}
+}
+
+func TestEngineV1NeverFallsBackToPostedText(t *testing.T) {
+	const canary = "posted-text-must-not-be-evidence"
+	environment := newTestEnvironment(t, false)
+	factory := &fakeRuntimeFactory{build: func(request RuntimeRequest) *fakeRuntime {
+		runtime := newFakeRuntime(request, true, completeMessages(""))
+		for index := range runtime.response.Parts {
+			if runtime.response.Parts[index].Type == "text" {
+				runtime.response.Parts[index].Text = canary
+			}
+		}
+		return runtime
+	}}
+	result, err := newTestEngine(t, environment, factory).Run(context.Background(), environment.caseValue, RunRequest{Variant: "candidate", Repetition: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != contracts.RunStatusInvalid || result.Error == nil || result.Error.Kind != string(evaluationErrorResponseTraceMismatch) {
+		t.Fatalf("posted-text fallback result = status %s error %#v", result.Status, result.Error)
+	}
+	if claims := findEvidence(t, result, "claims"); claims.Complete {
+		t.Fatalf("POST-only text completed claims: %#v", claims)
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(encoded, []byte(canary)) {
+		t.Fatalf("POST-only text persisted: %s", encoded)
+	}
+}
+
+func TestEngineV1UnexpectedQuestionKeepsVerifiedDurableClaims(t *testing.T) {
+	environment := newTestEnvironment(t, false)
+	factory := &fakeRuntimeFactory{build: func(request RuntimeRequest) *fakeRuntime {
+		return newFakeRuntime(request, true, completeMessages("Done successfully; verified?"))
+	}}
+	result, err := newTestEngine(t, environment, factory).Run(context.Background(), environment.caseValue, RunRequest{Variant: "candidate", Repetition: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != contracts.RunStatusFail || result.Error == nil || result.Error.Kind != "evaluation" {
+		t.Fatalf("unexpected-question result = status %s error %#v", result.Status, result.Error)
+	}
+	if claims := findEvidence(t, result, "claims"); !claims.Complete {
+		t.Fatalf("verified durable response was erased by candidate outcome: %#v", claims)
+	}
+}
+
+func TestWaitForDurableResponseDoesNotRetryGETErrors(t *testing.T) {
+	response := &client.Response{Info: client.ResponseInfo{ID: "assistant", ParentID: "msg_user"}}
+	calls := 0
+	runtime := &fakeRuntime{getMessages: func(context.Context, string) ([]client.Message, error) {
+		calls++
+		return nil, errors.New("secret transport detail")
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if waitForDurableResponse(ctx, runtime, "root", response) {
+		t.Fatal("GET error unexpectedly established durability")
+	}
+	if calls != 1 {
+		t.Fatalf("GET errors retried %d times, want exactly 1", calls)
 	}
 }
 
@@ -893,7 +1236,7 @@ func TestEngineV1RejectsMissingOrMismatchedObservedModel(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Run() error = %v", err)
 			}
-			if result.Status != contracts.RunStatusInvalid || result.Error == nil || result.Error.Kind != "evaluation" {
+			if result.Status != contracts.RunStatusInvalid || result.Error == nil || result.Error.Kind != string(evaluationErrorPostResponseInvalid) {
 				t.Fatalf("observed model result = %#v", result)
 			}
 			assertValidResultLineage(t, result)
@@ -1454,6 +1797,17 @@ func findCheck(t *testing.T, checks []contracts.CheckResult, id string) contract
 	}
 	t.Fatalf("check %q not found in %#v", id, checks)
 	return contracts.CheckResult{}
+}
+
+func findEvidence(t *testing.T, result contracts.RunResult, id string) contracts.EvidenceItem {
+	t.Helper()
+	for _, item := range result.Evidence.Items {
+		if item.ID == id {
+			return item
+		}
+	}
+	t.Fatalf("evidence %q not found in %#v", id, result.Evidence.Items)
+	return contracts.EvidenceItem{}
 }
 
 func assertValidResultLineage(t *testing.T, result contracts.RunResult) {

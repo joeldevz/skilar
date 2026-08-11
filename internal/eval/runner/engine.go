@@ -36,7 +36,26 @@ const (
 	provenanceExtensionObservedProvider          = "x-observed-provider"
 	provenanceExtensionObservedModel             = "x-observed-model"
 	provenanceExtensionRedaction                 = "x-redaction"
+	durableResponsePollInterval                  = 50 * time.Millisecond
+	durableResponseMaxWait                       = 2 * time.Second
 )
+
+type evaluationErrorCode string
+
+const (
+	evaluationErrorPostResponseInvalid   evaluationErrorCode = "post_response_invalid"
+	evaluationErrorResponseTraceMismatch evaluationErrorCode = "response_trace_mismatch"
+)
+
+type codedEvaluationError struct {
+	code evaluationErrorCode
+}
+
+func (e *codedEvaluationError) Error() string { return string(e.code) }
+
+func newCodedEvaluationError(code evaluationErrorCode) error {
+	return &codedEvaluationError{code: code}
+}
 
 type Engine struct {
 	config        EngineConfig
@@ -274,9 +293,20 @@ func (e *Engine) Run(ctx context.Context, testCase contracts.Case, request RunRe
 	}
 	response, conversationErr := executeConversation(runCtx, runtimeHandle, session.ID, testCase)
 
+	var durableWaitErr error
+	if response != nil && !hasResponseContractError(conversationErr) {
+		// OpenCode can acknowledge the synchronous POST before its message is
+		// visible through the durable history endpoint. Do not let two stable,
+		// empty snapshots make that visibility gap look quiescent.
+		anchorCtx, anchorCancel := context.WithTimeout(runCtx, durableResponseMaxWait)
+		if !waitForDurableResponse(anchorCtx, runtimeHandle, session.ID, response) {
+			durableWaitErr = newCodedEvaluationError(evaluationErrorResponseTraceMismatch)
+		}
+		anchorCancel()
+	}
 	reconcileTimeout, _ := time.ParseDuration(testCase.Trace.Quiescence.Timeout)
 	reconcileCtx, reconcileCancel := context.WithTimeout(runCtx, reconcileTimeout)
-	collector := trace.New(runtimeHandle, e.config.TraceOptions)
+	collector := trace.New(runtimeHandle, traceOptionsForCase(e.config.TraceOptions, testCase.Trace.Quiescence))
 	var collectedTrace *trace.Trace
 	var traceErr error
 	var runtimeCloseErr error
@@ -286,6 +316,8 @@ func (e *Engine) Run(ctx context.Context, testCase contracts.Case, request RunRe
 		collectedTrace, traceErr = collector.Reconcile(reconcileCtx, session.ID, nil)
 	}
 	reconcileCancel()
+	responseTraceErr := errors.Join(durableWaitErr, validateDurableResponse(collectedTrace, session.ID, response, conversationErr))
+	conversationErr = errors.Join(conversationErr, responseTraceErr)
 	observedProvider, observedModel, modelObservationErr := validateObservedRootModel(collectedTrace, testCase.Agent.Model)
 	// Observed identifiers are untrusted trace data. Publish them only after the
 	// entire session tree has been proven to use the frozen model selection; a
@@ -333,10 +365,7 @@ func (e *Engine) Run(ctx context.Context, testCase contracts.Case, request RunRe
 	bundleUnchanged, bundleErr := e.verifyFrozenBundle(bundleCopy, frozenBundleDigest)
 	toolchainErr := e.verifyExecutableClosure()
 
-	finalText := responseText(response)
-	if collectedTrace != nil {
-		finalText = finalResponseText(collectedTrace, session.ID, finalText)
-	}
+	finalText := durableFinalResponseText(collectedTrace, session.ID, response, conversationErr)
 	traceDigest, tracePath, redactionSummary, persistErr := e.processTrace(runID, collectedTrace, request.RetainTrace)
 	tracePersistErr := persistErr
 	if traceDigest != "" {
@@ -681,6 +710,9 @@ func sanitizePersistableRunResult(result *contracts.RunResult) {
 func summarizedRunError(result contracts.RunResult, errs ...error) *contracts.RunError {
 	joined := errors.Join(errs...)
 	if joined != nil {
+		if code := evaluationCode(joined); code != "" {
+			return runError(code, newCodedEvaluationError(evaluationErrorCode(code)), false)
+		}
 		return runError("evaluation", joined, false)
 	}
 	for _, check := range result.Checks {
@@ -702,10 +734,21 @@ func executeConversation(ctx context.Context, api Runtime, sessionID string, tes
 	}
 	model := &client.ModelSelection{ProviderID: providerID, ModelID: modelID}
 	send := func(text string) (*client.Response, error) {
-		return api.SendMessageWithRequestContext(ctx, sessionID, client.SendMessageRequest{
-			Agent: testCase.Agent.Name, Model: model, Tools: tools,
+		messageID, messageIDErr := randomMessageID()
+		if messageIDErr != nil {
+			return nil, fmt.Errorf("create message id: %w", messageIDErr)
+		}
+		response, sendErr := api.SendMessageWithRequestContext(ctx, sessionID, client.SendMessageRequest{
+			MessageID: messageID, Agent: testCase.Agent.Name, Model: model, Tools: tools,
 			Parts: []client.Part{{Type: "text", Text: text}},
 		})
+		if sendErr != nil {
+			return nil, newCodedEvaluationError(evaluationErrorPostResponseInvalid)
+		}
+		if responseErr := validatePostedResponse(response, sessionID, messageID, providerID, modelID); responseErr != nil {
+			return response, responseErr
+		}
+		return response, nil
 	}
 	response, err := send(testCase.Input)
 	if err != nil {
@@ -729,9 +772,6 @@ func executeConversation(ctx context.Context, api Runtime, sessionID string, tes
 			}
 		}
 	}
-	if response != nil && response.Info.Error != nil {
-		return response, fmt.Errorf("assistant response error: %s", response.Info.Error.Name)
-	}
 	return response, nil
 }
 
@@ -743,11 +783,212 @@ func responseLooksLikeQuestion(response *client.Response) bool {
 	return strings.HasSuffix(text, "?")
 }
 
-func responseText(response *client.Response) string {
+func validatePostedResponse(response *client.Response, sessionID, parentID, providerID, modelID string) error {
 	if response == nil {
+		return newCodedEvaluationError(evaluationErrorPostResponseInvalid)
+	}
+	info := response.Info
+	if info.Role != "assistant" {
+		return newCodedEvaluationError(evaluationErrorPostResponseInvalid)
+	}
+	if info.ID == "" {
+		return newCodedEvaluationError(evaluationErrorPostResponseInvalid)
+	}
+	if info.SessionID != sessionID {
+		return newCodedEvaluationError(evaluationErrorPostResponseInvalid)
+	}
+	if info.ParentID == "" || info.ParentID != parentID {
+		return newCodedEvaluationError(evaluationErrorPostResponseInvalid)
+	}
+	if info.ProviderID != providerID {
+		return newCodedEvaluationError(evaluationErrorPostResponseInvalid)
+	}
+	if info.ModelID != modelID {
+		return newCodedEvaluationError(evaluationErrorPostResponseInvalid)
+	}
+	if info.Error != nil {
+		return newCodedEvaluationError(evaluationErrorPostResponseInvalid)
+	}
+	if info.Finish != "stop" || info.Time.Completed == 0 {
+		return newCodedEvaluationError(evaluationErrorPostResponseInvalid)
+	}
+	for _, part := range response.Parts {
+		if part.ID == "" || part.SessionID != sessionID || part.MessageID != info.ID {
+			return newCodedEvaluationError(evaluationErrorPostResponseInvalid)
+		}
+	}
+	return nil
+}
+
+type durableMessageAPI interface {
+	GetMessagesContext(context.Context, string) ([]client.Message, error)
+}
+
+func waitForDurableResponse(ctx context.Context, api durableMessageAPI, sessionID string, response *client.Response) bool {
+	if ctx == nil || api == nil || response == nil || response.Info.ID == "" {
+		return false
+	}
+	for {
+		messages, err := api.GetMessagesContext(ctx, sessionID)
+		if err != nil {
+			return false
+		}
+		switch durableResponseStatus(messages, sessionID, response) {
+		case durableResponseValid:
+			return true
+		case durableResponseInvalid:
+			return false
+		}
+		timer := time.NewTimer(durableResponsePollInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return false
+		case <-timer.C:
+		}
+	}
+}
+
+type durableResponseState uint8
+
+const (
+	durableResponseAbsent durableResponseState = iota
+	durableResponseValid
+	durableResponseInvalid
+)
+
+func durableResponseStatus(messages []client.Message, sessionID string, response *client.Response) durableResponseState {
+	if response == nil {
+		return durableResponseInvalid
+	}
+	parentFound := false
+	for _, message := range messages {
+		if message.Info.ID != response.Info.ParentID {
+			continue
+		}
+		if message.Info.Role != "user" || message.Info.SessionID != sessionID {
+			return durableResponseInvalid
+		}
+		parentFound = true
+		break
+	}
+	for _, message := range messages {
+		if message.Info.ID != response.Info.ID {
+			continue
+		}
+		info := message.Info
+		if info.Role != "assistant" || info.SessionID != sessionID ||
+			info.ParentID == "" || info.ParentID != response.Info.ParentID ||
+			info.ProviderID != response.Info.ProviderID || info.ModelID != response.Info.ModelID ||
+			info.Error != nil || info.Finish != response.Info.Finish || info.Finish != "stop" || info.Time.Completed == 0 {
+			return durableResponseInvalid
+		}
+		for _, part := range message.Parts {
+			if part.ID == "" || part.SessionID != sessionID || part.MessageID != info.ID {
+				return durableResponseInvalid
+			}
+		}
+		if !parentFound {
+			return durableResponseInvalid
+		}
+		postedParts, postedErr := contracts.CanonicalDigest(response.Parts)
+		durableParts, durableErr := contracts.CanonicalDigest(message.Parts)
+		if postedErr != nil || durableErr != nil || postedParts != durableParts {
+			return durableResponseInvalid
+		}
+		return durableResponseValid
+	}
+	return durableResponseAbsent
+}
+
+func durableResponsePresent(messages []client.Message, sessionID string, response *client.Response) bool {
+	// Compare only the durable envelope and part ownership. Text is consumed
+	// from the durable message below, never from the synchronous response.
+	return durableResponseStatus(messages, sessionID, response) == durableResponseValid
+}
+
+func validateDurableResponse(collected *trace.Trace, sessionID string, response *client.Response, conversationErr error) error {
+	if hasResponseContractError(conversationErr) || (conversationErr != nil && response == nil) {
+		return nil
+	}
+	if collected == nil || response == nil {
+		return newCodedEvaluationError(evaluationErrorResponseTraceMismatch)
+	}
+	for _, session := range collected.Sessions {
+		if session.Session.ID != sessionID {
+			continue
+		}
+		if durableResponsePresent(session.Messages, sessionID, response) {
+			return nil
+		}
+		break
+	}
+	return newCodedEvaluationError(evaluationErrorResponseTraceMismatch)
+}
+
+func durableFinalResponseText(collected *trace.Trace, sessionID string, response *client.Response, conversationErr error) string {
+	if hasResponseContractError(conversationErr) || collected == nil || response == nil {
 		return ""
 	}
-	return client.ExtractText(response.Parts)
+	for _, session := range collected.Sessions {
+		if session.Session.ID != sessionID {
+			continue
+		}
+		if !durableResponsePresent(session.Messages, sessionID, response) {
+			return ""
+		}
+		for _, message := range session.Messages {
+			if message.Info.ID != response.Info.ID {
+				continue
+			}
+			return client.ExtractText(message.Parts)
+		}
+	}
+	return ""
+}
+
+func evaluationCode(err error) string {
+	var coded *codedEvaluationError
+	if errors.As(err, &coded) && coded != nil {
+		return string(coded.code)
+	}
+	return ""
+}
+
+func hasResponseContractError(err error) bool {
+	code := evaluationCode(err)
+	return code == string(evaluationErrorPostResponseInvalid) || code == string(evaluationErrorResponseTraceMismatch)
+}
+
+func traceOptionsForCase(options trace.Options, quiescence contracts.QuiescenceConfig) trace.Options {
+	if options.StablePasses <= 0 {
+		options.StablePasses = 2
+	}
+	if options.PollInterval <= 0 {
+		options.PollInterval, _ = time.ParseDuration(quiescence.QuietPeriod)
+	}
+	if options.MaxPasses <= 0 {
+		timeout, _ := time.ParseDuration(quiescence.Timeout)
+		intervals := int(timeout / options.PollInterval)
+		if timeout%options.PollInterval != 0 {
+			intervals++
+		}
+		options.MaxPasses = intervals + 1
+		if options.MaxPasses < options.StablePasses {
+			options.MaxPasses = options.StablePasses
+		}
+	}
+	return options
+}
+
+func randomMessageID() (string, error) {
+	var bytes [16]byte
+	if _, err := rand.Read(bytes[:]); err != nil {
+		return "", err
+	}
+	return "msg_" + hex.EncodeToString(bytes[:]), nil
 }
 
 func runnerConfig(testCase contracts.Case, closure *ExecutableClosure) sandbox.RunnerConfig {

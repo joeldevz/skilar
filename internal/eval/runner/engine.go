@@ -813,7 +813,7 @@ func validatePostedResponse(response *client.Response, sessionID, parentID, prov
 		return newCodedEvaluationError(evaluationErrorPostResponseInvalid)
 	}
 	for _, part := range response.Parts {
-		if part.ID == "" || part.SessionID != sessionID || part.MessageID != info.ID {
+		if part.ID == "" || part.Type == "" || part.SessionID != sessionID || part.MessageID != info.ID {
 			return newCodedEvaluationError(evaluationErrorPostResponseInvalid)
 		}
 	}
@@ -886,21 +886,62 @@ func durableResponseStatus(messages []client.Message, sessionID string, response
 			return durableResponseInvalid
 		}
 		for _, part := range message.Parts {
-			if part.ID == "" || part.SessionID != sessionID || part.MessageID != info.ID {
+			if part.ID == "" || part.Type == "" || part.SessionID != sessionID || part.MessageID != info.ID {
 				return durableResponseInvalid
 			}
 		}
 		if !parentFound {
 			return durableResponseInvalid
 		}
-		postedParts, postedErr := contracts.CanonicalDigest(response.Parts)
-		durableParts, durableErr := contracts.CanonicalDigest(message.Parts)
-		if postedErr != nil || durableErr != nil || postedParts != durableParts {
+		if !sameStablePartIdentities(response.Parts, message.Parts) {
 			return durableResponseInvalid
 		}
 		return durableResponseValid
 	}
 	return durableResponseAbsent
+}
+
+type stablePartIdentity struct {
+	ID        string
+	Type      string
+	SessionID string
+	MessageID string
+}
+
+func sameStablePartIdentities(posted, durable []client.Part) bool {
+	left := stablePartIdentities(posted)
+	right := stablePartIdentities(durable)
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func stablePartIdentities(parts []client.Part) []stablePartIdentity {
+	result := make([]stablePartIdentity, 0, len(parts))
+	for _, part := range parts {
+		result = append(result, stablePartIdentity{
+			ID: part.ID, Type: part.Type, SessionID: part.SessionID, MessageID: part.MessageID,
+		})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].ID != result[j].ID {
+			return result[i].ID < result[j].ID
+		}
+		if result[i].Type != result[j].Type {
+			return result[i].Type < result[j].Type
+		}
+		if result[i].SessionID != result[j].SessionID {
+			return result[i].SessionID < result[j].SessionID
+		}
+		return result[i].MessageID < result[j].MessageID
+	})
+	return result
 }
 
 func durableResponsePresent(messages []client.Message, sessionID string, response *client.Response) bool {

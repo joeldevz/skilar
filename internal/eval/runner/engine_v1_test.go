@@ -588,6 +588,7 @@ func TestValidatePostedResponseRequiresBoundTerminalAssistant(t *testing.T) {
 		{name: "content filter finish", mutate: func(response *client.Response) { response.Info.Finish = "content-filter" }},
 		{name: "unknown finish", mutate: func(response *client.Response) { response.Info.Finish = "future-value" }},
 		{name: "missing part id", mutate: func(response *client.Response) { response.Parts[0].ID = "" }},
+		{name: "missing part type", mutate: func(response *client.Response) { response.Parts[0].Type = "" }},
 		{name: "part session mismatch", mutate: func(response *client.Response) { response.Parts[0].SessionID = "other" }},
 		{name: "part message mismatch", mutate: func(response *client.Response) { response.Parts[0].MessageID = "other" }},
 	}
@@ -615,7 +616,7 @@ func TestValidatePostedResponseRequiresBoundTerminalAssistant(t *testing.T) {
 	}
 }
 
-func TestDurableResponseMustEqualPostedEnvelopeAndParts(t *testing.T) {
+func TestDurableResponseRequiresStablePostedEnvelopeAndPartIdentities(t *testing.T) {
 	newMessages := func() ([]client.Message, *client.Response) {
 		assistant := completeMessages("Done successfully; verified.")[0]
 		assistant.Info.ParentID = "msg_user"
@@ -623,21 +624,45 @@ func TestDurableResponseMustEqualPostedEnvelopeAndParts(t *testing.T) {
 		response := &client.Response{Info: assistant.Info, Parts: append([]client.Part(nil), assistant.Parts...)}
 		return []client.Message{user, assistant}, response
 	}
-	tests := []struct {
+	invalid := []struct {
 		name   string
 		mutate func([]client.Message)
 	}{
 		{name: "missing parent user", mutate: func(messages []client.Message) { messages[0].Info.ID = "msg_other" }},
 		{name: "wrong parent", mutate: func(messages []client.Message) { messages[1].Info.ParentID = "msg_other" }},
 		{name: "wrong finish", mutate: func(messages []client.Message) { messages[1].Info.Finish = "tool-calls" }},
-		{name: "changed parts", mutate: func(messages []client.Message) { messages[1].Parts[4].Text = "different" }},
+		{name: "changed part id", mutate: func(messages []client.Message) { messages[1].Parts[4].ID = "different" }},
+		{name: "changed part type", mutate: func(messages []client.Message) { messages[1].Parts[4].Type = "reasoning" }},
+		{name: "changed part session", mutate: func(messages []client.Message) { messages[1].Parts[4].SessionID = "other" }},
+		{name: "changed part owner", mutate: func(messages []client.Message) { messages[1].Parts[4].MessageID = "other" }},
 	}
-	for _, test := range tests {
+	for _, test := range invalid {
 		t.Run(test.name, func(t *testing.T) {
 			messages, response := newMessages()
 			test.mutate(messages)
 			if status := durableResponseStatus(messages, "root", response); status != durableResponseInvalid {
 				t.Fatalf("durable status = %v, want invalid", status)
+			}
+		})
+	}
+	stableMutations := []struct {
+		name   string
+		mutate func([]client.Message)
+	}{
+		{name: "changed text", mutate: func(messages []client.Message) { messages[1].Parts[4].Text = "different" }},
+		{name: "changed metadata", mutate: func(messages []client.Message) { messages[1].Parts[4].Metadata = json.RawMessage(`{"pruned":true}`) }},
+		{name: "changed time", mutate: func(messages []client.Message) { messages[1].Parts[4].Time = client.PartTime{Start: 10, End: 20} }},
+		{name: "changed tool state", mutate: func(messages []client.Message) { messages[1].Parts[1].State.Output = "updated" }},
+		{name: "reordered parts", mutate: func(messages []client.Message) {
+			messages[1].Parts[0], messages[1].Parts[5] = messages[1].Parts[5], messages[1].Parts[0]
+		}},
+	}
+	for _, test := range stableMutations {
+		t.Run(test.name, func(t *testing.T) {
+			messages, response := newMessages()
+			test.mutate(messages)
+			if status := durableResponseStatus(messages, "root", response); status != durableResponseValid {
+				t.Fatalf("durable status = %v, want valid", status)
 			}
 		})
 	}
@@ -815,7 +840,7 @@ func TestEngineV1NeverFallsBackToPostedText(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Status != contracts.RunStatusInvalid || result.Error == nil || result.Error.Kind != string(evaluationErrorResponseTraceMismatch) {
+	if result.Status != contracts.RunStatusInvalid || result.Error == nil || result.Error.Kind != "hard_check" {
 		t.Fatalf("posted-text fallback result = status %s error %#v", result.Status, result.Error)
 	}
 	if claims := findEvidence(t, result, "claims"); claims.Complete {

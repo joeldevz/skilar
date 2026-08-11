@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/joeldevz/skynex/internal/eval/client"
 	"github.com/joeldevz/skynex/internal/eval/contracts"
 	"github.com/joeldevz/skynex/internal/eval/lifecycle"
+	"github.com/joeldevz/skynex/internal/eval/mcpproxy"
 	"github.com/joeldevz/skynex/internal/eval/toolpolicy"
 )
 
@@ -58,6 +60,13 @@ func (f OpenCodeFactory) Start(ctx context.Context, request RuntimeRequest) (Run
 	for key, value := range f.Env {
 		env[key] = value
 	}
+	if _, collision := env[mcpproxy.ManifestEnvironment]; collision {
+		return nil, fmt.Errorf("reserved MCP proxy environment is already configured")
+	}
+	manifestPath, err := materializeMCPRuntimeManifest(request.RunPath, request.ToolPolicy)
+	if err != nil {
+		return nil, fmt.Errorf("prepare MCP proxy runtime authority: %w", err)
+	}
 	if request.ConfigRoot != "" {
 		if !filepath.IsAbs(request.ConfigRoot) {
 			return nil, fmt.Errorf("runtime config root must be absolute")
@@ -71,6 +80,7 @@ func (f OpenCodeFactory) Start(ctx context.Context, request RuntimeRequest) (Run
 		RunDir:                     request.RunPath,
 		EnvAllowlist:               append([]string(nil), f.EnvAllowlist...),
 		Env:                        env,
+		MCPProxyManifest:           manifestPath,
 		ConfigHome:                 request.ConfigRoot,
 		OpenAIOAuthSession:         oauthSession,
 		OpenAIOAuthMinimumValidity: oauthMinimumValidity,
@@ -88,7 +98,7 @@ func (f OpenCodeFactory) Start(ctx context.Context, request RuntimeRequest) (Run
 	probe, err := server.Probe(probeCtx)
 	cancel()
 	if err != nil {
-		if errors.Is(err, client.ErrInvalidProviderCatalog) || errors.Is(err, client.ErrIncompatibleAPI) {
+		if errors.Is(err, client.ErrInvalidProviderCatalog) || errors.Is(err, client.ErrInvalidMCPStatusCatalog) || errors.Is(err, client.ErrIncompatibleAPI) {
 			return fail(fmt.Errorf("%w: probe OpenCode runtime: %w", ErrRuntimeContractIncompatible, err))
 		}
 		return fail(fmt.Errorf("probe OpenCode runtime: %w", err))
@@ -115,17 +125,13 @@ func (f OpenCodeFactory) Start(ctx context.Context, request RuntimeRequest) (Run
 	if !verification.Valid {
 		return fail(fmt.Errorf("%w: resolved OpenCode config violates tool policy: %s", ErrRuntimeContractIncompatible, strings.Join(verification.Violations, "; ")))
 	}
-	var toolIDs []string
-	if err := json.Unmarshal(probe.Tools.Body, &toolIDs); err != nil {
-		return fail(fmt.Errorf("%w: decode probed OpenCode tool catalog: %w", ErrRuntimeContractIncompatible, err))
-	}
-	promptTools, err := toolpolicy.BindPromptTools(request.ToolPolicy, toolIDs)
+	promptTools, toolCatalogDigest, err := bindEffectiveRuntimeToolCatalog(request.ToolPolicy, probe.Tools.Body, probe.MCP)
 	if err != nil {
-		return fail(fmt.Errorf("%w: bind fail-closed prompt tools: %w", ErrRuntimeContractIncompatible, err))
+		return fail(fmt.Errorf("%w: bind fail-closed runtime tool catalog: %w", ErrRuntimeContractIncompatible, err))
 	}
 	toolsetDigest, err := contracts.CanonicalDigest(map[string]string{
 		"policy":  request.ToolPolicy.Digest,
-		"catalog": probe.Tools.SHA256,
+		"catalog": toolCatalogDigest,
 	})
 	if err != nil {
 		return fail(fmt.Errorf("digest effective OpenCode toolset: %w", err))
@@ -140,7 +146,7 @@ func (f OpenCodeFactory) Start(ctx context.Context, request RuntimeRequest) (Run
 			ConfigDigest:          probe.Config.SHA256,
 			AgentsDigest:          probe.Agents.SHA256,
 			ToolPolicyDigest:      request.ToolPolicy.Digest,
-			ToolCatalogDigest:     probe.Tools.SHA256,
+			ToolCatalogDigest:     toolCatalogDigest,
 			ToolsetDigest:         toolsetDigest,
 			ProviderCatalogDigest: probe.Providers.SHA256,
 			ProviderAuthMode:      authModeForFactory(f),
@@ -151,6 +157,85 @@ func (f OpenCodeFactory) Start(ctx context.Context, request RuntimeRequest) (Run
 			Network:               contracts.NetworkHostUnisolated,
 		},
 	}, nil
+}
+
+// bindEffectiveRuntimeToolCatalog combines OpenCode's builtin/custom/plugin
+// ToolRegistry IDs with only the fake MCP IDs proven by evaluator-owned stdio
+// attestations. GET /mcp remains a readiness/status fence; it is never treated
+// as authority to synthesize MCP tool names.
+func bindEffectiveRuntimeToolCatalog(effective toolpolicy.Effective, rawRegistry json.RawMessage, mcp client.MCPStatusCatalog) (map[string]bool, string, error) {
+	if err := verifyRuntimeMCPStatuses(effective, mcp.Statuses); err != nil {
+		return nil, "", err
+	}
+	var registryIDs []string
+	if err := json.Unmarshal(rawRegistry, &registryIDs); err != nil {
+		return nil, "", fmt.Errorf("decode probed OpenCode ToolRegistry catalog: %w", err)
+	}
+	if registryIDs == nil {
+		return nil, "", fmt.Errorf("decode probed OpenCode ToolRegistry catalog: expected a JSON array")
+	}
+	catalog := append([]string(nil), registryIDs...)
+	attestedIDs, err := attestedMCPToolIDs(effective)
+	if err != nil {
+		return nil, "", err
+	}
+	catalog = append(catalog, attestedIDs...)
+	sort.Strings(catalog)
+	for index, toolID := range catalog {
+		if index > 0 && catalog[index-1] == toolID {
+			return nil, "", fmt.Errorf("effective runtime tool catalog contains a duplicate or colliding ID")
+		}
+	}
+	promptTools, err := toolpolicy.BindPromptTools(effective, catalog)
+	if err != nil {
+		return nil, "", fmt.Errorf("runtime tool catalog does not satisfy the fail-closed policy")
+	}
+	digest, err := contracts.CanonicalDigest(catalog)
+	if err != nil {
+		return nil, "", fmt.Errorf("digest canonical effective runtime tool catalog: %w", err)
+	}
+	return promptTools, digest, nil
+}
+
+func verifyRuntimeMCPStatuses(effective toolpolicy.Effective, actual map[string]client.MCPStatus) error {
+	expected := make(map[string]client.MCPStatus, len(effective.EnabledFakes)+len(effective.DisabledMCPs))
+	for _, name := range effective.EnabledFakes {
+		if _, duplicate := expected[name]; duplicate {
+			return fmt.Errorf("effective policy contains a duplicate MCP status expectation")
+		}
+		expected[name] = client.MCPStatusConnected
+	}
+	for _, name := range effective.DisabledMCPs {
+		if _, duplicate := expected[name]; duplicate {
+			return fmt.Errorf("effective policy contains a duplicate MCP status expectation")
+		}
+		expected[name] = client.MCPStatusDisabled
+	}
+	expectedNames := make([]string, 0, len(expected))
+	for name := range expected {
+		expectedNames = append(expectedNames, name)
+	}
+	sort.Strings(expectedNames)
+	for _, name := range expectedNames {
+		status, exists := actual[name]
+		if !exists {
+			return fmt.Errorf("runtime MCP status is missing for a declared entry")
+		}
+		if status != expected[name] {
+			return fmt.Errorf("runtime MCP status differs from the declared policy")
+		}
+	}
+	actualNames := make([]string, 0, len(actual))
+	for name := range actual {
+		actualNames = append(actualNames, name)
+	}
+	sort.Strings(actualNames)
+	for _, name := range actualNames {
+		if _, declared := expected[name]; !declared {
+			return fmt.Errorf("runtime exposes an unexpected MCP entry")
+		}
+	}
+	return nil
 }
 
 func authModeForFactory(factory OpenCodeFactory) string {

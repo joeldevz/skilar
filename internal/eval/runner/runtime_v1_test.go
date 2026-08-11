@@ -16,7 +16,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/joeldevz/skynex/internal/eval/client"
 	"github.com/joeldevz/skynex/internal/eval/contracts"
+	"github.com/joeldevz/skynex/internal/eval/mcpproxy"
 	"github.com/joeldevz/skynex/internal/eval/toolpolicy"
 )
 
@@ -25,6 +27,7 @@ const (
 	runnerHelperBinary  = "SKYNEX_RUNNER_TEST_BINARY"
 	runnerHelperMode    = "SKYNEX_RUNNER_HELPER_MODE"
 	runnerHelperTools   = "SKYNEX_RUNNER_TOOL_IDS_BODY"
+	runnerHelperMCP     = "SKYNEX_RUNNER_MCP_STATUS_BODY"
 )
 
 // TestRunnerOpenCodeFactoryHelperProcess is re-executed behind a tiny wrapper
@@ -77,6 +80,11 @@ func TestRunnerOpenCodeFactoryHelperProcess(t *testing.T) {
 		_, _ = io.WriteString(w, `[{"name":"orchestrator"}]`)
 	})
 	mux.HandleFunc("/experimental/tool/ids", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, toolBody) })
+	mcpBody := os.Getenv(runnerHelperMCP)
+	if mcpBody == "" {
+		mcpBody = `{}`
+	}
+	mux.HandleFunc("/mcp", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, mcpBody) })
 	mux.HandleFunc("/provider", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{"all":[{"id":"openai","models":{"gpt-5":{"id":"gpt-5","providerID":"openai"}}}],"default":{"openai":"gpt-5"},"connected":["openai"]}`)
 	})
@@ -86,7 +94,7 @@ func TestRunnerOpenCodeFactoryHelperProcess(t *testing.T) {
 			"/session/{sessionID}/children":{"get":{}},
 			"/session/{sessionID}/message":{"get":{},"post":{}},
 			"/session/status":{"get":{}},"/global/event":{"get":{}},
-			"/experimental/tool/ids":{"get":{}},"/provider":{"get":{}}
+			"/experimental/tool/ids":{"get":{}},"/mcp":{"get":{}},"/provider":{"get":{}}
 		}}`)
 	})
 	listener, err := net.Listen("tcp", net.JoinHostPort(hostname, port))
@@ -178,8 +186,9 @@ func TestOpenCodeFactoryFailsClosedOnRuntimeConfigOrCatalogDrift(t *testing.T) {
 		want string
 	}{
 		{name: "resolved config widens authority", env: map[string]string{runnerHelperMode: "unsafe-config"}, want: "violates tool policy"},
-		{name: "allowed tool absent from catalog", env: map[string]string{runnerHelperTools: `["github_push","ambient_unknown"]`}, want: "explicitly allowed tool \"read\" is absent"},
-		{name: "malformed catalog", env: map[string]string{runnerHelperTools: `{"read":true}`}, want: "decode probed OpenCode tool catalog"},
+		{name: "allowed tool absent from catalog", env: map[string]string{runnerHelperTools: `["github_push","ambient_unknown"]`}, want: "does not satisfy the fail-closed policy"},
+		{name: "malformed catalog", env: map[string]string{runnerHelperTools: `{"read":true}`}, want: "decode probed OpenCode ToolRegistry catalog"},
+		{name: "malformed MCP status", env: map[string]string{runnerHelperMCP: `{"fake":{"status":`}, want: "MCP status catalog is invalid"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -193,6 +202,159 @@ func TestOpenCodeFactoryFailsClosedOnRuntimeConfigOrCatalogDrift(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBindEffectiveRuntimeToolCatalogIncludesOnlyConnectedFakeBindings(t *testing.T) {
+	t.Parallel()
+	effective := runtimeToolPolicyWithFake(t)
+	mcp := client.MCPStatusCatalog{Statuses: map[string]client.MCPStatus{
+		"ambient":         client.MCPStatusDisabled,
+		"candidate_drift": client.MCPStatusConnected,
+	}}
+	promptTools, digest, err := bindEffectiveRuntimeToolCatalog(effective, json.RawMessage(`["read","ambient_unknown"]`), mcp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantTools := map[string]bool{
+		"*":                             false,
+		"ambient_unknown":               false,
+		"candidate_drift_worker_result": true,
+		"read":                          true,
+	}
+	if !reflect.DeepEqual(promptTools, wantTools) {
+		t.Fatalf("prompt tools = %#v, want %#v", promptTools, wantTools)
+	}
+	wantDigest, err := contracts.CanonicalDigest([]string{"ambient_unknown", "candidate_drift_worker_result", "read"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digest != wantDigest {
+		t.Fatalf("catalog digest = %s, want %s", digest, wantDigest)
+	}
+}
+
+func TestBindEffectiveRuntimeToolCatalogRejectsMCPStatusDrift(t *testing.T) {
+	t.Parallel()
+	effective := runtimeToolPolicyWithFake(t)
+	tests := []struct {
+		name     string
+		statuses map[string]client.MCPStatus
+		want     string
+	}{
+		{
+			name: "failed enabled fake",
+			statuses: map[string]client.MCPStatus{
+				"ambient": client.MCPStatusDisabled, "candidate_drift": client.MCPStatusFailed,
+			},
+			want: `runtime MCP status differs from the declared policy`,
+		},
+		{
+			name:     "missing enabled fake",
+			statuses: map[string]client.MCPStatus{"ambient": client.MCPStatusDisabled},
+			want:     `runtime MCP status is missing for a declared entry`,
+		},
+		{
+			name: "unexpected MCP",
+			statuses: map[string]client.MCPStatus{
+				"ambient": client.MCPStatusDisabled, "candidate_drift": client.MCPStatusConnected, "rogue": client.MCPStatusConnected,
+			},
+			want: `runtime exposes an unexpected MCP entry`,
+		},
+		{
+			name: "disabled MCP connected",
+			statuses: map[string]client.MCPStatus{
+				"ambient": client.MCPStatusConnected, "candidate_drift": client.MCPStatusConnected,
+			},
+			want: `runtime MCP status differs from the declared policy`,
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			_, _, err := bindEffectiveRuntimeToolCatalog(effective, json.RawMessage(`["read"]`), client.MCPStatusCatalog{Statuses: test.statuses})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want substring %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestBindEffectiveRuntimeToolCatalogRejectsToolIDCollision(t *testing.T) {
+	t.Parallel()
+	effective := runtimeToolPolicyWithFake(t)
+	statuses := map[string]client.MCPStatus{
+		"ambient": client.MCPStatusDisabled, "candidate_drift": client.MCPStatusConnected,
+	}
+	_, _, err := bindEffectiveRuntimeToolCatalog(effective, json.RawMessage(`["read","candidate_drift_worker_result"]`), client.MCPStatusCatalog{Statuses: statuses})
+	if err == nil || !strings.Contains(err.Error(), "duplicate or colliding ID") {
+		t.Fatalf("collision error = %v", err)
+	}
+}
+
+func TestBindEffectiveRuntimeToolCatalogNeverSynthesizesMCPIDWithoutAttestation(t *testing.T) {
+	t.Parallel()
+	effective := runtimeToolPolicyWithFake(t)
+	effective.MCPAttestations = nil
+	statuses := map[string]client.MCPStatus{
+		"ambient": client.MCPStatusDisabled, "candidate_drift": client.MCPStatusConnected,
+	}
+	if _, _, err := bindEffectiveRuntimeToolCatalog(effective, json.RawMessage(` ["read"] `), client.MCPStatusCatalog{Statuses: statuses}); err == nil || !strings.Contains(err.Error(), "attestations are incomplete") {
+		t.Fatalf("connected status synthesized an unattested MCP ID: %v", err)
+	}
+}
+
+func TestOpenCodeFactoryRejectsPublicOverrideOfInternalMCPManifest(t *testing.T) {
+	request, _ := openCodeFactoryRequest(t)
+	factory := openCodeTestFactory(t, nil)
+	factory.Env[mcpproxy.ManifestEnvironment] = filepath.Join(t.TempDir(), "forged.json")
+	if runtimeHandle, err := factory.Start(context.Background(), request); err == nil || !strings.Contains(err.Error(), "reserved MCP proxy environment") {
+		if runtimeHandle != nil {
+			_ = runtimeHandle.Close()
+		}
+		t.Fatalf("public internal-manifest override error = %v", err)
+	}
+}
+
+func runtimeToolPolicyWithFake(t *testing.T) toolpolicy.Effective {
+	t.Helper()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	effective, err := toolpolicy.Generate(toolpolicy.Input{
+		Base:            json.RawMessage(`{"agent":{"orchestrator":{"model":"openai/gpt-5"}}}`),
+		AllowedTools:    []string{"read", "worker_result"},
+		AmbientMCPNames: []string{"ambient"},
+		FakeMCPs: []toolpolicy.FakeMCP{{
+			Name: "candidate_drift", Command: []string{executable}, Tools: []string{"worker_result"},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attestationPath := filepath.Join(t.TempDir(), "tools.json")
+	nonce := strings.Repeat("a", 64)
+	raw, err := json.Marshal(struct {
+		SchemaVersion int      `json:"schema_version"`
+		MCPName       string   `json:"mcp_name"`
+		Nonce         string   `json:"nonce"`
+		RawTools      []string `json:"raw_tools"`
+	}{SchemaVersion: 1, MCPName: "candidate_drift", Nonce: nonce, RawTools: []string{"worker_result"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(attestationPath, append(raw, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	effective.MCPAttestations = []toolpolicy.MCPAttestationBinding{{
+		MCPName: "candidate_drift", RawTools: []string{"worker_result"}, AttestationPath: attestationPath, Nonce: nonce,
+	}}
+	effective.MCPProxy, err = resolveMCPProxyIdentity(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return effective
 }
 
 func TestRequireCleanOpenAIOAuthProviders(t *testing.T) {

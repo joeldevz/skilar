@@ -18,6 +18,7 @@ func TestBuildEnvironmentRejectsAmbientIdentityAndOpenCodeOverrides(t *testing.T
 		"OPENCODE_CONFIG_CONTENT",
 		"OPENCODE_CONFIG_DIR",
 		"OPENCODE_DISABLE_PROJECT_CONFIG",
+		"SKYNEX_EVAL_MCP_PROXY_MANIFEST",
 	}
 	for _, key := range reserved {
 		key := key

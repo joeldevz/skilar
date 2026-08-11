@@ -386,6 +386,25 @@ type ModelSummary struct {
 	ProviderID string `json:"providerID"`
 }
 
+// MCPStatus is the non-secret state exposed by GET /mcp in the pinned
+// OpenCode API. Failure details are deliberately discarded by the client.
+type MCPStatus string
+
+const (
+	MCPStatusConnected               MCPStatus = "connected"
+	MCPStatusDisabled                MCPStatus = "disabled"
+	MCPStatusFailed                  MCPStatus = "failed"
+	MCPStatusNeedsAuth               MCPStatus = "needs_auth"
+	MCPStatusNeedsClientRegistration MCPStatus = "needs_client_registration"
+)
+
+// MCPStatusCatalog is a sanitized view of GET /mcp. SHA256 commits only to
+// the canonical name-to-status map and never to server-provided error text.
+type MCPStatusCatalog struct {
+	Statuses map[string]MCPStatus `json:"statuses"`
+	SHA256   string               `json:"sha256"`
+}
+
 // RawDocument is a bounded endpoint capture together with its content digest.
 // It is used by compatibility probes without interpreting rapidly changing
 // configuration, agent, or OpenAPI schemas.
@@ -607,6 +626,152 @@ func (c *Client) GetToolIDsDocumentContext(ctx context.Context) (RawDocument, er
 		return RawDocument{}, fmt.Errorf("get tool IDs: %w", err)
 	}
 	return document, nil
+}
+
+// GetMCPStatusCatalogContext initializes the configured MCP catalog through
+// OpenCode's read-only status endpoint. In pinned OpenCode 1.18.16 a
+// connected status is published only after initialize and listTools have
+// succeeded and the returned definitions have been cached.
+func (c *Client) GetMCPStatusCatalogContext(ctx context.Context) (MCPStatusCatalog, error) {
+	document, err := c.getRawDocument(ctx, "/mcp")
+	if err != nil {
+		return MCPStatusCatalog{}, fmt.Errorf("get MCP status catalog: %w", err)
+	}
+	statuses, err := decodeMCPStatusCatalog(document.Body)
+	if err != nil {
+		return MCPStatusCatalog{}, fmt.Errorf("%w: %v", ErrInvalidMCPStatusCatalog, err)
+	}
+	safeJSON, err := json.Marshal(statuses)
+	if err != nil {
+		return MCPStatusCatalog{}, fmt.Errorf("%w: encode sanitized status catalog: %v", ErrInvalidMCPStatusCatalog, err)
+	}
+	sum := sha256.Sum256(safeJSON)
+	return MCPStatusCatalog{
+		Statuses: statuses,
+		SHA256:   fmt.Sprintf("sha256:%x", sum[:]),
+	}, nil
+}
+
+func decodeMCPStatusCatalog(raw json.RawMessage) (map[string]MCPStatus, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	token, err := decoder.Token()
+	if err != nil {
+		return nil, fmt.Errorf("decode status catalog")
+	}
+	if delimiter, ok := token.(json.Delim); !ok || delimiter != '{' {
+		return nil, fmt.Errorf("status catalog must be an object")
+	}
+	statuses := make(map[string]MCPStatus)
+	for entry := 0; decoder.More(); entry++ {
+		token, err := decoder.Token()
+		if err != nil {
+			return nil, fmt.Errorf("decode status catalog entry %d", entry)
+		}
+		name, ok := token.(string)
+		if !ok || !validMCPServerName(name) {
+			return nil, fmt.Errorf("status catalog entry %d has an invalid server name", entry)
+		}
+		if _, duplicate := statuses[name]; duplicate {
+			return nil, fmt.Errorf("duplicate MCP server %q", name)
+		}
+		status, err := decodeMCPStatus(decoder)
+		if err != nil {
+			return nil, fmt.Errorf("MCP server %q: %w", name, err)
+		}
+		statuses[name] = status
+	}
+	if token, err = decoder.Token(); err != nil || token != json.Delim('}') {
+		return nil, fmt.Errorf("decode status catalog closing object")
+	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return nil, fmt.Errorf("status catalog contains trailing JSON")
+	}
+	return statuses, nil
+}
+
+func decodeMCPStatus(decoder *json.Decoder) (MCPStatus, error) {
+	token, err := decoder.Token()
+	if err != nil {
+		return "", fmt.Errorf("decode status object")
+	}
+	if delimiter, ok := token.(json.Delim); !ok || delimiter != '{' {
+		return "", fmt.Errorf("status must be an object")
+	}
+	var status MCPStatus
+	seenStatus := false
+	seenError := false
+	seenFields := make(map[string]struct{}, 2)
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return "", fmt.Errorf("decode status field")
+		}
+		field, ok := token.(string)
+		if !ok {
+			return "", fmt.Errorf("status contains a non-string field")
+		}
+		if _, duplicate := seenFields[field]; duplicate {
+			return "", fmt.Errorf("status contains a duplicate field")
+		}
+		seenFields[field] = struct{}{}
+		switch field {
+		case "status":
+			if err := decoder.Decode(&status); err != nil {
+				return "", fmt.Errorf("status discriminator must be a string")
+			}
+			seenStatus = true
+		case "error":
+			var discarded string
+			if err := decoder.Decode(&discarded); err != nil {
+				return "", fmt.Errorf("error detail must be a string")
+			}
+			seenError = true
+		default:
+			return "", fmt.Errorf("status contains an unknown field")
+		}
+	}
+	if token, err = decoder.Token(); err != nil || token != json.Delim('}') {
+		return "", fmt.Errorf("decode status closing object")
+	}
+	if !seenStatus {
+		return "", fmt.Errorf("status discriminator is missing")
+	}
+	switch status {
+	case MCPStatusConnected, MCPStatusDisabled, MCPStatusNeedsAuth:
+		if seenError {
+			return "", fmt.Errorf("status has an unexpected error detail")
+		}
+	case MCPStatusFailed, MCPStatusNeedsClientRegistration:
+		if !seenError {
+			return "", fmt.Errorf("status is missing its required error detail")
+		}
+	default:
+		return "", fmt.Errorf("status discriminator is unsupported")
+	}
+	return status, nil
+}
+
+func validMCPServerName(name string) bool {
+	if len(name) == 0 || len(name) > 128 || !asciiAlphaNumeric(name[0]) {
+		return false
+	}
+	for i := 1; i < len(name); i++ {
+		if !asciiAlphaNumeric(name[i]) && !strings.ContainsRune("_.:-", rune(name[i])) {
+			return false
+		}
+	}
+	return true
+}
+
+func asciiAlphaNumeric(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9'
+}
+
+func requireJSONEOF(decoder *json.Decoder) error {
+	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return errors.New("expected end of JSON")
+	}
+	return nil
 }
 
 // GetProviderCatalogContext probes configured providers and models without

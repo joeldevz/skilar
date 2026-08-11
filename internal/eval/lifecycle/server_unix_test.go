@@ -60,14 +60,15 @@ func TestLifecycleHelperProcess(t *testing.T) {
 	})
 	mux.HandleFunc("/config", func(w http.ResponseWriter, _ *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{
-			"inherited":  os.Getenv("SKYNEX_LIFECYCLE_NOT_ALLOWED"),
-			"override":   os.Getenv("SKYNEX_LIFECYCLE_OVERRIDE"),
-			"home":       os.Getenv("HOME"),
-			"tmpdir":     os.Getenv("TMPDIR"),
-			"xdg_config": os.Getenv("XDG_CONFIG_HOME"),
-			"xdg_data":   os.Getenv("XDG_DATA_HOME"),
-			"xdg_state":  os.Getenv("XDG_STATE_HOME"),
-			"xdg_cache":  os.Getenv("XDG_CACHE_HOME"),
+			"inherited":    os.Getenv("SKYNEX_LIFECYCLE_NOT_ALLOWED"),
+			"override":     os.Getenv("SKYNEX_LIFECYCLE_OVERRIDE"),
+			"home":         os.Getenv("HOME"),
+			"tmpdir":       os.Getenv("TMPDIR"),
+			"xdg_config":   os.Getenv("XDG_CONFIG_HOME"),
+			"xdg_data":     os.Getenv("XDG_DATA_HOME"),
+			"xdg_state":    os.Getenv("XDG_STATE_HOME"),
+			"xdg_cache":    os.Getenv("XDG_CACHE_HOME"),
+			"mcp_manifest": os.Getenv("SKYNEX_EVAL_MCP_PROXY_MANIFEST"),
 		})
 	})
 	mux.HandleFunc("/agent", func(w http.ResponseWriter, _ *http.Request) {
@@ -75,6 +76,9 @@ func TestLifecycleHelperProcess(t *testing.T) {
 	})
 	mux.HandleFunc("/experimental/tool/ids", func(w http.ResponseWriter, _ *http.Request) {
 		io.WriteString(w, `["read","write"]`)
+	})
+	mux.HandleFunc("/mcp", func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, `{}`)
 	})
 	mux.HandleFunc("/provider", func(w http.ResponseWriter, _ *http.Request) {
 		io.WriteString(w, `{"all":[{"id":"test","models":{"model":{"id":"model","providerID":"test"}}}],"default":{"test":"model"},"connected":["test"]}`)
@@ -97,6 +101,10 @@ func TestServerBindsRunCWDProbesAndCleansEntireProcessGroup(t *testing.T) {
 	workDir := t.TempDir()
 	runDir := t.TempDir()
 	pidFile := filepath.Join(runDir, "child.pid")
+	manifestPath := filepath.Join(runDir, "mcp-proxy-manifest.json")
+	if err := os.WriteFile(manifestPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("SKYNEX_LIFECYCLE_NOT_ALLOWED", "must-not-leak")
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -112,7 +120,8 @@ func TestServerBindsRunCWDProbesAndCleansEntireProcessGroup(t *testing.T) {
 		},
 		Timeout: 5 * time.Second, ShutdownTimeout: 200 * time.Millisecond,
 		HealthTimeout: time.Second, HealthInterval: 10 * time.Millisecond,
-		ExpectedVersion: "test-v1",
+		ExpectedVersion:  "test-v1",
+		MCPProxyManifest: manifestPath,
 	})
 	if err := srv.Start(ctx); err != nil {
 		cancel()
@@ -144,7 +153,7 @@ func TestServerBindsRunCWDProbesAndCleansEntireProcessGroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if evidence.Health.Version != "test-v1" || evidence.OpenAPI.SHA256 == "" || evidence.Config.SHA256 == "" || evidence.Tools.SHA256 == "" || evidence.Providers.SHA256 == "" {
+	if evidence.Health.Version != "test-v1" || evidence.OpenAPI.SHA256 == "" || evidence.Config.SHA256 == "" || evidence.Tools.SHA256 == "" || evidence.MCP.SHA256 == "" || evidence.Providers.SHA256 == "" {
 		t.Fatalf("probe evidence = %#v", evidence)
 	}
 	var effectiveEnv map[string]string
@@ -153,6 +162,9 @@ func TestServerBindsRunCWDProbesAndCleansEntireProcessGroup(t *testing.T) {
 	}
 	if effectiveEnv["inherited"] != "" || effectiveEnv["override"] != "explicit" {
 		t.Fatalf("effective env = %#v", effectiveEnv)
+	}
+	if effectiveEnv["mcp_manifest"] != manifestPath {
+		t.Fatalf("internal MCP manifest env = %q, want %q", effectiveEnv["mcp_manifest"], manifestPath)
 	}
 	for _, key := range []string{"home", "tmpdir", "xdg_config", "xdg_data", "xdg_state", "xdg_cache"} {
 		assertPrivateDirectory(t, runDir, effectiveEnv[key])
@@ -182,6 +194,46 @@ func TestServerBindsRunCWDProbesAndCleansEntireProcessGroup(t *testing.T) {
 	}
 	if !waitUntil(2*time.Second, func() bool { return !processAliveNonZombie(childPID) }) {
 		t.Fatalf("descendant %d survived process-group cleanup", childPID)
+	}
+}
+
+func TestServerRejectsUncontainedOrUnprotectedInternalMCPManifest(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		prepare func(*testing.T, string) string
+	}{
+		{
+			name: "outside run",
+			prepare: func(t *testing.T, _ string) string {
+				path := filepath.Join(t.TempDir(), "manifest.json")
+				if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return path
+			},
+		},
+		{
+			name: "unsafe mode",
+			prepare: func(t *testing.T, runDir string) string {
+				path := filepath.Join(runDir, "manifest.json")
+				if err := os.WriteFile(path, []byte("{}\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				return path
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runDir := t.TempDir()
+			srv := NewServerWithConfig(Config{
+				Binary: os.Args[0], WorkDir: t.TempDir(), RunDir: runDir,
+				CommandArgs:      []string{"-test.run=^TestLifecycleHelperProcess$", "--", "{port}"},
+				MCPProxyManifest: test.prepare(t, runDir),
+			})
+			if err := srv.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "protected MCP proxy manifest") {
+				t.Fatalf("Start error = %v", err)
+			}
+		})
 	}
 }
 

@@ -110,7 +110,7 @@ func commandDoctor(ctx context.Context, args []string, deps dependencies) (docto
 			return doctorResult{}, invalidf("opencode_version_mismatch", "%v", err)
 		}
 		var incompatible *openCodeCompatibilityError
-		if errors.As(err, &incompatible) || errors.Is(err, client.ErrIncompatibleAPI) || errors.Is(err, client.ErrInvalidProviderCatalog) {
+		if errors.As(err, &incompatible) || errors.Is(err, client.ErrIncompatibleAPI) || errors.Is(err, client.ErrInvalidProviderCatalog) || errors.Is(err, client.ErrInvalidMCPStatusCatalog) {
 			return doctorResult{}, invalidf("opencode_api_incompatible", "%v", err)
 		}
 		return doctorResult{}, infraf("opencode_unavailable", err)
@@ -222,6 +222,7 @@ func probeOpenCode(ctx context.Context, options doctorOptions) (result doctorRes
 			{Name: "/config", Digest: evidence.Config.SHA256, ContentType: evidence.Config.ContentType},
 			{Name: "/agent", Digest: evidence.Agents.SHA256, ContentType: evidence.Agents.ContentType},
 			{Name: "/experimental/tool/ids", Digest: evidence.Tools.SHA256, ContentType: evidence.Tools.ContentType},
+			{Name: "/mcp", Digest: evidence.MCP.SHA256, ContentType: "application/json"},
 			{Name: "/provider", Digest: evidence.Providers.SHA256, ContentType: "application/json"},
 			{Name: "/doc", Digest: evidence.OpenAPI.SHA256, ContentType: evidence.OpenAPI.ContentType},
 		},

@@ -436,7 +436,7 @@ func commandAB(ctx context.Context, args []string, deps dependencies) (abCommand
 			return abCommandResult{}, invalidf("opencode_version_mismatch", "%v", publishedProbeErr)
 		}
 		var incompatible *openCodeCompatibilityError
-		if errors.As(probeErr, &incompatible) || errors.Is(probeErr, client.ErrIncompatibleAPI) || errors.Is(probeErr, client.ErrInvalidProviderCatalog) {
+		if errors.As(probeErr, &incompatible) || errors.Is(probeErr, client.ErrIncompatibleAPI) || errors.Is(probeErr, client.ErrInvalidProviderCatalog) || errors.Is(probeErr, client.ErrInvalidMCPStatusCatalog) {
 			return abCommandResult{}, invalidf("opencode_api_incompatible", "%v", publishedProbeErr)
 		}
 		return abCommandResult{}, infraf("opencode_preflight", publishedProbeErr)

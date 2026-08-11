@@ -66,6 +66,8 @@ func TestClientUsesCurrentSessionAPIAndPreservesTraceFields(t *testing.T) {
 			io.WriteString(w, `{"ses_root":{"type":"retry","attempt":2,"message":"rate limited","next":1800}}`)
 		case "GET /experimental/tool/ids":
 			io.WriteString(w, `["bash","read","worker_failure_worker_result"]`)
+		case "GET /mcp":
+			io.WriteString(w, `{"ambient":{"status":"disabled"},"worker_failure":{"status":"connected"}}`)
 		case "GET /provider":
 			io.WriteString(w, `{"all":[{"id":"openai","key":"must-not-survive","options":{"apiKey":"must-not-survive"},"models":{"gpt-5.6-terra":{"id":"gpt-5.6-terra","providerID":"openai"}}}],"default":{"openai":"gpt-5.6-terra"},"connected":["openai"]}`)
 		case "GET /global/health":
@@ -115,6 +117,10 @@ func TestClientUsesCurrentSessionAPIAndPreservesTraceFields(t *testing.T) {
 	if err != nil || fmt.Sprint(toolIDs) != "[bash read worker_failure_worker_result]" {
 		t.Fatalf("tool IDs = %#v, err = %v", toolIDs, err)
 	}
+	mcp, err := c.GetMCPStatusCatalogContext(ctx)
+	if err != nil || mcp.Statuses["worker_failure"] != MCPStatusConnected || mcp.Statuses["ambient"] != MCPStatusDisabled || mcp.SHA256 == "" {
+		t.Fatalf("MCP status catalog = %#v, err = %v", mcp, err)
+	}
 	providers, err := c.GetProviderCatalogContext(ctx)
 	if err != nil || len(providers.All) != 1 || providers.All[0].ID != "openai" || providers.All[0].Models["gpt-5.6-terra"].ID != "gpt-5.6-terra" || providers.SHA256 == "" {
 		t.Fatalf("providers = %#v, err = %v", providers, err)
@@ -148,11 +154,83 @@ func TestClientUsesCurrentSessionAPIAndPreservesTraceFields(t *testing.T) {
 		"GET /session/ses_root/message",
 		"GET /session/status",
 		"GET /experimental/tool/ids",
+		"GET /mcp",
 		"GET /provider",
 		"GET /global/health",
 	}
 	if fmt.Sprint(requested) != fmt.Sprint(wantPaths) {
 		t.Fatalf("requests = %v, want %v", requested, wantPaths)
+	}
+}
+
+func TestMCPStatusCatalogIsStrictAndDropsFailureDetails(t *testing.T) {
+	t.Parallel()
+	const secret = "must-not-survive"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, `{"z_failed":{"status":"failed","error":"`+secret+`"},"a_connected":{"status":"connected"}}`)
+	}))
+	defer server.Close()
+	catalog, err := New(Config{BaseURL: server.URL}).GetMCPStatusCatalogContext(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantStatuses := map[string]MCPStatus{"a_connected": MCPStatusConnected, "z_failed": MCPStatusFailed}
+	if fmt.Sprint(catalog.Statuses) != fmt.Sprint(wantStatuses) {
+		t.Fatalf("statuses = %#v, want %#v", catalog.Statuses, wantStatuses)
+	}
+	encoded, err := json.Marshal(catalog)
+	if err != nil || bytes.Contains(encoded, []byte(secret)) {
+		t.Fatalf("sanitized MCP catalog leaked failure detail: %s, err=%v", encoded, err)
+	}
+	safeJSON, err := json.Marshal(wantStatuses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(safeJSON)
+	if want := fmt.Sprintf("sha256:%x", sum[:]); catalog.SHA256 != want {
+		t.Fatalf("MCP digest = %s, want %s", catalog.SHA256, want)
+	}
+
+	malformed := []string{
+		`null`,
+		`[]`,
+		`{"bad name":{"status":"connected"}}`,
+		`{"a":{"status":"connected"},"a":{"status":"disabled"}}`,
+		`{"a":{}}`,
+		`{"a":{"status":"unknown"}}`,
+		`{"a":{"status":"connected","extra":true}}`,
+		`{"a":{"status":"failed"}}`,
+		`{"a":{"status":"connected","error":"unexpected"}}`,
+		`{"a":{"status":"failed","error":3}}`,
+		`{"a":{"status":"connected","status":"disabled"}}`,
+		`{"a":{"status":"connected"}} {}`,
+	}
+	for _, raw := range malformed {
+		if _, err := decodeMCPStatusCatalog(json.RawMessage(raw)); err == nil {
+			t.Errorf("malformed MCP status catalog accepted: %s", raw)
+		}
+	}
+	_, err = decodeMCPStatusCatalog(json.RawMessage(`{"a":{"status":"failed","error":"` + secret + `","extra":true}}`))
+	if err == nil || strings.Contains(err.Error(), secret) {
+		t.Fatalf("malformed MCP error leaked failure detail: %v", err)
+	}
+}
+
+func TestVerifyRequiredAPIRequiresMCPStatusEndpoint(t *testing.T) {
+	t.Parallel()
+	document := json.RawMessage(`{"paths":{
+		"/session":{"post":{}},"/session/{id}":{"get":{}},
+		"/session/{id}/children":{"get":{}},"/session/{id}/message":{"get":{},"post":{}},
+		"/session/status":{"get":{}},"/global/event":{"get":{}},
+		"/experimental/tool/ids":{"get":{}},"/mcp":{"get":{}},"/provider":{"get":{}}
+	}}`)
+	routes, err := VerifyRequiredAPI(document)
+	if err != nil || len(routes) != 10 {
+		t.Fatalf("VerifyRequiredAPI() = %v, %v", routes, err)
+	}
+	missing := bytes.Replace(document, []byte(`,"/mcp":{"get":{}}`), nil, 1)
+	if _, err := VerifyRequiredAPI(missing); err == nil || !strings.Contains(err.Error(), "GET /mcp") {
+		t.Fatalf("missing /mcp error = %v", err)
 	}
 }
 

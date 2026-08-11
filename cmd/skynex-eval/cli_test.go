@@ -16,6 +16,7 @@ import (
 
 	"github.com/joeldevz/skynex/internal/eval/baseline"
 	"github.com/joeldevz/skynex/internal/eval/cases"
+	"github.com/joeldevz/skynex/internal/eval/client"
 	"github.com/joeldevz/skynex/internal/eval/contracts"
 	"github.com/joeldevz/skynex/internal/eval/experiment"
 	"github.com/joeldevz/skynex/internal/eval/gates"
@@ -305,6 +306,7 @@ func TestDoctorUsesReadOnlyProbeAndStableClassification(t *testing.T) {
 	}{
 		{name: "version mismatch", err: &lifecycle.VersionMismatchError{Got: "2", Expected: "1"}, exit: contracts.ExitInvalid, kind: "opencode_version_mismatch"},
 		{name: "API incompatible", err: &openCodeCompatibilityError{cause: errors.New("required route absent")}, exit: contracts.ExitInvalid, kind: "opencode_api_incompatible"},
+		{name: "MCP status incompatible", err: client.ErrInvalidMCPStatusCatalog, exit: contracts.ExitInvalid, kind: "opencode_api_incompatible"},
 		{name: "unavailable", err: errors.New("binary missing"), exit: contracts.ExitInfrastructure, kind: "opencode_unavailable"},
 	}
 	for _, test := range tests {
@@ -337,14 +339,20 @@ func TestDoctorOpenAPIContractRequiresEveryRunnerRoute(t *testing.T) {
 		"/session/status":{"get":{}},
 		"/global/event":{"get":{}},
 		"/experimental/tool/ids":{"get":{}},
+		"/mcp":{"get":{}},
 		"/provider":{"get":{}}
 	}}`)
 	routes, err := verifyRequiredOpenCodeAPI(document)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(routes) != 9 {
+	if len(routes) != 10 {
 		t.Fatalf("verified routes = %v", routes)
+	}
+	missingMCP := bytes.Replace(document, []byte(`
+		"/mcp":{"get":{}},`), nil, 1)
+	if _, err := verifyRequiredOpenCodeAPI(missingMCP); err == nil || !strings.Contains(err.Error(), "GET /mcp") {
+		t.Fatalf("missing MCP GET error = %v", err)
 	}
 	missing := bytes.Replace(document, []byte(`"post":{}`), []byte{}, 1)
 	if _, err := verifyRequiredOpenCodeAPI(missing); err == nil || !strings.Contains(err.Error(), "POST /session") {

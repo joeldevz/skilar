@@ -3,17 +3,24 @@ package runner
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/joeldevz/skynex/internal/eval/contracts"
 	"github.com/joeldevz/skynex/internal/eval/sandbox"
 	"github.com/joeldevz/skynex/internal/eval/toolpolicy"
+	"github.com/joeldevz/skynex/internal/safefs"
 )
+
+const maxAgentPromptBytes int64 = 1 << 20
 
 // freezeAgentBundle copies the content-addressed OpenCode configuration into
 // the private run root and removes write bits before the runtime starts. The
@@ -60,6 +67,10 @@ func prepareToolPolicy(bundleCopy string, testCase contracts.Case, closures ...*
 	if len(closures) != 0 {
 		closure = closures[0]
 	}
+	return prepareToolPolicyWithProxy(bundleCopy, testCase, closure, "")
+}
+
+func prepareToolPolicyWithProxy(bundleCopy string, testCase contracts.Case, closure *ExecutableClosure, proxyExecutable string) (toolpolicy.Effective, error) {
 	configPath := filepath.Join(bundleCopy, "opencode.json")
 	base, err := os.ReadFile(configPath)
 	if err != nil && !os.IsNotExist(err) {
@@ -70,6 +81,10 @@ func prepareToolPolicy(bundleCopy string, testCase contracts.Case, closures ...*
 	}
 	if len(base) > 8<<20 {
 		return toolpolicy.Effective{}, fmt.Errorf("copied OpenCode config exceeds 8 MiB")
+	}
+	base, err = materializeBundleFilePrompts(bundleCopy, base)
+	if err != nil {
+		return toolpolicy.Effective{}, err
 	}
 	base, err = pinCaseProviderConfig(base, testCase)
 	if err != nil {
@@ -104,6 +119,10 @@ func prepareToolPolicy(bundleCopy string, testCase contracts.Case, closures ...*
 			Tools: append([]string(nil), fake.Tools...),
 		})
 	}
+	fakes, attestations, proxyIdentity, err := prepareMCPProxyPolicy(bundleCopy, proxyExecutable, fakes)
+	if err != nil {
+		return toolpolicy.Effective{}, err
+	}
 	effective, err := toolpolicy.Generate(toolpolicy.Input{
 		Base: json.RawMessage(base), AllowedTools: testCase.ToolPolicy.AllowedTools,
 		ForbiddenTools: testCase.ToolPolicy.ForbiddenTools, FakeMCPs: fakes,
@@ -111,10 +130,159 @@ func prepareToolPolicy(bundleCopy string, testCase contracts.Case, closures ...*
 	if err != nil {
 		return toolpolicy.Effective{}, fmt.Errorf("generate fail-closed tool policy: %w", err)
 	}
+	effective.MCPAttestations = attestations
+	effective.MCPProxy = proxyIdentity
 	if err := writePolicyAtomically(configPath, effective.Config); err != nil {
 		return toolpolicy.Effective{}, err
 	}
+	if err := pruneRuntimeBundle(bundleCopy); err != nil {
+		return toolpolicy.Effective{}, err
+	}
 	return effective, nil
+}
+
+// materializeBundleFilePrompts turns OpenCode's file-prompt shorthand into an
+// evaluator-owned inline value before the runtime sees the config. This keeps
+// the generated policy and OpenCode's resolved /config representation equal,
+// while the rooted read binds every prompt to the already verified bundle
+// copy. Inline prompts remain unchanged; any attempted or malformed file
+// expansion fails closed.
+func materializeBundleFilePrompts(bundleCopy string, base []byte) ([]byte, error) {
+	var config map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(base))
+	decoder.UseNumber()
+	if err := decoder.Decode(&config); err != nil {
+		return nil, fmt.Errorf("decode copied OpenCode config prompts: %w", err)
+	}
+	if trailingErr := decoder.Decode(new(any)); !errors.Is(trailingErr, io.EOF) {
+		return nil, fmt.Errorf("decode copied OpenCode config prompts: multiple JSON values")
+	}
+	if config == nil {
+		return nil, fmt.Errorf("copied OpenCode config prompts must be an object")
+	}
+
+	root, err := safefs.Open(filepath.Clean(bundleCopy))
+	if err != nil {
+		return nil, fmt.Errorf("open copied OpenCode bundle for prompt resolution: %w", err)
+	}
+	defer root.Close()
+
+	for _, field := range []string{"agent", "mode"} {
+		entries, ok := config[field].(map[string]any)
+		if !ok {
+			continue
+		}
+		for name, rawEntry := range entries {
+			entry, ok := rawEntry.(map[string]any)
+			if !ok {
+				continue
+			}
+			rawPrompt, exists := entry["prompt"]
+			if !exists {
+				continue
+			}
+			prompt, ok := rawPrompt.(string)
+			if !ok {
+				continue
+			}
+			materialized, changed, promptErr := materializeFilePrompt(root, prompt)
+			if promptErr != nil {
+				return nil, fmt.Errorf("resolve %s %q prompt: %w", field, name, promptErr)
+			}
+			if changed {
+				entry["prompt"] = materialized
+			}
+		}
+	}
+
+	encoded, err := json.Marshal(config)
+	if err != nil {
+		return nil, fmt.Errorf("encode copied OpenCode config prompts: %w", err)
+	}
+	return encoded, nil
+}
+
+func materializeFilePrompt(root *safefs.Root, prompt string) (string, bool, error) {
+	const prefix = "{file:"
+	if !strings.Contains(prompt, prefix) {
+		if strings.Contains(prompt, "{file") {
+			return "", false, fmt.Errorf("file prompt must use exact {file:REL} syntax")
+		}
+		return prompt, false, nil
+	}
+	if !strings.HasPrefix(prompt, prefix) || !strings.HasSuffix(prompt, "}") || strings.Count(prompt, prefix) != 1 {
+		return "", false, fmt.Errorf("file prompt must use exact {file:REL} syntax")
+	}
+	relative := strings.TrimSuffix(strings.TrimPrefix(prompt, prefix), "}")
+	if relative == "" || strings.TrimSpace(relative) != relative || strings.ContainsAny(relative, "{}\\") {
+		return "", false, fmt.Errorf("file prompt contains an invalid relative path")
+	}
+	if strings.HasPrefix(relative, "/") || strings.HasPrefix(relative, "//") || filepath.IsAbs(filepath.FromSlash(relative)) || hasWindowsVolumePrefix(relative) {
+		return "", false, fmt.Errorf("file prompt path must be relative")
+	}
+	for strings.HasPrefix(relative, "./") {
+		relative = strings.TrimPrefix(relative, "./")
+	}
+	if relative == "" || relative == "." || path.Clean(relative) != relative {
+		return "", false, fmt.Errorf("file prompt contains a non-canonical relative path")
+	}
+	for _, component := range strings.Split(relative, "/") {
+		if component == "" || component == "." || component == ".." {
+			return "", false, fmt.Errorf("file prompt path contains traversal")
+		}
+	}
+
+	content, err := safefs.ReadFileVerified(root, relative, maxAgentPromptBytes)
+	if err != nil {
+		return "", false, fmt.Errorf("read file prompt %q: %w", relative, err)
+	}
+	if !utf8.Valid(content) {
+		return "", false, fmt.Errorf("file prompt %q is not valid UTF-8", relative)
+	}
+	materialized := strings.TrimSpace(string(content))
+	if materialized == "" {
+		return "", false, fmt.Errorf("file prompt %q is empty", relative)
+	}
+	return materialized, true, nil
+}
+
+func hasWindowsVolumePrefix(relative string) bool {
+	return len(relative) >= 2 && relative[1] == ':' &&
+		(relative[0] >= 'a' && relative[0] <= 'z' || relative[0] >= 'A' && relative[0] <= 'Z')
+}
+
+// pruneRuntimeBundle removes every convention-based OpenCode discovery
+// surface after the complete effective config has been written. The immutable
+// source bundle remains untouched; the subsequently frozen digest covers this
+// one-file runtime projection.
+func pruneRuntimeBundle(bundleCopy string) error {
+	root, err := safefs.Open(filepath.Clean(bundleCopy))
+	if err != nil {
+		return fmt.Errorf("open copied OpenCode bundle for runtime projection: %w", err)
+	}
+	defer root.Close()
+
+	directory, err := root.Open(".")
+	if err != nil {
+		return fmt.Errorf("read copied OpenCode bundle for runtime projection: %w", err)
+	}
+	entries, readErr := directory.ReadDir(-1)
+	closeErr := directory.Close()
+	if readErr != nil {
+		return fmt.Errorf("read copied OpenCode bundle for runtime projection: %w", readErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close copied OpenCode bundle during runtime projection: %w", closeErr)
+	}
+	for _, entry := range entries {
+		if entry.Name() == "opencode.json" {
+			continue
+		}
+		if err := root.RemoveAll(entry.Name()); err != nil {
+			return fmt.Errorf("remove auto-discovered OpenCode bundle entry %q: %w", entry.Name(), err)
+		}
+	}
+	return nil
 }
 
 func pinCaseProviderConfig(base []byte, testCase contracts.Case) ([]byte, error) {

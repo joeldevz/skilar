@@ -67,6 +67,13 @@ patch en `source_git_*`; las copias sin `.git` no heredan esos valores como `git
 verificable localmente. El holdout nunca publica identificadores Git de origen y se
 rechaza si su worktree está sucio.
 
+El runtime local no entrega ese árbol completo a OpenCode. Deriva una proyección
+privada que inlinea de forma exacta los prompts `{file:REL}` ya autenticados y conserva
+únicamente el `opencode.json` fail-closed. Así, los directorios convencionales de
+commands, plugins, agents o skills no pueden reintroducir autoridad mediante
+autodescubrimiento. Se verifican por separado tanto el digest del bundle fuente como
+el de la proyección congelada.
+
 La especificación normativa es
 `eval/specs/skynex-orchestrator-contract.md`. Sus 22 requisitos son la autoridad; el
 prompt actual es un input del baseline, no la especificación. Esto resuelve
@@ -97,7 +104,9 @@ invalida el pin aunque el script permanezca igual. `doctor` publica tanto
 - `/path`: cwd y roots efectivos;
 - `/config`: configuración resuelta y tool policy efectiva;
 - `/agent`: agentes realmente disponibles;
-- `/experimental/tool/ids`: catálogo efectivo al que se enlaza la policy por caso;
+- `/experimental/tool/ids`: IDs del `ToolRegistry` nativo;
+- `/mcp`: estado sanitizado de cada MCP declarado. En OpenCode `1.18.16`, `connected`
+  sólo se publica después de `initialize`, `tools/list` y cachear sus definiciones;
 - `/provider`: providers conectados y modelos declarados cuando se pasa `--models`;
 - `/doc`: OpenAPI exacto;
 - soporte de `/session`, `/session/{id}`, `/session/{id}/children`,
@@ -392,9 +401,19 @@ secreto en inaccesible al proceso evaluado.
 ### Tool policy, proxy y MCPs falsos
 
 El harness genera una policy fail-closed: tools desconocidas denegadas, MCPs ambient
-deshabilitados, plugins/connectors vacíos y sólo fakes stdio locales declarados. Después
-verifica `/config` para detectar capas que reintroduzcan autoridad. Neurox, workers y
-side effects de tests se representan mediante fakes locales trazables.
+deshabilitados, plugins/connectors vacíos y sólo fakes stdio locales declarados. La
+proyección runtime elimina las superficies de autodescubrimiento y después verifica
+`/config` para detectar capas que reintroduzcan autoridad.
+`/experimental/tool/ids` no incluye los tools MCP en `1.18.16`; por ello, cada fake
+stdio queda detrás de un proxy del evaluador que observa la respuesta real
+`tools/list` consumida por esa misma instancia de OpenCode. El proxy exige el conjunto
+exacto declarado (incluida paginación y ausencia de duplicados), instala una
+atestación privada ligada a un nonce antes de reenviar la página final y no hereda las
+credenciales del runtime. El catálogo canónico combina los IDs nativos con esos IDs
+MCP atestados; `/mcp` aporta además la fence de readiness. Missing, extra, failed,
+colisiones, una atestación ausente o un MCP ambiental no-disabled invalidan el run.
+Neurox, workers y side effects de tests se representan mediante fakes locales
+trazables.
 
 Esta configuración no sustituye una frontera de ejecución. Para claims fuertes, las
 operaciones externas y credenciales de provider deben atravesar un proxy/gateway
@@ -482,8 +501,10 @@ un flujo usable de extremo a extremo.
   runtime altera `auth.json`, incluso por refresh, el run y la sesión quedan
   invalidados y ningún valor se copia al siguiente brazo.
 - **Hecho:** `doctor` y el factory prueban `/path`, `/config`, `/agent`,
-  `/experimental/tool/ids`, `/provider` y `/doc`; verifican las rutas requeridas sin
-  enviar prompts ni llamar a un modelo.
+  `/experimental/tool/ids`, `/mcp`, `/provider` y `/doc`; verifican las rutas
+  requeridas sin enviar prompts ni llamar a un modelo. El factory liga la policy al
+  catálogo canónico `ToolRegistry + herramientas MCP atestadas desde el tools/list
+  real`, no al endpoint nativo ni a nombres sintetizados desde el contrato.
 - **Hecho:** la traza recursiva se reconcilia antes de los jueces, exige SSE desde
   antes del primer prompt, cerca sesiones raíz paralelas, detecta eventos tardíos o
   mensajes/parts eliminados y exige el provider/model congelado en todas las
@@ -542,8 +563,9 @@ un flujo usable de extremo a extremo.
 
 ### Step 6 — Tool boundary, proxy y container — **parcial**
 
-- **Hecho:** policy fail-closed enlazada al catálogo runtime, fake MCP **stdio**
-  trazable (HTTP no forma parte del contrato v1), y
+- **Hecho:** policy fail-closed enlazada al catálogo runtime canónico, fake MCP
+  **stdio** trazable con `tools/list` exacto atestado y readiness cercada por `/mcp`
+  (HTTP no forma parte del contrato v1), y
   adapter Podman genérico argv-only con imagen por digest, mounts/límites y probes
   cubiertos mediante runtime falso.
 - **Hecho para desarrollo local:** perfil OAuth limpio y efímero con credencial

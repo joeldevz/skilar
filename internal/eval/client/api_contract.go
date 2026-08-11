@@ -9,8 +9,9 @@ import (
 )
 
 var (
-	ErrIncompatibleAPI        = errors.New("OpenCode API is incompatible")
-	ErrInvalidProviderCatalog = errors.New("OpenCode provider catalog is invalid")
+	ErrIncompatibleAPI         = errors.New("OpenCode API is incompatible")
+	ErrInvalidProviderCatalog  = errors.New("OpenCode provider catalog is invalid")
+	ErrInvalidMCPStatusCatalog = errors.New("OpenCode MCP status catalog is invalid")
 )
 
 // VerifyRequiredAPI validates the exact read/write routes used by the runner.
@@ -43,9 +44,10 @@ func VerifyRequiredAPI(raw json.RawMessage) ([]string, error) {
 		"/session/status":        {"GET"},
 		"/global/event":          {"GET"},
 		"/experimental/tool/ids": {"GET"},
+		"/mcp":                   {"GET"},
 		"/provider":              {"GET"},
 	}
-	verified := make([]string, 0, 9)
+	verified := make([]string, 0, 10)
 	for path, methods := range required {
 		for _, method := range methods {
 			if !available[path][method] {

@@ -5,7 +5,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -13,6 +16,7 @@ import (
 func TestGenerateFailClosedEffectiveConfigAndCanonicalDigest(t *testing.T) {
 	input := Input{
 		Base: json.RawMessage(`{
+			"$schema":"https://opencode.ai/config.json",
 			"provider":{"openai":{"name":"test"}},
 			"plugin":["ambient-mutator"],
 			"formatter":{"prettier":{"command":["npx","prettier"]}},
@@ -64,6 +68,12 @@ func TestGenerateFailClosedEffectiveConfigAndCanonicalDigest(t *testing.T) {
 	}
 	if _, exists := config["experimental"]; exists {
 		t.Fatalf("experimental authority survived: %#v", config["experimental"])
+	}
+	if _, exists := config["$schema"]; exists {
+		t.Fatalf("schema metadata survived runtime projection: %#v", config["$schema"])
+	}
+	if provider, ok := config["provider"].(map[string]any); !ok || len(provider) != 0 {
+		t.Fatalf("provider authority survived runtime projection: %#v", config["provider"])
 	}
 	mcp := config["mcp"].(map[string]any)
 	for _, name := range []string{"context7", "exa"} {
@@ -191,6 +201,11 @@ func TestGenerateRejectsUnsafeAuthority(t *testing.T) {
 		{"shell fake executable", func(input *Input) { input.FakeMCPs[0].Command[0] = "/bin/sh" }},
 		{"environment trampoline", func(input *Input) { input.FakeMCPs[0].Command = []string{"/usr/bin/env", "sh", "-c", "echo unsafe"} }},
 		{"fake credential", func(input *Input) { input.FakeMCPs[0].Environment = map[string]string{"API_TOKEN": "secret"} }},
+		{"fake HOME override", func(input *Input) { input.FakeMCPs[0].Environment = map[string]string{"HOME": "/tmp/escape"} }},
+		{"fake loader override", func(input *Input) { input.FakeMCPs[0].Environment = map[string]string{"LD_PRELOAD": "/tmp/escape.so"} }},
+		{"fake manifest override", func(input *Input) {
+			input.FakeMCPs[0].Environment = map[string]string{"SKYNEX_EVAL_MCP_PROXY_MANIFEST": "/tmp/escape"}
+		}},
 		{"undeclared fake tool", func(input *Input) { input.FakeMCPs[0].Tools = append(input.FakeMCPs[0].Tools, "neurox_recall") }},
 		{"case-insensitive allow forbid overlap", func(input *Input) { input.ForbiddenTools = []string{"READ"} }},
 		{"trailing JSON", func(input *Input) { input.Base = json.RawMessage(`{} {}`) }},
@@ -206,6 +221,38 @@ func TestGenerateRejectsUnsafeAuthority(t *testing.T) {
 		}},
 		{"credentialed provider URL", func(input *Input) {
 			input.Base = json.RawMessage(`{"provider":{"openai":{"options":{"baseURL":"https://user:pass@proxy.invalid/v1"}}}}`)
+		}},
+		{"instructions file", func(input *Input) {
+			input.Base = json.RawMessage(`{"instructions":["/tmp/ambient.md"]}`)
+		}},
+		{"instructions URL", func(input *Input) {
+			input.Base = json.RawMessage(`{"instructions":["https://attacker.invalid/prompt.md"]}`)
+		}},
+		{"skills", func(input *Input) { input.Base = json.RawMessage(`{"skills":{"paths":["/tmp/skills"]}}`) }},
+		{"references", func(input *Input) { input.Base = json.RawMessage(`{"references":["https://attacker.invalid"]}`) }},
+		{"reference", func(input *Input) { input.Base = json.RawMessage(`{"reference":"/tmp/reference.md"}`) }},
+		{"shell", func(input *Input) { input.Base = json.RawMessage(`{"shell":{"command":["/bin/sh"]}}`) }},
+		{"server", func(input *Input) { input.Base = json.RawMessage(`{"server":{"hostname":"0.0.0.0"}}`) }},
+		{"enterprise", func(input *Input) { input.Base = json.RawMessage(`{"enterprise":{"url":"https://attacker.invalid"}}`) }},
+		{"default agent", func(input *Input) { input.Base = json.RawMessage(`{"default_agent":"ambient"}`) }},
+		{"disabled providers", func(input *Input) { input.Base = json.RawMessage(`{"disabled_providers":["openai"]}`) }},
+		{"unknown root field", func(input *Input) {
+			input.Base = json.RawMessage(`{"future_authority":{"command":["/bin/sh"]}}`)
+		}},
+		{"unknown agent field", func(input *Input) {
+			input.Base = json.RawMessage(`{"agent":{"orchestrator":{"options":{"headers":{"X-Authority":"ambient"}}}}}`)
+		}},
+		{"residual file substitution", func(input *Input) {
+			input.Base = json.RawMessage(`{"agent":{"orchestrator":{"prompt":"materialized {file:/tmp/ambient.md}"}}}`)
+		}},
+		{"residual environment substitution", func(input *Input) {
+			input.Base = json.RawMessage(`{"agent":{"orchestrator":{"description":"{env:OPENAI_API_KEY}"}}}`)
+		}},
+		{"fake command substitution", func(input *Input) {
+			input.FakeMCPs[0].Command = append(input.FakeMCPs[0].Command, "{file:/tmp/argument}")
+		}},
+		{"fake environment substitution", func(input *Input) {
+			input.FakeMCPs[0].Environment = map[string]string{"SCENARIO": "{env:OPENAI_API_KEY}"}
 		}},
 		{"ambiguous raw fake alias", func(input *Input) {
 			input.FakeMCPs = append(input.FakeMCPs, FakeMCP{Name: "second", Command: []string{"/opt/second"}, Tools: []string{"neurox_context"}})
@@ -230,6 +277,71 @@ func TestGenerateRejectsUnsafeAuthority(t *testing.T) {
 				t.Fatalf("error = %v, want ErrUnsafePolicy", err)
 			}
 		})
+	}
+}
+
+func TestGenerateAcceptsMaterializedPublicBundleProjection(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate policy test source")
+	}
+	repositoryRoot := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", "..", ".."))
+	bundleRoot := filepath.Join(repositoryRoot, "internal", "assets", "data", "opencode")
+	raw, err := os.ReadFile(filepath.Join(bundleRoot, "opencode.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config map[string]any
+	if err := json.Unmarshal(raw, &config); err != nil {
+		t.Fatal(err)
+	}
+	agents, ok := config["agent"].(map[string]any)
+	if !ok || len(agents) == 0 {
+		t.Fatalf("public bundle agents = %#v", config["agent"])
+	}
+	for name, rawAgent := range agents {
+		agent, ok := rawAgent.(map[string]any)
+		if !ok {
+			t.Fatalf("public bundle agent %q = %#v", name, rawAgent)
+		}
+		prompt, ok := agent["prompt"].(string)
+		if !ok || !strings.HasPrefix(prompt, "{file:./") || !strings.HasSuffix(prompt, "}") {
+			t.Fatalf("public bundle agent %q prompt = %#v", name, agent["prompt"])
+		}
+		relative := strings.TrimSuffix(strings.TrimPrefix(prompt, "{file:./"), "}")
+		if filepath.Clean(relative) != filepath.FromSlash(relative) || strings.HasPrefix(relative, "..") {
+			t.Fatalf("public bundle agent %q has unsafe prompt path %q", name, relative)
+		}
+		content, err := os.ReadFile(filepath.Join(bundleRoot, filepath.FromSlash(relative)))
+		if err != nil {
+			t.Fatalf("read public bundle agent %q prompt: %v", name, err)
+		}
+		agent["prompt"] = strings.TrimSpace(string(content))
+	}
+	config["model"] = "openai/gpt-5.6-terra"
+	config["small_model"] = "openai/gpt-5.6-terra"
+	config["enabled_providers"] = []any{"openai"}
+	config["provider"] = map[string]any{}
+	materialized, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effective, err := Generate(Input{Base: materialized, AllowedTools: []string{"read"}})
+	if err != nil {
+		t.Fatalf("materialized public bundle projection failed: %v", err)
+	}
+	var projected map[string]any
+	if err := json.Unmarshal(effective.Config, &projected); err != nil {
+		t.Fatal(err)
+	}
+	projectedAgents, ok := projected["agent"].(map[string]any)
+	if !ok || len(projectedAgents) != len(agents) {
+		t.Fatalf("projected public agents = %d, want %d", len(projectedAgents), len(agents))
+	}
+	for _, forbidden := range []string{"$schema", "instructions", "skills", "references", "shell", "server", "enterprise"} {
+		if _, exists := projected[forbidden]; exists {
+			t.Fatalf("public runtime projection retained %q", forbidden)
+		}
 	}
 }
 

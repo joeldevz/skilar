@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/joeldevz/skynex/internal/eval/client"
+	"github.com/joeldevz/skynex/internal/eval/mcpproxy"
 )
 
 const (
@@ -69,6 +70,10 @@ type Config struct {
 	// these two fields.
 	EnvAllowlist []string
 	Env          map[string]string
+	// MCPProxyManifest is evaluator-owned runtime authority. Unlike Env it is
+	// installed only after reserved-environment validation and must be a
+	// protected file contained by RunDir.
+	MCPProxyManifest string
 
 	ShutdownTimeout time.Duration
 	HealthTimeout   time.Duration
@@ -137,14 +142,15 @@ type Server struct {
 // a model. Raw documents remain in memory; callers decide whether a sanitized
 // copy is safe to persist.
 type ProbeEvidence struct {
-	CapturedAt time.Time              `json:"captured_at"`
-	Health     client.HealthInfo      `json:"health"`
-	Path       client.RawDocument     `json:"path"`
-	Config     client.RawDocument     `json:"config"`
-	Agents     client.RawDocument     `json:"agents"`
-	Tools      client.RawDocument     `json:"tools"`
-	Providers  client.ProviderCatalog `json:"providers"`
-	OpenAPI    client.RawDocument     `json:"openapi"`
+	CapturedAt time.Time               `json:"captured_at"`
+	Health     client.HealthInfo       `json:"health"`
+	Path       client.RawDocument      `json:"path"`
+	Config     client.RawDocument      `json:"config"`
+	Agents     client.RawDocument      `json:"agents"`
+	Tools      client.RawDocument      `json:"tools"`
+	MCP        client.MCPStatusCatalog `json:"mcp"`
+	Providers  client.ProviderCatalog  `json:"providers"`
+	OpenAPI    client.RawDocument      `json:"openapi"`
 }
 
 // VersionMismatchError is a hard compatibility fence, not a transient
@@ -252,6 +258,20 @@ func (s *Server) Start(ctx context.Context) error {
 		return err
 	}
 	s.privateEnvDirs = privateEnvironmentPaths(env)
+	if s.cfg.MCPProxyManifest != "" {
+		manifest := filepath.Clean(s.cfg.MCPProxyManifest)
+		relative, relErr := filepath.Rel(s.runDir, manifest)
+		info, statErr := os.Lstat(manifest)
+		if !filepath.IsAbs(manifest) || manifest != s.cfg.MCPProxyManifest || relErr != nil || relative == "." || relative == ".." ||
+			strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) || statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+			s.mu.Unlock()
+			_ = s.closeLog()
+			_ = s.cleanupPrivateEnvironment()
+			s.markStopped()
+			return errors.New("protected MCP proxy manifest is invalid")
+		}
+		env = replaceEnvironmentValue(env, mcpproxy.ManifestEnvironment, manifest)
+	}
 	// --pure disables external plugins, while this evaluator-owned switch also
 	// prevents a candidate fixture from injecting project configuration before
 	// the runtime contract is probed.
@@ -712,6 +732,11 @@ func (s *Server) Probe(ctx context.Context) (ProbeEvidence, error) {
 	} else {
 		evidence.Tools = doc
 	}
+	if catalog, err := c.GetMCPStatusCatalogContext(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("probe /mcp: %w", err))
+	} else {
+		evidence.MCP = catalog
+	}
 	if providers, err := c.GetProviderCatalogContext(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("probe /provider: %w", err))
 	} else {
@@ -969,6 +994,9 @@ func privateEnvironmentPaths(env []string) []string {
 
 func isReservedEvaluationEnvironment(key string) bool {
 	upper := strings.ToUpper(key)
+	if upper == mcpproxy.ManifestEnvironment {
+		return true
+	}
 	if upper == "HOME" || upper == "TMPDIR" || upper == "TEMP" || upper == "TMP" ||
 		upper == "APPDATA" || upper == "LOCALAPPDATA" || upper == "USERPROFILE" ||
 		upper == "LANG" || upper == "LC_ALL" || upper == "TZ" ||

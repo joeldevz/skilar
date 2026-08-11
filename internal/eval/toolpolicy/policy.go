@@ -49,6 +49,26 @@ var forbiddenFakeExecutables = map[string]struct{}{
 	"powershell.exe": {}, "pwsh": {}, "sh": {}, "zsh": {},
 }
 
+// Generate accepts only the OpenCode fields the evaluator either projects or
+// replaces below. Rejecting every other field keeps new/unknown OpenCode config
+// surfaces from silently becoming runtime authority after a binary upgrade.
+var acceptedBaseConfigFields = map[string]struct{}{
+	"$schema": {}, "agent": {}, "mode": {}, "model": {}, "small_model": {},
+	"enabled_providers": {}, "mcp": {}, "plugin": {}, "provider": {},
+	"command": {}, "tools": {}, "permission": {}, "formatter": {}, "lsp": {},
+	"share": {}, "autoshare": {}, "autoupdate": {}, "experimental": {},
+}
+
+var effectiveConfigFields = map[string]struct{}{
+	"agent": {}, "mode": {}, "model": {}, "small_model": {}, "enabled_providers": {},
+	"mcp": {}, "plugin": {}, "provider": {}, "command": {}, "tools": {}, "permission": {},
+	"formatter": {}, "lsp": {}, "share": {}, "autoshare": {}, "autoupdate": {},
+}
+
+var projectedAgentFields = map[string]struct{}{
+	"description": {}, "mode": {}, "model": {}, "prompt": {}, "tools": {}, "permission": {},
+}
+
 type FakeMCP struct {
 	Name string `json:"name"`
 	// Command is an evaluator-owned, already-resolved stdio command. Generate
@@ -75,6 +95,24 @@ type Effective struct {
 	FakeToolBindings []FakeToolBinding `json:"fake_tool_bindings,omitempty"`
 	EnabledFakes     []string          `json:"enabled_fakes,omitempty"`
 	DisabledMCPs     []string          `json:"disabled_mcps,omitempty"`
+	// MCPAttestations and MCPProxy are fresh/private runtime authority. They
+	// are deliberately excluded from JSON so nonces and run-local paths cannot
+	// perturb the content-addressed effective OpenCode configuration or leak
+	// into evaluator artifacts.
+	MCPAttestations []MCPAttestationBinding `json:"-"`
+	MCPProxy        MCPProxyIdentity        `json:"-"`
+}
+
+type MCPAttestationBinding struct {
+	MCPName         string
+	RawTools        []string
+	AttestationPath string
+	Nonce           string
+}
+
+type MCPProxyIdentity struct {
+	Path          string
+	ContentDigest string
 }
 
 // FakeToolBinding records the distinction between the raw name returned by an
@@ -171,6 +209,17 @@ func validateEffective(effective Effective) (map[string]bool, error) {
 	if err != nil || !bytes.Equal(canonical, effective.Config) {
 		return nil, fmt.Errorf("%w: effective config is not canonical", ErrUnsafePolicy)
 	}
+	for key := range config {
+		if _, allowed := effectiveConfigFields[key]; !allowed {
+			return nil, fmt.Errorf("%w: unexpected effective config field %q", ErrUnsafePolicy, key)
+		}
+	}
+	if err := validateProjectedAgents(config); err != nil {
+		return nil, err
+	}
+	if err := rejectRuntimeConfigSubstitutions(config); err != nil {
+		return nil, err
+	}
 	command, ok := config["command"].(map[string]any)
 	if !ok || len(command) != 0 {
 		return nil, fmt.Errorf("%w: effective command catalogue must be an empty object", ErrUnsafePolicy)
@@ -189,8 +238,9 @@ func validateEffective(effective Effective) (map[string]bool, error) {
 	if _, exists := config["experimental"]; exists {
 		return nil, fmt.Errorf("%w: effective experimental configuration is forbidden", ErrUnsafePolicy)
 	}
-	if err := rejectInlineProviderCredentials(config["provider"]); err != nil {
-		return nil, err
+	providers, ok := config["provider"].(map[string]any)
+	if !ok || len(providers) != 0 {
+		return nil, fmt.Errorf("%w: effective provider configuration must be an empty object", ErrUnsafePolicy)
 	}
 	rawTools, ok := config["tools"].(map[string]any)
 	if !ok {
@@ -307,20 +357,20 @@ func Generate(input Input) (Effective, error) {
 	if err != nil {
 		return Effective{}, err
 	}
-	base := make(map[string]any)
+	source := make(map[string]any)
 	if len(normalized.Base) > maxPolicyJSONBytes {
 		return Effective{}, fmt.Errorf("%w: base config exceeds %d bytes", ErrUnsafePolicy, maxPolicyJSONBytes)
 	}
 	if len(bytes.TrimSpace(normalized.Base)) != 0 {
 		decoder := json.NewDecoder(bytes.NewReader(normalized.Base))
 		decoder.UseNumber()
-		if err := decoder.Decode(&base); err != nil {
+		if err := decoder.Decode(&source); err != nil {
 			return Effective{}, fmt.Errorf("%w: decode base config: %v", ErrUnsafePolicy, err)
 		}
 		if trailingErr := decoder.Decode(new(any)); !errors.Is(trailingErr, io.EOF) {
 			return Effective{}, fmt.Errorf("%w: base config contains multiple JSON values", ErrUnsafePolicy)
 		}
-		if base == nil {
+		if source == nil {
 			return Effective{}, fmt.Errorf("%w: base config must be a JSON object, not null", ErrUnsafePolicy)
 		}
 	}
@@ -329,17 +379,21 @@ func Generate(input Input) (Effective, error) {
 	for _, name := range normalized.AmbientMCPNames {
 		ambient[name] = struct{}{}
 	}
-	if rawMCP, ok := base["mcp"].(map[string]any); ok {
+	if rawMCP, ok := source["mcp"].(map[string]any); ok {
 		for name := range rawMCP {
 			if !namePattern.MatchString(name) {
 				return Effective{}, fmt.Errorf("%w: invalid ambient MCP name %q", ErrUnsafePolicy, name)
 			}
 			ambient[name] = struct{}{}
 		}
-	} else if value, exists := base["mcp"]; exists && value != nil {
+	} else if value, exists := source["mcp"]; exists && value != nil {
 		return Effective{}, fmt.Errorf("%w: base mcp field must be an object", ErrUnsafePolicy)
 	}
-	if err := rejectInlineProviderCredentials(base["provider"]); err != nil {
+	if err := rejectInlineProviderCredentials(source["provider"]); err != nil {
+		return Effective{}, err
+	}
+	base, err := projectEvaluatorConfig(source)
+	if err != nil {
 		return Effective{}, err
 	}
 
@@ -392,6 +446,10 @@ func Generate(input Input) (Effective, error) {
 	}
 	base["mcp"] = mcp
 	base["plugin"] = []string{}
+	// Provider packages, endpoints, and options are runtime authority. The
+	// evaluator pins the provider/model selection separately; OpenCode supplies
+	// the built-in provider implementation.
+	base["provider"] = map[string]any{}
 	// OpenCode otherwise injects built-in command templates into the resolved
 	// config. Evaluation prompts do not need slash commands, so pin an empty
 	// evaluator-owned map and make any layered addition observable.
@@ -408,6 +466,9 @@ func Generate(input Input) (Effective, error) {
 		if err := applyAgentBoundary(base, field, tools, permission); err != nil {
 			return Effective{}, err
 		}
+	}
+	if err := rejectRuntimeConfigSubstitutions(base); err != nil {
+		return Effective{}, err
 	}
 
 	raw, err := json.Marshal(base)
@@ -429,6 +490,178 @@ func Generate(input Input) (Effective, error) {
 		EnabledFakes:     enabledFakes,
 		DisabledMCPs:     disabled,
 	}, nil
+}
+
+func projectEvaluatorConfig(source map[string]any) (map[string]any, error) {
+	for key := range source {
+		if _, accepted := acceptedBaseConfigFields[key]; !accepted {
+			return nil, fmt.Errorf("%w: base config field %q is not permitted by the evaluator projection", ErrUnsafePolicy, key)
+		}
+	}
+
+	projected := make(map[string]any, 6)
+	for _, field := range []string{"agent", "mode"} {
+		value, exists := source[field]
+		if !exists {
+			continue
+		}
+		agents, err := projectAgentEntries(field, value)
+		if err != nil {
+			return nil, err
+		}
+		projected[field] = agents
+	}
+	for _, field := range []string{"model", "small_model"} {
+		value, exists := source[field]
+		if !exists {
+			continue
+		}
+		text, ok := value.(string)
+		if !ok || text == "" || strings.TrimSpace(text) != text {
+			return nil, fmt.Errorf("%w: base %s field must be a non-empty trimmed string", ErrUnsafePolicy, field)
+		}
+		projected[field] = text
+	}
+	if rawProviders, exists := source["enabled_providers"]; exists {
+		values, ok := rawProviders.([]any)
+		if !ok {
+			return nil, fmt.Errorf("%w: base enabled_providers field must be an array", ErrUnsafePolicy)
+		}
+		providers := make([]string, 0, len(values))
+		for _, raw := range values {
+			provider, ok := raw.(string)
+			if !ok {
+				return nil, fmt.Errorf("%w: base enabled_providers entries must be strings", ErrUnsafePolicy)
+			}
+			providers = append(providers, provider)
+		}
+		normalized, err := normalizeNames("enabled provider", providers)
+		if err != nil {
+			return nil, err
+		}
+		projected["enabled_providers"] = normalized
+	}
+	return projected, nil
+}
+
+func projectAgentEntries(field string, value any) (map[string]any, error) {
+	agents, ok := value.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("%w: base %s field must be an object", ErrUnsafePolicy, field)
+	}
+	projected := make(map[string]any, len(agents))
+	for name, rawEntry := range agents {
+		if !namePattern.MatchString(name) {
+			return nil, fmt.Errorf("%w: invalid base %s name %q", ErrUnsafePolicy, field, name)
+		}
+		entry, ok := rawEntry.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("%w: %s %q must be an object", ErrUnsafePolicy, field, name)
+		}
+		kept := make(map[string]any, 4)
+		for key, raw := range entry {
+			if _, accepted := projectedAgentFields[key]; !accepted {
+				return nil, fmt.Errorf("%w: base %s %q field %q is not permitted by the evaluator projection", ErrUnsafePolicy, field, name, key)
+			}
+			if key == "tools" || key == "permission" {
+				continue
+			}
+			text, ok := raw.(string)
+			if !ok {
+				return nil, fmt.Errorf("%w: base %s %q field %q must be a string", ErrUnsafePolicy, field, name, key)
+			}
+			kept[key] = text
+		}
+		projected[name] = kept
+	}
+	return projected, nil
+}
+
+func validateProjectedAgents(config map[string]any) error {
+	for _, field := range []string{"agent", "mode"} {
+		rawAgents, exists := config[field]
+		if !exists {
+			continue
+		}
+		agents, ok := rawAgents.(map[string]any)
+		if !ok {
+			return fmt.Errorf("%w: effective %s field must be an object", ErrUnsafePolicy, field)
+		}
+		for name, rawEntry := range agents {
+			if !namePattern.MatchString(name) {
+				return fmt.Errorf("%w: invalid effective %s name %q", ErrUnsafePolicy, field, name)
+			}
+			entry, ok := rawEntry.(map[string]any)
+			if !ok {
+				return fmt.Errorf("%w: effective %s %q must be an object", ErrUnsafePolicy, field, name)
+			}
+			for key := range entry {
+				if _, accepted := projectedAgentFields[key]; !accepted {
+					return fmt.Errorf("%w: unexpected effective %s %q field %q", ErrUnsafePolicy, field, name, key)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func rejectRuntimeConfigSubstitutions(config any) error {
+	nodes := 0
+	return scanRuntimeConfigSubstitutions(config, "config", 0, &nodes)
+}
+
+func scanRuntimeConfigSubstitutions(value any, location string, depth int, nodes *int) error {
+	(*nodes)++
+	if depth > 32 || *nodes > 100_000 {
+		return fmt.Errorf("%w: projected runtime config is too deeply nested or complex", ErrUnsafePolicy)
+	}
+	check := func(text string) error {
+		if strings.Contains(text, "{file:") || strings.Contains(text, "{env:") {
+			return fmt.Errorf("%w: %s retains an unresolved OpenCode config substitution", ErrUnsafePolicy, location)
+		}
+		return nil
+	}
+	switch typed := value.(type) {
+	case string:
+		return check(typed)
+	case map[string]any:
+		for key, child := range typed {
+			if err := check(key); err != nil {
+				return err
+			}
+			if err := scanRuntimeConfigSubstitutions(child, location+"."+key, depth+1, nodes); err != nil {
+				return err
+			}
+		}
+	case map[string]string:
+		for key, child := range typed {
+			if err := check(key); err != nil {
+				return err
+			}
+			if err := check(child); err != nil {
+				return err
+			}
+		}
+	case map[string]bool:
+		for key := range typed {
+			if err := check(key); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for index, child := range typed {
+			if err := scanRuntimeConfigSubstitutions(child, fmt.Sprintf("%s[%d]", location, index), depth+1, nodes); err != nil {
+				return err
+			}
+		}
+	case []string:
+		for _, child := range typed {
+			if err := check(child); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func bindFakeTools(fakes []FakeMCP, declaredAllowed map[string]struct{}) ([]FakeToolBinding, map[string]struct{}, error) {
@@ -599,6 +832,9 @@ func normalizeInput(input Input) (Input, error) {
 		}
 	}
 	input.FakeMCPs = fakes
+	if err := ValidateFakeExecutionBoundary(input.FakeMCPs); err != nil {
+		return Input{}, err
+	}
 	rawFakeTools := make(map[string]string)
 	for _, fake := range input.FakeMCPs {
 		for _, rawTool := range fake.Tools {
@@ -647,25 +883,6 @@ func normalizeInput(input Input) (Input, error) {
 			return Input{}, fmt.Errorf("%w: duplicate fake MCP %q", ErrUnsafePolicy, fake.Name)
 		}
 		seenFakes[fake.Name] = struct{}{}
-		if len(fake.Command) == 0 || !filepath.IsAbs(fake.Command[0]) {
-			return Input{}, fmt.Errorf("%w: fake MCP %q command must start with an absolute executable", ErrUnsafePolicy, fake.Name)
-		}
-		if _, shell := forbiddenFakeExecutables[strings.ToLower(filepath.Base(fake.Command[0]))]; shell {
-			return Input{}, fmt.Errorf("%w: fake MCP %q uses forbidden shell executable", ErrUnsafePolicy, fake.Name)
-		}
-		if len(fake.Command) > 256 {
-			return Input{}, fmt.Errorf("%w: fake MCP %q command exceeds 256 arguments", ErrUnsafePolicy, fake.Name)
-		}
-		commandBytes := 0
-		for _, arg := range fake.Command {
-			if strings.IndexByte(arg, 0) >= 0 {
-				return Input{}, fmt.Errorf("%w: fake MCP %q command contains NUL", ErrUnsafePolicy, fake.Name)
-			}
-			commandBytes += len(arg)
-			if commandBytes > 64<<10 {
-				return Input{}, fmt.Errorf("%w: fake MCP %q command exceeds 64KiB", ErrUnsafePolicy, fake.Name)
-			}
-		}
 		fake.Tools, err = normalizeNames("fake MCP tool", fake.Tools)
 		if err != nil {
 			return Input{}, err
@@ -673,25 +890,62 @@ func normalizeInput(input Input) (Input, error) {
 		if len(fake.Tools) == 0 {
 			return Input{}, fmt.Errorf("%w: fake MCP %q must declare its tools", ErrUnsafePolicy, fake.Name)
 		}
+	}
+	sort.Slice(input.FakeMCPs, func(i, j int) bool { return input.FakeMCPs[i].Name < input.FakeMCPs[j].Name })
+	return input, nil
+}
+
+// ValidateFakeExecutionBoundary validates the original child authority before
+// a caller replaces it with an evaluator-owned proxy command. Generate calls
+// the same helper, so wrapping cannot hide a shell trampoline, credential-like
+// environment, reserved runtime control, or size violation.
+func ValidateFakeExecutionBoundary(fakes []FakeMCP) error {
+	seenNames := make(map[string]struct{}, len(fakes))
+	for _, fake := range fakes {
+		if !namePattern.MatchString(fake.Name) {
+			return fmt.Errorf("%w: invalid fake MCP name %q", ErrUnsafePolicy, fake.Name)
+		}
+		if _, duplicate := seenNames[fake.Name]; duplicate {
+			return fmt.Errorf("%w: duplicate fake MCP %q", ErrUnsafePolicy, fake.Name)
+		}
+		seenNames[fake.Name] = struct{}{}
+		if len(fake.Command) == 0 || !filepath.IsAbs(fake.Command[0]) {
+			return fmt.Errorf("%w: fake MCP %q command must start with an absolute executable", ErrUnsafePolicy, fake.Name)
+		}
+		if _, shell := forbiddenFakeExecutables[strings.ToLower(filepath.Base(fake.Command[0]))]; shell {
+			return fmt.Errorf("%w: fake MCP %q uses forbidden shell executable", ErrUnsafePolicy, fake.Name)
+		}
+		if len(fake.Command) > 256 {
+			return fmt.Errorf("%w: fake MCP %q command exceeds 256 arguments", ErrUnsafePolicy, fake.Name)
+		}
+		commandBytes := 0
+		for _, arg := range fake.Command {
+			if strings.IndexByte(arg, 0) >= 0 {
+				return fmt.Errorf("%w: fake MCP %q command contains NUL", ErrUnsafePolicy, fake.Name)
+			}
+			commandBytes += len(arg)
+			if commandBytes > 64<<10 {
+				return fmt.Errorf("%w: fake MCP %q command exceeds 64KiB", ErrUnsafePolicy, fake.Name)
+			}
+		}
 		if len(fake.Environment) > 128 {
-			return Input{}, fmt.Errorf("%w: fake MCP %q environment exceeds 128 entries", ErrUnsafePolicy, fake.Name)
+			return fmt.Errorf("%w: fake MCP %q environment exceeds 128 entries", ErrUnsafePolicy, fake.Name)
 		}
 		environmentBytes := 0
 		for key, value := range fake.Environment {
 			if !envNamePattern.MatchString(key) || strings.IndexByte(value, 0) >= 0 {
-				return Input{}, fmt.Errorf("%w: fake MCP %q has invalid environment entry", ErrUnsafePolicy, fake.Name)
+				return fmt.Errorf("%w: fake MCP %q has invalid environment entry", ErrUnsafePolicy, fake.Name)
 			}
-			if secretEnvironmentKey(key) {
-				return Input{}, fmt.Errorf("%w: fake MCP %q has credential-like environment key %q", ErrUnsafePolicy, fake.Name, key)
+			if secretEnvironmentKey(key) || reservedFakeEnvironmentKey(key) {
+				return fmt.Errorf("%w: fake MCP %q has credential-like or reserved environment key %q", ErrUnsafePolicy, fake.Name, key)
 			}
 			environmentBytes += len(key) + len(value) + 1
 			if environmentBytes > 64<<10 {
-				return Input{}, fmt.Errorf("%w: fake MCP %q environment exceeds 64KiB", ErrUnsafePolicy, fake.Name)
+				return fmt.Errorf("%w: fake MCP %q environment exceeds 64KiB", ErrUnsafePolicy, fake.Name)
 			}
 		}
 	}
-	sort.Slice(input.FakeMCPs, func(i, j int) bool { return input.FakeMCPs[i].Name < input.FakeMCPs[j].Name })
-	return input, nil
+	return nil
 }
 
 func normalizeNames(label string, values []string) ([]string, error) {
@@ -766,6 +1020,20 @@ func secretEnvironmentKey(key string) bool {
 		if strings.Contains(upper, fragment) {
 			return true
 		}
+	}
+	return false
+}
+
+func reservedFakeEnvironmentKey(key string) bool {
+	upper := strings.ToUpper(key)
+	if upper == "SKYNEX_EVAL_MCP_PROXY_MANIFEST" || upper == "PATH" || upper == "HOME" || upper == "TMPDIR" || upper == "TEMP" || upper == "TMP" ||
+		upper == "LANG" || upper == "LC_ALL" || upper == "TZ" || upper == "ENV" ||
+		upper == "BASH_ENV" || upper == "SHELLOPTS" || upper == "BASHOPTS" || upper == "ZDOTDIR" ||
+		upper == "NODE_OPTIONS" || upper == "NODE_PATH" || upper == "BUN_OPTIONS" || upper == "DENO_DIR" ||
+		strings.HasPrefix(upper, "XDG_") || strings.HasPrefix(upper, "OPENCODE_") ||
+		strings.HasPrefix(upper, "LD_") || strings.HasPrefix(upper, "DYLD_") || strings.HasPrefix(upper, "GO") ||
+		strings.HasPrefix(upper, "PYTHON") || strings.HasPrefix(upper, "RUBY") || strings.HasPrefix(upper, "PERL") {
+		return true
 	}
 	return false
 }

@@ -1236,7 +1236,7 @@ func TestEngineV1DetectsFixtureAndBundleDrift(t *testing.T) {
 		},
 		{
 			name: "frozen bundle", withBundle: true, mutate: func(_ testEnvironment, request RuntimeRequest) error {
-				path := filepath.Join(request.ConfigRoot, "opencode", "agent.md")
+				path := filepath.Join(request.ConfigRoot, "opencode", "opencode.json")
 				if err := os.Chmod(path, 0o600); err != nil {
 					return err
 				}

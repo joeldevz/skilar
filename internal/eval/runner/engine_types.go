@@ -78,19 +78,20 @@ type ProvenanceInputs struct {
 }
 
 type EngineConfig struct {
-	RunParent         string
-	FixtureRoot       string
-	AgentBundleRoot   string
-	BundleDigest      string
-	Factory           RuntimeFactory
-	ExecutableClosure *ExecutableClosure
-	Pricing           metrics.PricingTable
-	Provenance        ProvenanceInputs
-	SnapshotLimits    sandbox.SnapshotLimits
-	TraceOptions      trace.Options
-	TraceDir          string
-	Clock             func() time.Time
-	NewRunID          func() (string, error)
+	RunParent             string
+	FixtureRoot           string
+	AgentBundleRoot       string
+	BundleDigest          string
+	Factory               RuntimeFactory
+	ExecutableClosure     *ExecutableClosure
+	Pricing               metrics.PricingTable
+	Provenance            ProvenanceInputs
+	SnapshotLimits        sandbox.SnapshotLimits
+	TraceOptions          trace.Options
+	EventReadinessTimeout time.Duration
+	TraceDir              string
+	Clock                 func() time.Time
+	NewRunID              func() (string, error)
 }
 
 type RunRequest struct {

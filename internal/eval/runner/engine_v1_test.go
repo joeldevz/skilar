@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -91,6 +92,7 @@ type fakeRuntime struct {
 	statuses map[string]client.SessionStatus
 
 	response    *client.Response
+	create      func(context.Context, string) (*client.Session, error)
 	send        func(context.Context, string, client.SendMessageRequest) (*client.Response, error)
 	getMessage  func(context.Context, string, string) (*client.Message, error)
 	getMessages func(context.Context, string) ([]client.Message, error)
@@ -189,20 +191,24 @@ func newHealthyFakeGlobalEventSource(root client.Session) (*httptest.Server, tra
 	properties, _ := json.Marshal(struct {
 		Info client.Session `json:"info"`
 	}{Info: root})
-	envelope, _ := json.Marshal(struct {
-		Directory string       `json:"directory"`
-		Payload   client.Event `json:"payload"`
-	}{
-		Directory: root.Directory,
-		Payload:   client.Event{Type: "session.created", Properties: properties},
-	})
+	events := []client.Event{
+		{Type: "server.connected", Properties: json.RawMessage(`{}`)},
+		{Type: "server.heartbeat", Properties: json.RawMessage(`{}`)},
+		{Type: "session.created", Properties: properties},
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/global/event" {
 			http.NotFound(w, r)
 			return
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = fmt.Fprintf(w, "id: root-created\ndata: %s\n\n", envelope)
+		for index, event := range events {
+			envelope, _ := json.Marshal(struct {
+				Directory string       `json:"directory"`
+				Payload   client.Event `json:"payload"`
+			}{Directory: root.Directory, Payload: event})
+			_, _ = fmt.Fprintf(w, "id: healthy-%d\ndata: %s\n\n", index+1, envelope)
+		}
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
 		}
@@ -231,9 +237,12 @@ func (r *fakeRuntime) Close() error {
 	return closeErr
 }
 
-func (r *fakeRuntime) CreateSessionContext(ctx context.Context, _ string) (*client.Session, error) {
+func (r *fakeRuntime) CreateSessionContext(ctx context.Context, title string) (*client.Session, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if r.create != nil {
+		return r.create(ctx, title)
 	}
 	copy := r.root
 	return &copy, nil
@@ -498,6 +507,10 @@ func traceOptionsOnePass() trace.Options {
 
 func newTestGlobalEventSource(t *testing.T, events []client.GlobalEvent) trace.EventSource {
 	t.Helper()
+	events = append([]client.GlobalEvent{
+		{Payload: client.Event{Type: "server.connected", Properties: json.RawMessage(`{}`)}},
+		{Payload: client.Event{Type: "server.heartbeat", Properties: json.RawMessage(`{}`)}},
+	}, events...)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/global/event" {
 			http.NotFound(w, r)
@@ -1205,6 +1218,172 @@ func TestEngineV1NeverPassesWhenRequestedTraceCannotBePersisted(t *testing.T) {
 	}
 	if err := result.Validate(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestEngineV1CreatesSessionAfterGlobalHeartbeat(t *testing.T) {
+	environment := newTestEnvironment(t, false)
+	streamOpen := make(chan struct{})
+	sendConnected := make(chan struct{})
+	connectedSent := make(chan struct{})
+	sendHeartbeat := make(chan struct{})
+	createCalled := make(chan struct{})
+
+	factory := &fakeRuntimeFactory{build: func(request RuntimeRequest) *fakeRuntime {
+		runtime := newFakeRuntime(request, true, completeMessages("Done successfully; verified."))
+		runtime.eventHTTP.Close()
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/global/event" {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			close(streamOpen)
+			writeEvent := func(event client.Event) {
+				envelope, _ := json.Marshal(struct {
+					Directory string       `json:"directory"`
+					Payload   client.Event `json:"payload"`
+				}{Directory: runtime.root.Directory, Payload: event})
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", envelope)
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+			}
+			select {
+			case <-sendConnected:
+			case <-r.Context().Done():
+				return
+			}
+			writeEvent(client.Event{Type: "server.connected", Properties: json.RawMessage(`{}`)})
+			close(connectedSent)
+			select {
+			case <-sendHeartbeat:
+			case <-r.Context().Done():
+				return
+			}
+			writeEvent(client.Event{Type: "server.heartbeat", Properties: json.RawMessage(`{}`)})
+			select {
+			case <-createCalled:
+			case <-r.Context().Done():
+				return
+			}
+			properties, _ := json.Marshal(struct {
+				Info client.Session `json:"info"`
+			}{Info: runtime.root})
+			writeEvent(client.Event{Type: "session.created", Properties: properties})
+			<-r.Context().Done()
+		}))
+		runtime.eventHTTP = server
+		runtime.events = client.New(client.Config{BaseURL: server.URL})
+		runtime.create = func(ctx context.Context, _ string) (*client.Session, error) {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			close(createCalled)
+			copy := runtime.root
+			return &copy, nil
+		}
+		return runtime
+	}}
+	engine := newTestEngine(t, environment, factory)
+	if engine.config.EventReadinessTimeout != defaultEventReadinessTimeout {
+		t.Fatalf("default event readiness timeout = %s", engine.config.EventReadinessTimeout)
+	}
+	runCtx, runCancel := context.WithCancel(context.Background())
+	defer runCancel()
+	type outcome struct {
+		result contracts.RunResult
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := engine.Run(runCtx, environment.caseValue, RunRequest{Variant: "candidate", Repetition: 1})
+		done <- outcome{result: result, err: err}
+	}()
+
+	select {
+	case <-streamOpen:
+	case result := <-done:
+		t.Fatalf("run ended before SSE stream opened: result=%#v err=%v", result.result, result.err)
+	case <-time.After(time.Second):
+		t.Fatal("SSE stream did not open")
+	}
+	close(sendConnected)
+	select {
+	case <-connectedSent:
+	case <-time.After(time.Second):
+		t.Fatal("server.connected was not sent")
+	}
+	close(sendHeartbeat)
+	select {
+	case got := <-done:
+		if got.err != nil || got.result.Status != contracts.RunStatusPass {
+			t.Fatalf("run after readiness barrier = status %s, err=%v, result error=%#v", got.result.Status, got.err, got.result.Error)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("run did not complete after readiness heartbeat")
+	}
+}
+
+func TestEngineV1ConnectedWithoutHeartbeatNeverCreatesSession(t *testing.T) {
+	environment := newTestEnvironment(t, false)
+	createCalled := make(chan struct{})
+	factory := &fakeRuntimeFactory{build: func(request RuntimeRequest) *fakeRuntime {
+		runtime := newFakeRuntime(request, true, completeMessages("Done successfully; verified."))
+		runtime.eventHTTP.Close()
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/global/event" {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, `data: {"payload":{"type":"server.connected","properties":{}}}`+"\n\n")
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			<-r.Context().Done()
+		}))
+		runtime.eventHTTP = server
+		runtime.events = client.New(client.Config{BaseURL: server.URL})
+		runtime.create = func(context.Context, string) (*client.Session, error) {
+			close(createCalled)
+			copy := runtime.root
+			return &copy, nil
+		}
+		return runtime
+	}}
+	config := newTestEngineConfig(t, environment, factory)
+	config.EventReadinessTimeout = 50 * time.Millisecond
+	engine, err := NewEngine(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if engine.config.EventReadinessTimeout != 50*time.Millisecond {
+		t.Fatalf("event readiness timeout override = %s", engine.config.EventReadinessTimeout)
+	}
+
+	result, err := engine.Run(context.Background(), environment.caseValue, RunRequest{Variant: "candidate", Repetition: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != contracts.RunStatusInvalid || result.Error == nil || result.Error.Kind != "session_isolation" {
+		t.Fatalf("connected-only readiness result = %#v", result)
+	}
+	select {
+	case <-createCalled:
+		t.Fatal("session POST occurred without a post-subscription heartbeat")
+	default:
+	}
+	runtime := factory.lastRuntime(t)
+	if sent := runtime.sentRequests(); len(sent) != 0 {
+		t.Fatalf("model prompt escaped readiness fence: %#v", sent)
+	}
+	if !runtime.closed {
+		t.Fatal("runtime remained open after readiness timeout")
 	}
 }
 

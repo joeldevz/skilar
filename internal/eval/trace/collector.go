@@ -37,6 +37,11 @@ type EventSource interface {
 // reconciled root tree. Runners must classify this as an invalid sample.
 var ErrGlobalSessionIsolation = errors.New("global session isolation fence violated")
 
+// ErrGlobalEventStreamNotReady marks a global SSE stream that did not deliver
+// its protocol readiness event. The detail-free sentinel prevents transport
+// data from becoming a persisted evaluator diagnostic.
+var ErrGlobalEventStreamNotReady = errors.New("global event stream is not ready")
+
 // ErrMessageCollectionFailed is detail-free by design. The per-session state
 // in Trace identifies the failed stage without retaining transport data.
 var ErrMessageCollectionFailed = errors.New("message collection failed")
@@ -1123,6 +1128,37 @@ func (r *Recorder) Snapshot() []client.GlobalEvent {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]client.GlobalEvent(nil), r.events...)
+}
+
+// WaitForServerReady waits for the connected event and then the first heartbeat
+// emitted by the same global SSE connection the recorder consumes. OpenCode's
+// global handler acquires its live bus stream after connected; the heartbeat is
+// emitted from that post-concatenation stream and is therefore the readiness
+// barrier that must precede root-session creation.
+func (r *Recorder) WaitForServerReady(ctx context.Context) error {
+	if r == nil {
+		return ErrGlobalEventStreamNotReady
+	}
+	for {
+		connected := false
+		for _, event := range r.Snapshot() {
+			switch event.Payload.Type {
+			case "server.connected":
+				connected = true
+			case "server.heartbeat":
+				if connected {
+					return nil
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return errors.Join(ErrGlobalEventStreamNotReady, ctx.Err())
+		case <-r.done:
+			return ErrGlobalEventStreamNotReady
+		case <-r.notify:
+		}
+	}
 }
 
 // WaitForSessionCreated proves that the stream is delivering session events

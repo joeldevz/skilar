@@ -39,6 +39,7 @@ const (
 	provenanceExtensionRedaction                 = "x-redaction"
 	durableResponsePollInterval                  = 50 * time.Millisecond
 	durableResponseMaxWait                       = 2 * time.Second
+	defaultEventReadinessTimeout                 = 15 * time.Second
 )
 
 type evaluationErrorCode string
@@ -93,6 +94,9 @@ func NewEngine(config EngineConfig) (*Engine, error) {
 	}
 	if config.NewRunID == nil {
 		config.NewRunID = randomRunID
+	}
+	if config.EventReadinessTimeout <= 0 {
+		config.EventReadinessTimeout = defaultEventReadinessTimeout
 	}
 	pricingDigest, err := config.Pricing.Digest()
 	if err != nil {
@@ -270,8 +274,23 @@ func (e *Engine) Run(ctx context.Context, testCase contracts.Case, request RunRe
 		isolationErr := fmt.Errorf("%w: open global event stream before root session: %v", trace.ErrGlobalSessionIsolation, recorderErr)
 		return e.earlyResultForContext(runCtx, result, started, contracts.RunStatusInvalid, "session_isolation", errors.Join(isolationErr, closeErr))
 	}
-	session, err := runtimeHandle.CreateSessionContext(runCtx, "skynex-eval:"+testCase.ID+":"+runID)
+	readyCtx, readyCancel := context.WithTimeout(runCtx, e.config.EventReadinessTimeout)
+	readyErr := recorder.WaitForServerReady(readyCtx)
+	readyCancel()
+	if readyErr != nil {
+		recorder.PrepareForRuntimeStop()
+		closeErr := runtimeHandle.Close()
+		runtimeClosed = true
+		_, stopErr := recorder.Stop()
+		isolationErr := fmt.Errorf("%w: global event readiness preflight: %v", trace.ErrGlobalSessionIsolation, readyErr)
+		return e.earlyResultForContext(runCtx, result, started, contracts.RunStatusInvalid, "session_isolation", errors.Join(isolationErr, closeErr, stopErr))
+	}
+	isolationTimeout, _ := time.ParseDuration(testCase.Trace.Quiescence.Timeout)
+	admissionCtx, admissionCancel := context.WithTimeout(runCtx, isolationTimeout)
+	session, err := runtimeHandle.CreateSessionContext(admissionCtx, "skynex-eval:"+testCase.ID+":"+runID)
 	if err != nil {
+		admissionErr := admissionCtx.Err()
+		admissionCancel()
 		if recorder != nil {
 			recorder.PrepareForRuntimeStop()
 		}
@@ -281,12 +300,14 @@ func (e *Engine) Run(ctx context.Context, testCase contracts.Case, request RunRe
 		if recorder != nil {
 			_, stopErr = recorder.Stop()
 		}
+		if admissionErr != nil && runCtx.Err() == nil {
+			isolationErr := fmt.Errorf("%w: root session creation exceeded the admission window", trace.ErrGlobalSessionIsolation)
+			return e.earlyResult(result, started, contracts.RunStatusInvalid, "session_isolation", errors.Join(isolationErr, closeErr, stopErr))
+		}
 		return e.earlyResultForContext(runCtx, result, started, contracts.RunStatusInfraError, "session_create", errors.Join(err, recorderErr, closeErr, stopErr))
 	}
-	isolationTimeout, _ := time.ParseDuration(testCase.Trace.Quiescence.Timeout)
-	isolationCtx, isolationCancel := context.WithTimeout(runCtx, isolationTimeout)
-	isolationErr := recorder.WaitForSessionCreated(isolationCtx, session.ID)
-	isolationCancel()
+	isolationErr := recorder.WaitForSessionCreated(admissionCtx, session.ID)
+	admissionCancel()
 	if isolationErr == nil {
 		isolationErr = trace.ValidateRootSessionAdmission(session.ID, recorder.Snapshot())
 	}

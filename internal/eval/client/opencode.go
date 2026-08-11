@@ -26,7 +26,16 @@ const (
 	defaultRequestTimeout = 180 * time.Second
 	defaultMaxBodyBytes   = int64(32 << 20)
 	defaultMaxEventBytes  = 8 << 20
+	messagePageLimit      = 50
+	maxMessagePages       = 256
+	maxMessagesPerSession = 10_000
+	maxMessageCursorBytes = 4 << 10
 )
+
+// ErrMessageListGetFailed is the deliberately detail-free boundary error for
+// paginated message retrieval. Transport bodies, URLs, session IDs, and opaque
+// cursors must not cross into retained evaluator diagnostics.
+var ErrMessageListGetFailed = errors.New("message list retrieval failed")
 
 // CacheTokenInfo is the cache token breakdown emitted by OpenCode.
 type CacheTokenInfo struct {
@@ -584,12 +593,122 @@ func (c *Client) GetMessages(sessionID string) ([]Message, error) {
 
 // GetMessagesContext retrieves all messages for a session.
 func (c *Client) GetMessagesContext(ctx context.Context, sessionID string) ([]Message, error) {
-	var messages []Message
-	path := "/session/" + url.PathEscape(sessionID) + "/message"
-	if err := c.doJSON(ctx, http.MethodGet, path, nil, &messages, http.StatusOK); err != nil {
-		return nil, fmt.Errorf("get messages for session %q: %w", sessionID, err)
+	basePath := "/session/" + url.PathEscape(sessionID) + "/message"
+	pages := make([][]Message, 0, 1)
+	seenCursors := make(map[string]struct{})
+	var before string
+	var bodyBytes int64
+	totalMessages := 0
+
+	for pageNumber := 0; ; pageNumber++ {
+		if pageNumber >= maxMessagePages {
+			return nil, ErrMessageListGetFailed
+		}
+		remainingBytes := c.maxBodyBytes - bodyBytes
+		if remainingBytes <= 0 {
+			return nil, ErrMessageListGetFailed
+		}
+
+		query := make(url.Values, 2)
+		query.Set("limit", fmt.Sprintf("%d", messagePageLimit))
+		if before != "" {
+			query.Set("before", before)
+		}
+		path := basePath + "?" + query.Encode()
+		page, header, size, err := c.getMessagesPageContext(ctx, path, remainingBytes)
+		if err != nil {
+			return nil, safeMessageListError(err)
+		}
+		bodyBytes += size
+		if len(page) > messagePageLimit {
+			return nil, ErrMessageListGetFailed
+		}
+		if totalMessages > maxMessagesPerSession-len(page) {
+			return nil, ErrMessageListGetFailed
+		}
+		totalMessages += len(page)
+		pages = append(pages, page)
+
+		cursorValues := header.Values("X-Next-Cursor")
+		if len(cursorValues) == 0 {
+			break
+		}
+		if len(cursorValues) != 1 || !validMessageCursor(cursorValues[0]) {
+			return nil, ErrMessageListGetFailed
+		}
+		if len(page) == 0 {
+			return nil, ErrMessageListGetFailed
+		}
+		before = cursorValues[0]
+		if _, duplicate := seenCursors[before]; duplicate {
+			return nil, ErrMessageListGetFailed
+		}
+		seenCursors[before] = struct{}{}
+	}
+
+	// OpenCode serves the newest page first, while each page is chronological.
+	// Reversing page order reconstructs the endpoint's unpaginated chronology.
+	messages := make([]Message, 0, totalMessages)
+	for index := len(pages) - 1; index >= 0; index-- {
+		messages = append(messages, pages[index]...)
 	}
 	return messages, nil
+}
+
+func safeMessageListError(err error) error {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return errors.Join(ErrMessageListGetFailed, context.Canceled)
+	case errors.Is(err, context.DeadlineExceeded):
+		return errors.Join(ErrMessageListGetFailed, context.DeadlineExceeded)
+	default:
+		return ErrMessageListGetFailed
+	}
+}
+
+func (c *Client) getMessagesPageContext(ctx context.Context, path string, maxBodyBytes int64) ([]Message, http.Header, int64, error) {
+	req, err := c.newRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		return nil, nil, 0, &HTTPError{Method: http.MethodGet, URL: req.URL.String(), StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(responseBody))}
+	}
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("read response: %w", err)
+	}
+	if int64(len(responseBody)) > maxBodyBytes {
+		return nil, nil, 0, fmt.Errorf("aggregate response body exceeds %d bytes", c.maxBodyBytes)
+	}
+	trimmed := bytes.TrimSpace(responseBody)
+	if len(trimmed) == 0 || trimmed[0] != '[' {
+		return nil, nil, 0, errors.New("decode response: expected message array")
+	}
+	var messages []Message
+	if err := json.Unmarshal(trimmed, &messages); err != nil {
+		return nil, nil, 0, fmt.Errorf("decode response: %w", err)
+	}
+	return messages, resp.Header.Clone(), int64(len(responseBody)), nil
+}
+
+func validMessageCursor(cursor string) bool {
+	if cursor == "" || len(cursor) > maxMessageCursorBytes || strings.TrimSpace(cursor) != cursor {
+		return false
+	}
+	for index := 0; index < len(cursor); index++ {
+		if cursor[index] < 0x21 || cursor[index] == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // GetMessageContext retrieves one message by its durable identity. The

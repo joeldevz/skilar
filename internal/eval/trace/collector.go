@@ -37,7 +37,14 @@ type EventSource interface {
 // reconciled root tree. Runners must classify this as an invalid sample.
 var ErrGlobalSessionIsolation = errors.New("global session isolation fence violated")
 
-const rootAdmissionQuietPeriod = 20 * time.Millisecond
+// ErrMessageCollectionFailed is detail-free by design. The per-session state
+// in Trace identifies the failed stage without retaining transport data.
+var ErrMessageCollectionFailed = errors.New("message collection failed")
+
+const (
+	rootAdmissionQuietPeriod         = 20 * time.Millisecond
+	expectedRootMessageMissingReason = "expected root response is absent from message listing"
+)
 
 // ValidateRootSessionAdmission checks the recorder history immediately after
 // POST /session and before the first model prompt. At this point the only
@@ -121,13 +128,27 @@ type Compaction struct {
 	Source    string    `json:"source"`
 }
 
+// MessageCollectionState records only whether the durable message listing was
+// obtained. It deliberately excludes transport details, response bodies,
+// session IDs, and cursors so runners can classify failures without persisting
+// untrusted endpoint data.
+type MessageCollectionState string
+
+const (
+	MessageCollectionComplete MessageCollectionState = "complete"
+	MessageCollectionEmpty    MessageCollectionState = "empty"
+	MessageCollectionInvalid  MessageCollectionState = "invalid"
+	MessageCollectionFailed   MessageCollectionState = "failed"
+)
+
 // SessionTrace is one canonical session in the reconciled tree.
 type SessionTrace struct {
-	Session  client.Session       `json:"session"`
-	Status   client.SessionStatus `json:"status"`
-	Children []string             `json:"children"`
-	Messages []client.Message     `json:"messages"`
-	Usage    Usage                `json:"usage"`
+	Session           client.Session         `json:"session"`
+	Status            client.SessionStatus   `json:"status"`
+	Children          []string               `json:"children"`
+	Messages          []client.Message       `json:"messages"`
+	MessageCollection MessageCollectionState `json:"message_collection"`
+	Usage             Usage                  `json:"usage"`
 }
 
 // Trace is the final evidence object. A false TelemetryComplete value blocks
@@ -150,8 +171,9 @@ type Trace struct {
 // Collector recursively discovers, deduplicates, and reconciles a session
 // tree. It is safe for independent collectors to use the same API client.
 type Collector struct {
-	api  API
-	opts Options
+	api                   API
+	opts                  Options
+	expectedRootMessageID string
 }
 
 // New creates a trace collector.
@@ -169,6 +191,16 @@ func New(api API, opts Options) *Collector {
 		opts.PollInterval = 50 * time.Millisecond
 	}
 	return &Collector{api: api, opts: opts}
+}
+
+// ExpectRootMessage keeps reconciliation open until a previously anchored
+// root response is visible in the complete listing. The durable ID remains
+// in memory and is never copied into trace diagnostics or artifacts.
+func (c *Collector) ExpectRootMessage(messageID string) {
+	if c == nil {
+		return
+	}
+	c.expectedRootMessageID = messageID
 }
 
 // Snapshot performs one recursive discovery pass. Collection errors are
@@ -260,13 +292,24 @@ func (c *Collector) Snapshot(ctx context.Context, rootID string, events []client
 		}
 		sort.Strings(childIDs)
 
+		messageCollection := MessageCollectionComplete
 		messages, messagesErr := c.api.GetMessagesContext(ctx, sessionID)
 		if messagesErr != nil {
-			reasons.add("message collection failed: " + sessionID)
-			collectionErrors = append(collectionErrors, fmt.Errorf("get messages for %q: %w", sessionID, messagesErr))
+			messageCollection = MessageCollectionFailed
+			reasons.add("message collection failed")
+			collectionErrors = append(collectionErrors, ErrMessageCollectionFailed)
 			messages = nil
+		} else if len(messages) == 0 {
+			messageCollection = MessageCollectionEmpty
 		}
-		messages = canonicalizeMessages(sessionID, messages, seenMessages, seenParts, reasons)
+		var messagesInvalid bool
+		messages, messagesInvalid = canonicalizeMessages(sessionID, messages, seenMessages, seenParts, reasons)
+		if messagesInvalid && messageCollection != MessageCollectionFailed {
+			messageCollection = MessageCollectionInvalid
+		}
+		if sessionID == rootID && c.expectedRootMessageID != "" && !containsMessageID(messages, c.expectedRootMessageID) {
+			reasons.add(expectedRootMessageMissingReason)
+		}
 		sort.SliceStable(messages, func(i, j int) bool {
 			if messages[i].Info.Time.Created != messages[j].Info.Time.Created {
 				return messages[i].Info.Time.Created < messages[j].Info.Time.Created
@@ -284,6 +327,7 @@ func (c *Collector) Snapshot(ctx context.Context, rootID string, events []client
 
 		sessionTrace := SessionTrace{
 			Session: *session, Status: status, Children: childIDs, Messages: messages,
+			MessageCollection: messageCollection,
 		}
 		sessionTrace.Usage = inspectMessages(t, sessionID, messages, usageSessions, reasons, diagnostics)
 		t.Totals.add(sessionTrace.Usage)
@@ -304,6 +348,15 @@ func (c *Collector) Snapshot(ctx context.Context, rootID string, events []client
 	t.Diagnostics = diagnostics.list()
 	t.TelemetryComplete = len(t.IncompleteReasons) == 0
 	return t, errors.Join(collectionErrors...)
+}
+
+func containsMessageID(messages []client.Message, messageID string) bool {
+	for _, message := range messages {
+		if message.Info.ID == messageID {
+			return true
+		}
+	}
+	return false
 }
 
 func canonicalizeRetries(t *Trace, reasons *reasonSet) {
@@ -444,47 +497,68 @@ func metricOnlyIncompleteReason(reason string) bool {
 		strings.HasPrefix(reason, "assistant message usage missing: ")
 }
 
-func canonicalizeMessages(sessionID string, messages []client.Message, seenMessages, seenParts map[string][]byte, reasons *reasonSet) []client.Message {
+func canonicalizeMessages(sessionID string, messages []client.Message, seenMessages, seenParts map[string][]byte, reasons *reasonSet) ([]client.Message, bool) {
 	result := make([]client.Message, 0, len(messages))
+	invalid := false
 	for _, message := range messages {
-		encodedMessage, _ := json.Marshal(message)
+		encodedMessage, encodeErr := json.Marshal(message)
+		if encodeErr != nil {
+			invalid = true
+			reasons.add("message cannot be canonicalized")
+			continue
+		}
 		if message.Info.ID == "" {
-			reasons.add("message has empty ID in session: " + sessionID)
+			invalid = true
+			reasons.add("message has empty ID")
 		} else if previous, found := seenMessages[message.Info.ID]; found {
+			invalid = true
 			if !equalJSON(previous, encodedMessage) {
-				reasons.add("conflicting duplicate message ID: " + message.Info.ID)
+				reasons.add("conflicting duplicate message ID")
+			} else {
+				reasons.add("duplicate message ID")
 			}
 			continue
 		} else {
 			seenMessages[message.Info.ID] = encodedMessage
 		}
 		if message.Info.SessionID != sessionID {
-			reasons.add(fmt.Sprintf("message %s belongs to session %s, expected %s", message.Info.ID, message.Info.SessionID, sessionID))
+			invalid = true
+			reasons.add("message ownership mismatch")
 		}
 		parts := make([]client.Part, 0, len(message.Parts))
 		for _, part := range message.Parts {
 			if part.ID == "" {
-				reasons.add("part has empty ID in message: " + message.Info.ID)
+				invalid = true
+				reasons.add("part has empty ID")
 				parts = append(parts, part)
 				continue
 			}
-			encoded, _ := json.Marshal(part)
+			encoded, encodeErr := json.Marshal(part)
+			if encodeErr != nil {
+				invalid = true
+				reasons.add("part cannot be canonicalized")
+				continue
+			}
 			if previous, found := seenParts[part.ID]; found {
+				invalid = true
 				if !equalJSON(previous, encoded) {
-					reasons.add("conflicting duplicate part ID: " + part.ID)
+					reasons.add("conflicting duplicate part ID")
+				} else {
+					reasons.add("duplicate part ID")
 				}
 				continue
 			}
 			seenParts[part.ID] = encoded
 			if part.SessionID != sessionID || part.MessageID != message.Info.ID {
-				reasons.add("part ownership mismatch: " + part.ID)
+				invalid = true
+				reasons.add("part ownership mismatch")
 			}
 			parts = append(parts, part)
 		}
 		message.Parts = parts
 		result = append(result, message)
 	}
-	return result
+	return result, invalid
 }
 
 func inspectMessages(t *Trace, sessionID string, messages []client.Message, usageSessions map[string]bool, reasons, diagnostics *reasonSet) Usage {

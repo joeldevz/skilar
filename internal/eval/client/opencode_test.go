@@ -61,6 +61,9 @@ func TestClientUsesCurrentSessionAPIAndPreservesTraceFields(t *testing.T) {
 		case "GET /session/ses_root/children":
 			io.WriteString(w, `[{"id":"ses_child","projectID":"p1","directory":"/fixture/run-1","parentID":"ses_root","title":"child","version":"1.18.16","time":{"created":1002,"updated":1003}}]`)
 		case "GET /session/ses_root/message":
+			if got := r.URL.Query().Get("limit"); got != "50" || r.URL.Query().Has("before") {
+				t.Errorf("message page query = %q", r.URL.RawQuery)
+			}
 			io.WriteString(w, "["+currentMessageJSON()+"]")
 		case "GET /session/ses_root/message/msg_assistant":
 			io.WriteString(w, currentMessageJSON())
@@ -169,6 +172,214 @@ func TestClientUsesCurrentSessionAPIAndPreservesTraceFields(t *testing.T) {
 	if fmt.Sprint(requested) != fmt.Sprint(wantPaths) {
 		t.Fatalf("requests = %v, want %v", requested, wantPaths)
 	}
+}
+
+func TestGetMessagesContextFollowsOpaqueCursorAndRestoresChronology(t *testing.T) {
+	t.Parallel()
+	const cursor = "opaque+/=?&token"
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Path != "/session/root/message" || r.URL.Query().Get("limit") != "50" || r.URL.Query().Get("directory") != "/fixture" {
+			t.Errorf("request %d URL = %s", requests, r.URL.String())
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch requests {
+		case 1:
+			if r.URL.Query().Has("before") {
+				t.Errorf("first request unexpectedly has before")
+			}
+			w.Header().Set("X-Next-Cursor", cursor)
+			w.Header().Set("Link", "<http://invalid.example/must-not-be-followed>; rel=\"next\"")
+			json.NewEncoder(w).Encode(testMessagePage(51, 100))
+		case 2:
+			if got := r.URL.Query().Get("before"); got != cursor {
+				t.Errorf("decoded cursor = %q, want %q", got, cursor)
+			}
+			json.NewEncoder(w).Encode(testMessagePage(1, 50))
+		default:
+			t.Errorf("unexpected request %d", requests)
+			io.WriteString(w, `[]`)
+		}
+	}))
+	defer server.Close()
+
+	messages, err := New(Config{BaseURL: server.URL, Directory: "/fixture"}).GetMessagesContext(context.Background(), "root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests != 2 || len(messages) != 100 {
+		t.Fatalf("requests/messages = %d/%d", requests, len(messages))
+	}
+	for index, message := range messages {
+		want := fmt.Sprintf("message-%03d", index+1)
+		if message.Info.ID != want {
+			t.Fatalf("message %d = %q, want %q", index, message.Info.ID, want)
+		}
+	}
+}
+
+func TestGetMessagesContextRejectsMalformedPagination(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		handler http.HandlerFunc
+	}{
+		{
+			name: "non-array JSON",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				io.WriteString(w, `null`)
+			},
+		},
+		{
+			name: "oversized page",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				json.NewEncoder(w).Encode(testMessagePage(1, messagePageLimit+1))
+			},
+		},
+		{
+			name: "empty page with cursor",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("X-Next-Cursor", "next")
+				io.WriteString(w, `[]`)
+			},
+		},
+		{
+			name: "multiple cursors",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Add("X-Next-Cursor", "one")
+				w.Header().Add("X-Next-Cursor", "two")
+				json.NewEncoder(w).Encode(testMessagePage(1, 1))
+			},
+		},
+		{
+			name: "oversized cursor",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("X-Next-Cursor", strings.Repeat("x", maxMessageCursorBytes+1))
+				json.NewEncoder(w).Encode(testMessagePage(1, 1))
+			},
+		},
+		{
+			name: "repeated cursor",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("X-Next-Cursor", "same")
+				json.NewEncoder(w).Encode(testMessagePage(1, 1))
+			},
+		},
+		{
+			name: "HTTP failure",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "secret response body", http.StatusInternalServerError)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(test.handler)
+			defer server.Close()
+			if _, err := New(Config{BaseURL: server.URL}).GetMessagesContext(context.Background(), "root"); err == nil {
+				t.Fatal("malformed pagination was accepted")
+			} else if !errors.Is(err, ErrMessageListGetFailed) || strings.Contains(err.Error(), "secret") {
+				t.Fatalf("unsafe pagination error: %v", err)
+			}
+		})
+	}
+}
+
+func TestGetMessagesContextCapsAggregateBody(t *testing.T) {
+	t.Parallel()
+	first := []byte(`[{"info":{"id":"one"},"parts":[]}]`)
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		if requests == 1 {
+			w.Header().Set("X-Next-Cursor", "next")
+		}
+		w.Write(first)
+	}))
+	defer server.Close()
+	_, err := New(Config{BaseURL: server.URL, MaxBodyBytes: int64(len(first) + 1)}).GetMessagesContext(context.Background(), "root")
+	if !errors.Is(err, ErrMessageListGetFailed) || requests != 2 {
+		t.Fatalf("aggregate body cap error=%v requests=%d", err, requests)
+	}
+}
+
+func TestGetMessagesContextPreservesOnlySafeContextCause(t *testing.T) {
+	t.Parallel()
+	const canary = "secret-session-or-cursor"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, `[]`)
+	}))
+	defer server.Close()
+	tests := []struct {
+		name string
+		ctx  func() (context.Context, context.CancelFunc)
+		want error
+	}{
+		{
+			name: "canceled",
+			ctx: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, func() {}
+			},
+			want: context.Canceled,
+		},
+		{
+			name: "deadline",
+			ctx: func() (context.Context, context.CancelFunc) {
+				return context.WithDeadline(context.Background(), time.Unix(1, 0))
+			},
+			want: context.DeadlineExceeded,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := test.ctx()
+			defer cancel()
+			_, err := New(Config{BaseURL: server.URL}).GetMessagesContext(ctx, canary)
+			if !errors.Is(err, ErrMessageListGetFailed) || !errors.Is(err, test.want) || strings.Contains(err.Error(), canary) {
+				t.Fatalf("unsafe context error: %v", err)
+			}
+		})
+	}
+}
+
+func TestGetMessagesContextEnforcesPageAndMessageCaps(t *testing.T) {
+	tests := []struct {
+		name         string
+		page         []Message
+		wantRequests int
+	}{
+		{name: "pages", page: testMessagePage(1, 1), wantRequests: maxMessagePages},
+		{name: "messages", page: testMessagePage(1, messagePageLimit), wantRequests: maxMessagesPerSession/messagePageLimit + 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			requests := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests++
+				w.Header().Set("X-Next-Cursor", fmt.Sprintf("cursor-%d", requests))
+				json.NewEncoder(w).Encode(test.page)
+			}))
+			defer server.Close()
+			_, err := New(Config{BaseURL: server.URL}).GetMessagesContext(context.Background(), "root")
+			if !errors.Is(err, ErrMessageListGetFailed) || requests != test.wantRequests {
+				t.Fatalf("cap error=%v requests=%d, want %d", err, requests, test.wantRequests)
+			}
+		})
+	}
+}
+
+func testMessagePage(first, last int) []Message {
+	result := make([]Message, 0, last-first+1)
+	for index := first; index <= last; index++ {
+		result = append(result, Message{Info: ResponseInfo{
+			ID: fmt.Sprintf("message-%03d", index), SessionID: "root", Role: "assistant",
+			Time: MessageTime{Created: int64(index)},
+		}})
+	}
+	return result
 }
 
 func TestMCPStatusCatalogIsStrictAndDropsFailureDetails(t *testing.T) {

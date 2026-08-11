@@ -691,6 +691,70 @@ func TestDurableResponseRequiresStablePostedEnvelopeAndPartIdentities(t *testing
 	}
 }
 
+func TestValidateDurableResponseClassifiesMessageListing(t *testing.T) {
+	assistant := completeMessages("Done successfully; verified.")[0]
+	assistant.Info.ParentID = "msg_user"
+	user := client.Message{Info: client.ResponseInfo{ID: "msg_user", SessionID: "root", Role: "user"}}
+	response := &client.Response{Info: assistant.Info, Parts: append([]client.Part(nil), assistant.Parts...)}
+	traceWith := func(state trace.MessageCollectionState, messages []client.Message) *trace.Trace {
+		return &trace.Trace{Sessions: []trace.SessionTrace{{
+			Session: client.Session{ID: "root"}, Messages: messages, MessageCollection: state,
+		}}}
+	}
+	invalidAssistant := assistant
+	invalidAssistant.Parts = append([]client.Part(nil), assistant.Parts...)
+	invalidAssistant.Info.Finish = "tool-calls"
+	tests := []struct {
+		name     string
+		trace    *trace.Trace
+		wantCode evaluationErrorCode
+	}{
+		{name: "get failed", trace: traceWith(trace.MessageCollectionFailed, nil), wantCode: evaluationErrorMessageListGetFailed},
+		{name: "empty", trace: traceWith(trace.MessageCollectionEmpty, nil), wantCode: evaluationErrorMessageListEmpty},
+		{name: "canonical invalid", trace: traceWith(trace.MessageCollectionInvalid, []client.Message{user, assistant}), wantCode: evaluationErrorMessageListInvalid},
+		{name: "valid but anchor absent", trace: traceWith(trace.MessageCollectionComplete, []client.Message{user}), wantCode: evaluationErrorMessageListInconsistent},
+		{name: "anchor envelope invalid", trace: traceWith(trace.MessageCollectionComplete, []client.Message{user, invalidAssistant}), wantCode: evaluationErrorMessageListInvalid},
+		{name: "unknown state", trace: traceWith("", nil), wantCode: evaluationErrorMessageListGetFailed},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateDurableResponse(test.trace, "root", response, nil)
+			if code := evaluationCode(err); code != string(test.wantCode) {
+				t.Fatalf("code = %q, want %q (error %v)", code, test.wantCode, err)
+			}
+		})
+	}
+	if err := validateDurableResponse(traceWith(trace.MessageCollectionComplete, []client.Message{user, assistant}), "root", response, nil); err != nil {
+		t.Fatalf("valid message listing rejected: %v", err)
+	}
+}
+
+func TestEngineV1MessageListFailureDoesNotLeakEndpointDetails(t *testing.T) {
+	const canary = "message-list-secret-canary"
+	environment := newTestEnvironment(t, false)
+	factory := &fakeRuntimeFactory{build: func(request RuntimeRequest) *fakeRuntime {
+		runtime := newFakeRuntime(request, true, completeMessages("Done successfully; verified."))
+		runtime.getMessages = func(context.Context, string) ([]client.Message, error) {
+			return nil, fmt.Errorf("%s: cursor=%s body=%s", canary, canary, canary)
+		}
+		return runtime
+	}}
+	result, err := newTestEngine(t, environment, factory).Run(context.Background(), environment.caseValue, RunRequest{Variant: "candidate", Repetition: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != contracts.RunStatusInvalid || result.Error == nil || result.Error.Kind != string(evaluationErrorMessageListGetFailed) {
+		t.Fatalf("result status=%s error=%#v", result.Status, result.Error)
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(encoded, []byte(canary)) {
+		t.Fatalf("message list endpoint detail leaked: %s", encoded)
+	}
+}
+
 func TestEngineV1RejectsPostedUserTextBeforeFollowupOrClaims(t *testing.T) {
 	const canary = "post-only-secret-canary?"
 	environment := newTestEnvironment(t, false)

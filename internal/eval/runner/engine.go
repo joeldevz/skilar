@@ -48,6 +48,9 @@ const (
 	evaluationErrorDurableResponseMissing   evaluationErrorCode = "durable_response_missing"
 	evaluationErrorDurableResponseGetFailed evaluationErrorCode = "durable_response_get_failed"
 	evaluationErrorDurableResponseInvalid   evaluationErrorCode = "durable_response_invalid"
+	evaluationErrorMessageListGetFailed     evaluationErrorCode = "message_list_get_failed"
+	evaluationErrorMessageListEmpty         evaluationErrorCode = "message_list_empty"
+	evaluationErrorMessageListInvalid       evaluationErrorCode = "message_list_invalid"
 	evaluationErrorMessageListInconsistent  evaluationErrorCode = "message_list_inconsistent"
 )
 
@@ -311,6 +314,9 @@ func (e *Engine) Run(ctx context.Context, testCase contracts.Case, request RunRe
 	reconcileTimeout, _ := time.ParseDuration(testCase.Trace.Quiescence.Timeout)
 	reconcileCtx, reconcileCancel := context.WithTimeout(runCtx, reconcileTimeout)
 	collector := trace.New(runtimeHandle, traceOptionsForCase(e.config.TraceOptions, testCase.Trace.Quiescence))
+	if anchorState == durableResponseAnchorValid {
+		collector.ExpectRootMessage(response.Info.ID)
+	}
 	var collectedTrace *trace.Trace
 	var traceErr error
 	var runtimeCloseErr error
@@ -422,7 +428,9 @@ func (e *Engine) Run(ctx context.Context, testCase contracts.Case, request RunRe
 	if toolchainErr != nil {
 		result.Status = contracts.RunStatusInvalid
 	}
-	if conversationErr != nil && result.Status == contracts.RunStatusPass {
+	if hasResponseContractError(conversationErr) && result.Status != contracts.RunStatusInfraError {
+		result.Status = contracts.RunStatusInvalid
+	} else if conversationErr != nil && result.Status == contracts.RunStatusPass {
 		result.Status = contracts.RunStatusFail
 	}
 	if errors.Is(runCtx.Err(), context.Canceled) {
@@ -1011,18 +1019,34 @@ func validateDurableResponse(collected *trace.Trace, sessionID string, response 
 		return nil
 	}
 	if collected == nil || response == nil {
-		return newCodedEvaluationError(evaluationErrorMessageListInconsistent)
+		return newCodedEvaluationError(evaluationErrorMessageListGetFailed)
 	}
 	for _, session := range collected.Sessions {
 		if session.Session.ID != sessionID {
 			continue
 		}
-		if durableResponsePresent(session.Messages, sessionID, response) {
-			return nil
+		switch session.MessageCollection {
+		case trace.MessageCollectionFailed:
+			return newCodedEvaluationError(evaluationErrorMessageListGetFailed)
+		case trace.MessageCollectionEmpty:
+			return newCodedEvaluationError(evaluationErrorMessageListEmpty)
+		case trace.MessageCollectionInvalid:
+			return newCodedEvaluationError(evaluationErrorMessageListInvalid)
+		case trace.MessageCollectionComplete:
+			// Continue with the independently reconciled envelope below.
+		default:
+			return newCodedEvaluationError(evaluationErrorMessageListGetFailed)
 		}
-		break
+		switch durableResponseStatus(session.Messages, sessionID, response) {
+		case durableResponseValid:
+			return nil
+		case durableResponseAbsent:
+			return newCodedEvaluationError(evaluationErrorMessageListInconsistent)
+		default:
+			return newCodedEvaluationError(evaluationErrorMessageListInvalid)
+		}
 	}
-	return newCodedEvaluationError(evaluationErrorMessageListInconsistent)
+	return newCodedEvaluationError(evaluationErrorMessageListGetFailed)
 }
 
 func durableFinalResponseText(collected *trace.Trace, sessionID string, response *client.Response, conversationErr error) string {
@@ -1061,6 +1085,9 @@ func hasResponseContractError(err error) bool {
 		evaluationErrorDurableResponseMissing,
 		evaluationErrorDurableResponseGetFailed,
 		evaluationErrorDurableResponseInvalid,
+		evaluationErrorMessageListGetFailed,
+		evaluationErrorMessageListEmpty,
+		evaluationErrorMessageListInvalid,
 		evaluationErrorMessageListInconsistent:
 		return true
 	default:

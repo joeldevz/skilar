@@ -18,6 +18,7 @@ type fakeAPI struct {
 	messages map[string][]client.Message
 	statuses map[string]client.SessionStatus
 	errors   map[string]error
+	message  func(string) ([]client.Message, error)
 }
 
 func (f *fakeAPI) GetSessionContext(_ context.Context, id string) (*client.Session, error) {
@@ -39,10 +40,94 @@ func (f *fakeAPI) GetChildrenContext(_ context.Context, id string) ([]client.Ses
 }
 
 func (f *fakeAPI) GetMessagesContext(_ context.Context, id string) ([]client.Message, error) {
+	if f.message != nil {
+		return f.message(id)
+	}
 	if err := f.errors["messages:"+id]; err != nil {
 		return nil, err
 	}
 	return append([]client.Message(nil), f.messages[id]...), nil
+}
+
+func TestMessageCollectionStateIsExplicitAndSafe(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		mutate func(*fakeAPI)
+		want   MessageCollectionState
+	}{
+		{
+			name: "complete", want: MessageCollectionComplete,
+			mutate: func(*fakeAPI) {},
+		},
+		{
+			name: "empty", want: MessageCollectionEmpty,
+			mutate: func(api *fakeAPI) { api.messages["root"] = nil },
+		},
+		{
+			name: "invalid", want: MessageCollectionInvalid,
+			mutate: func(api *fakeAPI) { api.messages["root"][0].Info.SessionID = "wrong" },
+		},
+		{
+			name: "failed", want: MessageCollectionFailed,
+			mutate: func(api *fakeAPI) { api.errors["messages:root"] = errors.New("secret transport detail") },
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			api := completeRootAPI()
+			test.mutate(api)
+			result, err := New(api, Options{StablePasses: 1, MaxPasses: 1}).Snapshot(context.Background(), "root", nil)
+			if result == nil || len(result.Sessions) != 1 || result.Sessions[0].MessageCollection != test.want {
+				t.Fatalf("message collection state = %#v, want %q", result, test.want)
+			}
+			if test.want == MessageCollectionFailed && (err == nil || !errors.Is(err, ErrMessageCollectionFailed) || strings.Contains(err.Error(), "secret")) {
+				t.Fatalf("unsafe message collection error: %v", err)
+			}
+		})
+	}
+}
+
+func TestExpectedRootMessagePreventsStableEmptyListing(t *testing.T) {
+	t.Parallel()
+	api := completeRootAPI()
+	target := api.messages["root"][0]
+	calls := 0
+	api.message = func(id string) ([]client.Message, error) {
+		calls++
+		if calls == 1 {
+			return nil, nil
+		}
+		return []client.Message{target}, nil
+	}
+	collector := New(api, Options{StablePasses: 1, MaxPasses: 3, PollInterval: time.Millisecond})
+	collector.ExpectRootMessage(target.Info.ID)
+	result, err := collector.Reconcile(context.Background(), "root", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 || result.Passes != 2 || result.Sessions[0].MessageCollection != MessageCollectionComplete {
+		t.Fatalf("calls/passes/state = %d/%d/%q", calls, result.Passes, result.Sessions[0].MessageCollection)
+	}
+}
+
+func TestExpectedRootMessageDiagnosticDoesNotPersistIdentity(t *testing.T) {
+	t.Parallel()
+	const secretID = "secret-response-identity"
+	collector := New(completeRootAPI(), Options{StablePasses: 1, MaxPasses: 1})
+	collector.ExpectRootMessage(secretID)
+	result, err := collector.Snapshot(context.Background(), "root", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsReason(result.IncompleteReasons, expectedRootMessageMissingReason) || strings.Contains(string(encoded), secretID) {
+		t.Fatalf("unsafe expected-message diagnostic: %s", encoded)
+	}
 }
 
 func (f *fakeAPI) GetSessionStatusesContext(context.Context) (map[string]client.SessionStatus, error) {

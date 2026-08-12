@@ -89,6 +89,24 @@ func TestCanaryProfileIsClosedAndRequiresExplicitModelOptIn(t *testing.T) {
 	}
 }
 
+func TestSkynexOrchestratorCanaryProfileIsSupportedButStillFailsClosed(t *testing.T) {
+	var stdout bytes.Buffer
+	exit := runCLI(context.Background(), []string{
+		"canary", "--allow-model-calls", "--profile", skynexOrchestratorCanaryProfile,
+		"--manifest", "not-read-without-executor.json", "--openai-oauth", "not-read-without-executor-auth.json",
+	}, dependencies{}, &stdout, &bytes.Buffer{})
+	if exit != contracts.ExitInfrastructure {
+		t.Fatalf("exit = %d, want %d", exit, contracts.ExitInfrastructure)
+	}
+	var response envelope
+	if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error == nil || response.Error.Kind != "canary_executor_unavailable" {
+		t.Fatalf("error = %#v", response.Error)
+	}
+}
+
 func TestWorkflowCanaryFixedLimits(t *testing.T) {
 	limits := workflowCanaryLimits()
 	if limits.GlobalWallClock != "30m0s" || limits.Preflight != "1m0s" || limits.PerSample != "4m0s" {
@@ -191,6 +209,76 @@ func TestValidateWorkflowCanaryCases(t *testing.T) {
 				t.Fatalf("error = %v, want substring %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestSkynexOrchestratorCanarySelectsExactPinnedCasesFromFullSuite(t *testing.T) {
+	fullSuite, err := loadSelectedCases(filepath.Join(projectRoot(t), "eval", "cases"), skynexOrchestratorCanarySuite, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected, err := selectSkynexOrchestratorCanaryCases(fullSuite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fullSuite) != skynexOrchestratorCanaryPublicCaseCount || len(selected) != workflowV2CanaryCaseCount {
+		t.Fatalf("full=%d selected=%d", len(fullSuite), len(selected))
+	}
+	ids := make([]string, len(selected))
+	for index, testCase := range selected {
+		ids[index] = testCase.ID
+		pin, pinned := skynexOrchestratorCanaryCasePinFor(testCase.ID)
+		if !pinned {
+			t.Fatalf("selected unpinned case %q", testCase.ID)
+		}
+		digest, digestErr := testCase.Digest()
+		if digestErr != nil || digest != pin.CaseDigest || testCase.Fixture.ExpectedDigest != pin.FixtureDigest {
+			t.Fatalf("case %q does not match its pin", testCase.ID)
+		}
+		if _, managedWorkflow := testCase.Extensions["x-workflow-driver-v1"]; managedWorkflow {
+			t.Fatalf("standalone case %q declares Workflow V2 authority", testCase.ID)
+		}
+	}
+	if got, want := strings.Join(ids, ","), "skx_compaction,skx_low_direct,skx_no_workflow"; got != want {
+		t.Fatalf("selected ids = %q, want %q", got, want)
+	}
+	publicDigest, err := publicCaseSetDigest(fullSuite)
+	if err != nil || publicDigest != skynexOrchestratorCanaryPublicCasesDigest {
+		t.Fatalf("public digest = %q, err=%v", publicDigest, err)
+	}
+	_, fixtureDigest, err := validateFixtures(filepath.Join(projectRoot(t), "eval", "fixtures"), fullSuite)
+	if err != nil || fixtureDigest != skynexOrchestratorCanaryFixtureSetDigest {
+		t.Fatalf("fixture digest = %q, err=%v", fixtureDigest, err)
+	}
+	closure, err := runner.ResolveExecutableClosure(selected, "git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := closure.PathFor("skynex"); err == nil {
+		t.Fatal("standalone executable closure unexpectedly contains skynex")
+	}
+
+	mutant := append([]contracts.Case(nil), fullSuite...)
+	for index := range mutant {
+		if mutant[index].ID == "skx_low_direct" {
+			mutant[index].Input += " changed"
+			break
+		}
+	}
+	if _, err := selectSkynexOrchestratorCanaryCases(mutant); err == nil || !strings.Contains(err.Error(), "digest differs") {
+		t.Fatalf("mutated pinned case accepted: %v", err)
+	}
+}
+
+func TestSkynexOrchestratorCanaryManifestFixesTheScreeningPopulation(t *testing.T) {
+	manifest := &experiment.Manifest{
+		Suite:           skynexOrchestratorCanarySuite,
+		Intent:          experiment.IntentDevelopment,
+		PublicCaseCount: skynexOrchestratorCanaryPublicCaseCount,
+		Runs:            5,
+	}
+	if err := validateSkynexOrchestratorCanaryManifest(manifest); err == nil || !strings.Contains(err.Error(), "runs must equal 2") {
+		t.Fatalf("mutable run count accepted: %v", err)
 	}
 }
 
@@ -496,6 +584,131 @@ func TestWorkflowCanaryExecutorRunsCommittedCoordinatesSerially(t *testing.T) {
 	}
 }
 
+func TestSkynexOrchestratorCanaryExecutorOmitsWorkflowAuthorities(t *testing.T) {
+	now := time.Now().UTC()
+	request := skynexOrchestratorCanaryExecutorRequest(t, now)
+	coordinates := flattenCanaryPlan(request.Plan)
+	calls := 0
+	result, err := executeWorkflowV2CanaryWithDependencies(context.Background(), request, canaryExecutorDependencies{
+		now:             func() time.Time { return now },
+		verifyAuthority: func() error { return nil },
+		runModel: func(_ context.Context, spec modelRunSpec) (modelRunResult, error) {
+			if spec.Suite != skynexOrchestratorCanarySuite || spec.WorkflowPlugin != nil || spec.SkynexBinary != nil {
+				t.Fatalf("standalone spec leaked Workflow V2 authority: %#v", spec)
+			}
+			coordinate := coordinates[calls]
+			calls++
+			sample := validRun("standalone-canary-"+string(rune('a'+calls)), string(coordinate.Variant), contracts.RunStatusPass)
+			sample.CaseID = coordinate.CaseID
+			sample.Provenance.Extensions[runner.ProvenanceExtensionRuntimeCleanupAttested] = "true"
+			return modelRunResult{Result: runner.ContractResult{Samples: []contracts.RunResult{sample}}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != workflowV2CanaryMaxSamples || len(result.Samples) != workflowV2CanaryMaxSamples {
+		t.Fatalf("calls=%d samples=%d", calls, len(result.Samples))
+	}
+}
+
+func TestCanaryRuntimeAuthorityIsProfileExact(t *testing.T) {
+	now := time.Now().UTC()
+	standalone := skynexOrchestratorCanaryExecutorRequest(t, now)
+	if err := validateCanaryExecutionRequest(standalone); err != nil {
+		t.Fatalf("valid standalone request: %v", err)
+	}
+
+	withPlugin := standalone
+	withPlugin.WorkflowPlugin = &toolpolicy.ControlledPluginIdentity{}
+	if err := validateCanaryExecutionRequest(withPlugin); err == nil || !strings.Contains(err.Error(), "forbids Workflow V2") {
+		t.Fatalf("standalone plugin authority error = %v", err)
+	}
+	withSkynex := standalone
+	withSkynex.SkynexBinary = &runner.ExecutableSnapshot{}
+	if err := validateCanaryExecutionRequest(withSkynex); err == nil || !strings.Contains(err.Error(), "forbids Workflow V2") {
+		t.Fatalf("standalone skynex authority error = %v", err)
+	}
+	withDriver := standalone
+	withDriver.Cases = append([]contracts.Case(nil), standalone.Cases...)
+	withDriver.Cases[0].Extensions = map[string]any{"x-workflow-driver-v1": map[string]any{}}
+	if err := validateCanaryExecutionRequest(withDriver); err == nil || !strings.Contains(err.Error(), "managed Workflow V2") {
+		t.Fatalf("standalone workflow driver error = %v", err)
+	}
+
+	workflow := workflowCanaryExecutorRequest(now)
+	workflow.WorkflowPlugin = nil
+	if err := validateCanaryExecutionRequest(workflow); err == nil || !strings.Contains(err.Error(), "requires frozen skynex and plugin") {
+		t.Fatalf("Workflow V2 missing authority error = %v", err)
+	}
+	unsupported := standalone
+	unsupported.Profile = "custom-canary"
+	if err := validateCanaryExecutionRequest(unsupported); err == nil || !strings.Contains(err.Error(), "unsupported profile") {
+		t.Fatalf("unsupported profile error = %v", err)
+	}
+}
+
+func TestSkynexOrchestratorCanaryExecutorRejectsCaseAuthorityDriftBeforeModelCall(t *testing.T) {
+	now := time.Now().UTC()
+	tests := []struct {
+		name   string
+		mutate func(*canaryExecutionRequest)
+		want   string
+	}{
+		{
+			name: "case digest",
+			mutate: func(request *canaryExecutionRequest) {
+				request.Cases = append([]contracts.Case(nil), request.Cases...)
+				request.Cases[0].Input += " drift"
+			},
+			want: "digest differs",
+		},
+		{
+			name: "missing",
+			mutate: func(request *canaryExecutionRequest) {
+				request.Cases = append([]contracts.Case(nil), request.Cases[:2]...)
+			},
+			want: "exactly 3",
+		},
+		{
+			name: "extra",
+			mutate: func(request *canaryExecutionRequest) {
+				request.Cases = append(append([]contracts.Case(nil), request.Cases...), contracts.Case{ID: "skx_extra"})
+			},
+			want: "exactly 3",
+		},
+		{
+			name: "duplicate",
+			mutate: func(request *canaryExecutionRequest) {
+				request.Cases = append([]contracts.Case(nil), request.Cases...)
+				request.Cases[2] = request.Cases[0]
+			},
+			want: "duplicate standalone canary case",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := skynexOrchestratorCanaryExecutorRequest(t, now)
+			test.mutate(&request)
+			modelCalls := 0
+			_, err := executeWorkflowV2CanaryWithDependencies(context.Background(), request, canaryExecutorDependencies{
+				now:             func() time.Time { return now },
+				verifyAuthority: func() error { return nil },
+				runModel: func(context.Context, modelRunSpec) (modelRunResult, error) {
+					modelCalls++
+					return modelRunResult{}, nil
+				},
+			})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want %q", err, test.want)
+			}
+			if modelCalls != 0 {
+				t.Fatalf("invalid authority made %d model calls", modelCalls)
+			}
+		})
+	}
+}
+
 func TestWorkflowCanaryExecutorFailsFast(t *testing.T) {
 	now := time.Now().UTC()
 	request := workflowCanaryExecutorRequest(now)
@@ -647,6 +860,29 @@ func workflowCanaryExecutorRequest(now time.Time) canaryExecutionRequest {
 		SchedulingDeadline: now.Add(25 * time.Minute), ExecutionDeadline: now.Add(26 * time.Minute),
 		FailFast: true, RunsPerArm: 1, MaximumSampleCount: 6,
 	}
+}
+
+func skynexOrchestratorCanaryExecutorRequest(t *testing.T, now time.Time) canaryExecutionRequest {
+	t.Helper()
+	fullSuite, err := loadSelectedCases(filepath.Join(projectRoot(t), "eval", "cases"), skynexOrchestratorCanarySuite, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected, err := selectSkynexOrchestratorCanaryCases(fullSuite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := workflowCanaryExecutorRequest(now)
+	request.Profile = skynexOrchestratorCanaryProfile
+	request.Manifest.Suite = skynexOrchestratorCanarySuite
+	request.Cases = selected
+	for index := range request.Plan.Blocks {
+		request.Plan.Blocks[index].ID = selected[index].ID + "-0001"
+		request.Plan.Blocks[index].CaseID = selected[index].ID
+	}
+	request.SkynexBinary = nil
+	request.WorkflowPlugin = nil
+	return request
 }
 
 func passingCanaryExecution(plan stats.ExperimentPlan, controlTokens, candidateTokens int64) canaryExecutionResult {

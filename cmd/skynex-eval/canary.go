@@ -245,8 +245,13 @@ func commandCanary(ctx context.Context, args []string, deps dependencies) (canar
 	if err := requireModelOptIn(*allow); err != nil {
 		return canaryCommandResult{}, err
 	}
-	if *profile != workflowV2CanaryProfile {
-		return canaryCommandResult{}, invalidf("invalid_canary_profile", "--profile must equal %q", workflowV2CanaryProfile)
+	if !isSupportedCanaryProfile(*profile) {
+		return canaryCommandResult{}, invalidf(
+			"invalid_canary_profile",
+			"--profile must equal %q or %q",
+			workflowV2CanaryProfile,
+			skynexOrchestratorCanaryProfile,
+		)
 	}
 	if strings.TrimSpace(*manifestPath) == "" {
 		return canaryCommandResult{}, invalidf("invalid_arguments", "--manifest is required")
@@ -255,17 +260,17 @@ func commandCanary(ctx context.Context, args []string, deps dependencies) (canar
 		return canaryCommandResult{}, invalidf("openai_oauth_required", "canary requires --openai-oauth PATH for its clean OpenCode profile")
 	}
 	if deps.runCanary == nil {
-		return canaryCommandResult{}, infraf("canary_executor_unavailable", errors.New("Workflow V2 canary executor is not configured"))
+		return canaryCommandResult{}, infraf("canary_executor_unavailable", errors.New("canary executor is not configured"))
 	}
 	if deps.probeRuntime == nil {
-		return canaryCommandResult{}, infraf("canary_preflight_unavailable", errors.New("Workflow V2 canary runtime probe is not configured"))
+		return canaryCommandResult{}, infraf("canary_preflight_unavailable", errors.New("canary runtime probe is not configured"))
 	}
 
 	hardCtx, hardCancel := context.WithTimeout(ctx, workflowV2CanaryGlobalLimit)
 	defer hardCancel()
 	startedAt := time.Now().UTC()
 	preflightCtx, preflightCancel := context.WithTimeout(hardCtx, workflowV2CanaryPreflightLimit)
-	prepared, err := prepareWorkflowV2Canary(preflightCtx, *manifestPath, *openAIOAuth, *binary, *workflowPlugin, *output)
+	prepared, err := prepareCanaryProfile(preflightCtx, *profile, *manifestPath, *openAIOAuth, *binary, *workflowPlugin, *output)
 	if err == nil {
 		err = probeWorkflowV2Canary(preflightCtx, prepared.request, deps.probeRuntime)
 	}
@@ -321,20 +326,28 @@ func commandCanary(ctx context.Context, args []string, deps dependencies) (canar
 		// stable reason code; never turn malformed sample text into an artifact.
 		publishedSamples = []contracts.RunResult{}
 	}
+	kind, supported := canaryArtifactKind(prepared.request.Profile)
+	if !supported {
+		return canaryCommandResult{}, invalidf("invalid_canary_profile", "prepared canary has an unsupported profile")
+	}
+	workflowPluginDigest := ""
+	if prepared.request.WorkflowPlugin != nil {
+		workflowPluginDigest = prepared.request.WorkflowPlugin.ContentDigest
+	}
 	artifact := canaryArtifact{
-		SchemaVersion: 1, Kind: workflowV2CanaryKind,
-		Profile: workflowV2CanaryProfile, Authority: workflowV2CanaryAuthority,
+		SchemaVersion: 1, Kind: kind,
+		Profile: prepared.request.Profile, Authority: workflowV2CanaryAuthority,
 		ExperimentID: prepared.request.Manifest.ID, ManifestDigest: prepared.request.ManifestDigest,
-		Suite:                 workflowV2CanarySuite,
+		Suite:                 prepared.request.Manifest.Suite,
 		HarnessBundleDigest:   prepared.request.Manifest.Harness.Digest,
 		ControlBundleDigest:   prepared.request.Control.Snapshot.Digest,
 		CandidateBundleDigest: prepared.request.Candidate.Snapshot.Digest,
-		WorkflowPluginDigest:  prepared.request.WorkflowPlugin.ContentDigest,
+		WorkflowPluginDigest:  workflowPluginDigest,
 		HoldoutUsed:           false, Plan: prepared.request.Plan, Limits: workflowCanaryLimits(),
 		StartedAt: startedAt, EndedAt: endedAt,
 		Samples:          publishedSamples,
-		PlannedSamples:   workflowV2CanaryMaxSamples,
-		CompletedSamples: len(publishedSamples), SkippedSamples: workflowV2CanaryMaxSamples - len(publishedSamples),
+		PlannedSamples:   prepared.request.MaximumSampleCount,
+		CompletedSamples: len(publishedSamples), SkippedSamples: prepared.request.MaximumSampleCount - len(publishedSamples),
 		CleanupComplete: execution.CleanupComplete,
 		Decision:        evaluation.Decision, Reasons: append([]string(nil), evaluation.Reasons...), Gates: evaluation.Summary,
 		Promotion: canaryPromotionContract{
@@ -371,7 +384,7 @@ func canaryTimeoutFailure() error {
 	return &commandError{
 		exitCode: contracts.ExitFailed,
 		kind:     "canary_timeout",
-		err:      errors.New("Workflow V2 canary exceeded its screening deadline"),
+		err:      errors.New("canary exceeded its screening deadline"),
 	}
 }
 
@@ -1140,16 +1153,19 @@ func workflowCanaryRuntimeCompatible(samples []contracts.RunResult) (bool, int) 
 
 func verifyPreparedCanaryUnchanged(prepared preparedCanary) error {
 	var result error
+	result = errors.Join(result, validateCanaryRuntimeAuthority(prepared.request))
 	if prepared.frozen != nil {
 		result = errors.Join(result, prepared.frozen.VerifyUnchanged())
 	}
 	if prepared.request.ExecutableClosure != nil {
 		result = errors.Join(result, prepared.request.ExecutableClosure.Revalidate())
 	}
-	if prepared.request.SkynexBinary != nil {
-		result = errors.Join(result, prepared.request.SkynexBinary.Revalidate())
+	if prepared.request.Profile == workflowV2CanaryProfile {
+		if prepared.request.SkynexBinary != nil {
+			result = errors.Join(result, prepared.request.SkynexBinary.Revalidate())
+		}
+		result = errors.Join(result, toolpolicy.VerifyControlledPluginIdentity(prepared.request.WorkflowPlugin))
 	}
-	result = errors.Join(result, toolpolicy.VerifyControlledPluginIdentity(prepared.request.WorkflowPlugin))
 	result = errors.Join(result, prepared.request.OpenCodeBinary.Revalidate())
 	if digest, err := executableDigest(); err != nil || digest != prepared.evaluatorDigest {
 		if err == nil {

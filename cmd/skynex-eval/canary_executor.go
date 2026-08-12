@@ -86,7 +86,7 @@ func executeWorkflowV2CanaryWithDependencies(
 		}
 		resolvedBinary := request.OpenCodeBinary
 		spec := modelRunSpec{
-			Cases: []contracts.Case{testCase}, Suite: workflowV2CanarySuite,
+			Cases: []contracts.Case{testCase}, Suite: request.Manifest.Suite,
 			Variant: string(coordinate.Variant), Repetitions: 1, RepetitionStart: coordinate.Repetition,
 			FixtureRoot: request.FixturesDir, AgentBundleRoot: bundle.AbsoluteRoot,
 			Binary: resolvedBinary.Path, ExpectedVersion: request.Manifest.Execution.OpenCodeVersion,
@@ -147,8 +147,8 @@ func executeWorkflowV2CanaryWithDependencies(
 }
 
 func validateCanaryExecutionRequest(request canaryExecutionRequest) error {
-	if request.Profile != workflowV2CanaryProfile || request.Manifest.Suite != workflowV2CanarySuite {
-		return errors.New("canary executor received an unsupported profile")
+	if err := validateCanaryRuntimeAuthority(request); err != nil {
+		return err
 	}
 	if request.RunsPerArm != workflowV2CanaryRunsPerArm || request.MaximumSampleCount != workflowV2CanaryMaxSamples || !request.FailFast {
 		return errors.New("canary executor received mutable population controls")
@@ -168,7 +168,7 @@ func validateCanaryExecutionRequest(request canaryExecutionRequest) error {
 		request.ExecutionDeadline.Sub(request.SchedulingDeadline) < request.CleanupReserve {
 		return errors.New("canary executor received invalid scheduling/cleanup deadlines")
 	}
-	if request.Frozen == nil || request.ExecutableClosure == nil || request.SkynexBinary == nil || request.WorkflowPlugin == nil || request.OpenAIOAuthSession == nil {
+	if request.Frozen == nil || request.ExecutableClosure == nil || request.OpenAIOAuthSession == nil {
 		return errors.New("canary executor is missing frozen runtime authority")
 	}
 	if request.Control.AbsoluteRoot == "" || request.Candidate.AbsoluteRoot == "" || request.FixturesDir == "" {
@@ -177,8 +177,39 @@ func validateCanaryExecutionRequest(request canaryExecutionRequest) error {
 	return nil
 }
 
+func validateCanaryRuntimeAuthority(request canaryExecutionRequest) error {
+	switch request.Profile {
+	case workflowV2CanaryProfile:
+		if request.Manifest.Suite != workflowV2CanarySuite {
+			return errors.New("canary executor received a profile/suite mismatch")
+		}
+		if request.SkynexBinary == nil || request.WorkflowPlugin == nil {
+			return errors.New("Workflow V2 canary requires frozen skynex and plugin authority")
+		}
+	case skynexOrchestratorCanaryProfile:
+		if request.Manifest.Suite != skynexOrchestratorCanarySuite {
+			return errors.New("canary executor received a profile/suite mismatch")
+		}
+		if request.SkynexBinary != nil || request.WorkflowPlugin != nil {
+			return errors.New("standalone canary forbids Workflow V2 runtime authority")
+		}
+		if err := validateSkynexOrchestratorCanarySelectedCases(request.Cases); err != nil {
+			return fmt.Errorf("standalone canary case authority: %w", err)
+		}
+		if request.ExecutableClosure != nil {
+			if _, err := request.ExecutableClosure.PathFor("skynex"); err == nil {
+				return errors.New("standalone canary executable closure contains skynex")
+			}
+		}
+	default:
+		return errors.New("canary executor received an unsupported profile")
+	}
+	return nil
+}
+
 func verifyCanaryExecutionAuthority(request canaryExecutionRequest) error {
 	var result error
+	result = errors.Join(result, validateCanaryRuntimeAuthority(request))
 	if request.Frozen == nil {
 		result = errors.Join(result, errors.New("frozen bundle set is required"))
 	} else {
@@ -189,12 +220,14 @@ func verifyCanaryExecutionAuthority(request canaryExecutionRequest) error {
 	} else {
 		result = errors.Join(result, request.ExecutableClosure.Revalidate())
 	}
-	if request.SkynexBinary == nil {
-		result = errors.Join(result, errors.New("skynex executable identity is required"))
-	} else {
-		result = errors.Join(result, request.SkynexBinary.Revalidate())
+	if request.Profile == workflowV2CanaryProfile {
+		if request.SkynexBinary == nil {
+			result = errors.Join(result, errors.New("skynex executable identity is required"))
+		} else {
+			result = errors.Join(result, request.SkynexBinary.Revalidate())
+		}
+		result = errors.Join(result, toolpolicy.VerifyControlledPluginIdentity(request.WorkflowPlugin))
 	}
-	result = errors.Join(result, toolpolicy.VerifyControlledPluginIdentity(request.WorkflowPlugin))
 	result = errors.Join(result, request.OpenCodeBinary.Revalidate())
 	return result
 }

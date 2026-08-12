@@ -188,6 +188,22 @@ func TestRunResultRejectsInvalidProviderCatalogDigestExtension(t *testing.T) {
 	}
 }
 
+func TestRunResultRuntimeCleanupAttestationUsesFixedStringVocabulary(t *testing.T) {
+	t.Parallel()
+	for _, value := range []string{"true", "false"} {
+		result := validRunResultForContractsTest()
+		result.Provenance.Extensions = map[string]string{ProvenanceExtensionRuntimeCleanupAttested: value}
+		if err := result.Validate(); err != nil {
+			t.Fatalf("cleanup attestation %q rejected: %v", value, err)
+		}
+	}
+	result := validRunResultForContractsTest()
+	result.Provenance.Extensions = map[string]string{ProvenanceExtensionRuntimeCleanupAttested: "yes"}
+	if err := result.Validate(); err == nil || !strings.Contains(err.Error(), ProvenanceExtensionRuntimeCleanupAttested) {
+		t.Fatalf("invalid cleanup attestation error = %v", err)
+	}
+}
+
 func TestRunResultRequiresConsistentNonSecretOAuthBillingProvenance(t *testing.T) {
 	valid := validRunResultForContractsTest()
 	valid.Provenance.Extensions = map[string]string{

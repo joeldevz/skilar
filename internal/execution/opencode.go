@@ -57,7 +57,9 @@ func (a *OpenCodeAdapter) Run(ctx context.Context, request OpenCodeRequest) (Wor
 	if a.Store == nil {
 		return WorkerResult{}, errors.New("execution: workflow store required")
 	}
+	hermetic := hermeticOpenCodeMode()
 	executable := a.Options.Executable
+	var executableIdentity os.FileInfo
 	if executable == "" {
 		executable = "opencode"
 	}
@@ -98,6 +100,16 @@ func (a *OpenCodeAdapter) Run(ctx context.Context, request OpenCodeRequest) (Wor
 	if out, gitErr := gitCommand(worktree, "read-tree", "--reset", "-u", request.Attempt.BasisTree); gitErr != nil {
 		return WorkerResult{}, fmt.Errorf("execution: materialize attempt basis: %w: %s", gitErr, out)
 	}
+	if hermetic {
+		executable, err = resolveHermeticOpenCodeExecutable(a.Options.Executable, worktree)
+		if err != nil {
+			return WorkerResult{}, err
+		}
+		executableIdentity, err = snapshotHermeticOpenCodeExecutable(executable)
+		if err != nil {
+			return WorkerResult{}, err
+		}
+	}
 	inputs := filepath.Join(worktree, ".skynex-inputs")
 	if err = os.Mkdir(inputs, 0o700); err != nil {
 		return WorkerResult{}, err
@@ -122,14 +134,7 @@ func (a *OpenCodeAdapter) Run(ctx context.Context, request OpenCodeRequest) (Wor
 	}
 	resultFile := filepath.Join(parent, "result.json")
 	prompt := buildWorkerPrompt(request, materialized)
-	args := []string{"run", "--format", "json", "--auto", "--dir", worktree}
-	if a.Options.Model != "" {
-		args = append(args, "--model", a.Options.Model)
-	}
-	if a.Options.Agent != "" {
-		args = append(args, "--agent", a.Options.Agent)
-	}
-	args = append(args, prompt)
+	args := workerOpenCodeArgs(worktree, prompt, a.Options, hermetic)
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	unregister := processregistry.Register(request.Attempt.WorkflowID, request.InvocationID, cancel)
@@ -137,9 +142,9 @@ func (a *OpenCodeAdapter) Run(ctx context.Context, request OpenCodeRequest) (Wor
 	stdout := &boundedBuffer{limit: limit}
 	stderr := &boundedBuffer{limit: limit}
 	cmd := exec.CommandContext(runCtx, executable, args...)
-	configureOpenCodeProcess(cmd)
+	configureOpenCodeProcess(cmd, evaluatorManagedOpenCodeProcess())
 	cmd.Dir = worktree
-	runtimeEnv, err := openCodeRuntimeEnv(parent, resultFile)
+	runtimeEnv, err := openCodeRuntimeEnv(parent, resultFile, hermetic)
 	if err != nil {
 		return WorkerResult{}, err
 	}
@@ -157,6 +162,13 @@ func (a *OpenCodeAdapter) Run(ctx context.Context, request OpenCodeRequest) (Wor
 	}
 	cmd.Stdout = &progressWriter{buffer: stdout, update: func(value []byte) { a.updateInvocationPreview(request.InvocationID, "stdout_preview", value) }, activity: noteActivity}
 	cmd.Stderr = &progressWriter{buffer: stderr, update: func(value []byte) { a.updateInvocationPreview(request.InvocationID, "stderr_preview", value) }, activity: noteActivity}
+	if hermetic {
+		if err = revalidateHermeticOpenCodeExecutable(a.Options.Executable, worktree, executable, executableIdentity); err != nil {
+			finished := time.Now().UTC()
+			_ = a.persistInvocation(request, args, -1, stdout.Bytes(), stderr.Bytes(), nil, "start_failed", started, finished)
+			return WorkerResult{}, err
+		}
+	}
 	runErr := cmd.Start()
 	if runErr != nil {
 		finished := time.Now().UTC()
@@ -262,6 +274,21 @@ func (a *OpenCodeAdapter) Run(ctx context.Context, request OpenCodeRequest) (Wor
 	}
 	return WorkerResult{Envelope: parsed.Envelope, Patch: parsed.Patch, Owner: request.Attempt.Owner, FencingToken: request.Attempt.FencingToken}, nil
 }
+
+func workerOpenCodeArgs(worktree, prompt string, options OpenCodeOptions, hermetic bool) []string {
+	args := []string{"run"}
+	if hermetic {
+		args = append(args, "--pure")
+	}
+	args = append(args, "--format", "json", "--auto", "--dir", worktree)
+	if options.Model != "" {
+		args = append(args, "--model", options.Model)
+	}
+	if options.Agent != "" {
+		args = append(args, "--agent", options.Agent)
+	}
+	return append(args, prompt)
+}
 func (a *OpenCodeAdapter) persistInvocation(r OpenCodeRequest, args []string, exit int, stdout, stderr []byte, evidence []string, status string, start, end time.Time) error {
 	command, _ := json.Marshal(append([]string{"opencode"}, args...))
 	evidenceJSON, _ := json.Marshal(evidence)
@@ -365,7 +392,10 @@ func safeArtifactID(id string) bool {
 	}
 	return true
 }
-func openCodeRuntimeEnv(parent, result string) ([]string, error) {
+func openCodeRuntimeEnv(parent, result string, hermetic bool) ([]string, error) {
+	if hermetic {
+		return hermeticOpenCodeRuntimeEnv(parent, result)
+	}
 	runtimeData := filepath.Join(parent, "xdg-data")
 	runtimeCache := filepath.Join(parent, "xdg-cache")
 	runtimeState := filepath.Join(parent, "xdg-state")

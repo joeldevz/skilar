@@ -230,6 +230,134 @@ func TestStaleReviewJobReconcilesAndReleasesCrossOperationAdmission(t *testing.T
 	}
 }
 
+func TestReconcileManagedEvaluationJobsCancelsLiveJobsIdempotently(t *testing.T) {
+	for _, initial := range []JobState{JobQueued, JobRunning, JobCancelRequested} {
+		t.Run(string(initial), func(t *testing.T) {
+			s, err := OpenSQLite(filepath.Join(t.TempDir(), "workflows.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+
+			executingJobWorkflow(t, s, "wf")
+			created := time.Date(2026, time.August, 12, 8, 0, 0, 0, time.UTC)
+			if _, err = s.CreateWorkflowJobOperation("job", "wf", "run", created); err != nil {
+				t.Fatal(err)
+			}
+			if initial == JobRunning || initial == JobCancelRequested {
+				if err = s.StartWorkflowJob("job", 4242, created.Add(time.Second)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if initial == JobCancelRequested {
+				if _, err = s.CancelWorkflowJobs("wf", created.Add(2*time.Second)); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			finished := created.Add(3 * time.Second)
+			if err = s.ReconcileManagedEvaluationJobs("wf", finished); err != nil {
+				t.Fatal(err)
+			}
+			job, err := s.WorkflowJob("job")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if job.State != JobCancelled || job.TerminalState != string(StateExecuting) || job.Error != managedEvaluationCleanupJobError {
+				t.Fatalf("job=%+v", job)
+			}
+			if !job.FinishedAt.Equal(finished) || !job.HeartbeatAt.Equal(finished) {
+				t.Fatalf("finished=%s heartbeat=%s, want %s", job.FinishedAt, job.HeartbeatAt, finished)
+			}
+
+			var notifications, live int
+			if err = s.Database().QueryRow(`SELECT COUNT(*) FROM workflow_notifications WHERE job_id=?`, "job").Scan(&notifications); err != nil {
+				t.Fatal(err)
+			}
+			if notifications != 1 {
+				t.Fatalf("notifications=%d, want 1", notifications)
+			}
+			if err = s.Database().QueryRow(
+				`SELECT COUNT(*) FROM workflow_jobs WHERE workflow_id=? AND state IN (?,?,?,?)`,
+				"wf",
+				JobQueued,
+				JobRunning,
+				JobCancelRequested,
+				JobWaitingApproval,
+			).Scan(&live); err != nil {
+				t.Fatal(err)
+			}
+			if live != 0 {
+				t.Fatalf("live jobs=%d, want 0", live)
+			}
+
+			if err = s.ReconcileManagedEvaluationJobs("wf", finished.Add(time.Hour)); err != nil {
+				t.Fatalf("idempotent replay: %v", err)
+			}
+			replayed, err := s.WorkflowJob("job")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !replayed.FinishedAt.Equal(finished) || !replayed.HeartbeatAt.Equal(finished) || replayed.Error != managedEvaluationCleanupJobError {
+				t.Fatalf("replay mutated terminal job: %+v", replayed)
+			}
+			if err = s.Database().QueryRow(`SELECT COUNT(*) FROM workflow_notifications WHERE job_id=?`, "job").Scan(&notifications); err != nil {
+				t.Fatal(err)
+			}
+			if notifications != 1 {
+				t.Fatalf("notifications after replay=%d, want 1", notifications)
+			}
+		})
+	}
+}
+
+func TestReconcileManagedEvaluationJobsFailsClosedForWaitingApproval(t *testing.T) {
+	s, err := OpenSQLite(filepath.Join(t.TempDir(), "workflows.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	executingJobWorkflow(t, s, "wf")
+	created := time.Date(2026, time.August, 12, 8, 0, 0, 0, time.UTC)
+	if _, err = s.CreateWorkflowJobOperation("approval", "wf", "review", created); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.FinishWorkflowJob("approval", JobWaitingApproval, "ignored", "approval required", created.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.CreateWorkflowJobOperation("active", "wf", "run", created.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	err = s.ReconcileManagedEvaluationJobs("wf", created.Add(3*time.Second))
+	if err == nil || !strings.Contains(err.Error(), "evaluator-managed cleanup left") {
+		t.Fatalf("err=%v", err)
+	}
+	approval, approvalErr := s.WorkflowJob("approval")
+	if approvalErr != nil {
+		t.Fatal(approvalErr)
+	}
+	if approval.State != JobWaitingApproval || approval.Error != "approval required" || approval.TerminalState != string(StateExecuting) {
+		t.Fatalf("approval job mutated: %+v", approval)
+	}
+	active, activeErr := s.WorkflowJob("active")
+	if activeErr != nil {
+		t.Fatal(activeErr)
+	}
+	if active.State != JobQueued || active.Error != "" || !active.FinishedAt.IsZero() {
+		t.Fatalf("transaction did not fail closed: %+v", active)
+	}
+
+	var activeNotifications int
+	if err = s.Database().QueryRow(`SELECT COUNT(*) FROM workflow_notifications WHERE job_id=?`, "active").Scan(&activeNotifications); err != nil {
+		t.Fatal(err)
+	}
+	if activeNotifications != 0 {
+		t.Fatalf("active notifications=%d, want 0 after rollback", activeNotifications)
+	}
+}
+
 func TestRunningWorkflowJobRequiresFreshHeartbeatAndLivePID(t *testing.T) {
 	oldProbe := workflowJobProcessAlive
 	t.Cleanup(func() { workflowJobProcessAlive = oldProbe })

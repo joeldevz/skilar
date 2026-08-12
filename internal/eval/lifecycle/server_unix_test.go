@@ -4,6 +4,8 @@ package lifecycle
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,8 +13,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -37,8 +41,15 @@ func TestLifecycleHelperProcess(t *testing.T) {
 	if _, err := strconv.Atoi(port); err != nil {
 		t.Fatalf("invalid helper port %q: %v", port, err)
 	}
+	if os.Getenv("SKYNEX_LIFECYCLE_IGNORE_TERM") == "1" {
+		signal.Ignore(syscall.SIGTERM)
+	}
 
-	child := exec.Command("/bin/sh", "-c", "trap '' TERM; exec sleep 600")
+	childScript := "exec sleep 600"
+	if os.Getenv("SKYNEX_LIFECYCLE_CHILD_IGNORE_TERM") == "1" {
+		childScript = "trap '' TERM; exec sleep 600"
+	}
+	child := exec.Command("/bin/sh", "-c", childScript)
 	if err := child.Start(); err != nil {
 		t.Fatalf("start helper descendant: %v", err)
 	}
@@ -114,9 +125,11 @@ func TestServerBindsRunCWDProbesAndCleansEntireProcessGroup(t *testing.T) {
 		WorkDir:     workDir, RunDir: runDir,
 		EnvAllowlist: []string{"PATH"},
 		Env: map[string]string{
-			helperProcessEnv:                  "1",
-			"SKYNEX_LIFECYCLE_CHILD_PID_FILE": pidFile,
-			"SKYNEX_LIFECYCLE_OVERRIDE":       "explicit",
+			helperProcessEnv:                     "1",
+			"SKYNEX_LIFECYCLE_CHILD_PID_FILE":    pidFile,
+			"SKYNEX_LIFECYCLE_CHILD_IGNORE_TERM": "1",
+			"SKYNEX_LIFECYCLE_IGNORE_TERM":       "1",
+			"SKYNEX_LIFECYCLE_OVERRIDE":          "explicit",
 		},
 		Timeout: 5 * time.Second, ShutdownTimeout: 200 * time.Millisecond,
 		HealthTimeout: time.Second, HealthInterval: 10 * time.Millisecond,
@@ -181,11 +194,22 @@ func TestServerBindsRunCWDProbesAndCleansEntireProcessGroup(t *testing.T) {
 	if !processAliveNonZombie(childPID) {
 		t.Fatalf("helper child %d was not alive before Stop", childPID)
 	}
+	srv.mu.RLock()
+	serverPID := srv.pid
+	srv.mu.RUnlock()
+	childGroup, err := syscall.Getpgid(childPID)
+	if err != nil || childGroup != serverPID {
+		t.Fatalf("helper child pgid = %d, lifecycle pgid = %d, err = %v", childGroup, serverPID, err)
+	}
 
-	cancel()
+	stopStarted := time.Now()
 	if err := srv.Stop(); err != nil {
 		t.Fatal(err)
 	}
+	if elapsed := time.Since(stopStarted); elapsed < 180*time.Millisecond || elapsed > 2*time.Second {
+		t.Fatalf("forced process-group stop took %s", elapsed)
+	}
+	cancel()
 	if err := srv.Stop(); err != nil {
 		t.Fatalf("second Stop: %v", err)
 	}
@@ -194,6 +218,54 @@ func TestServerBindsRunCWDProbesAndCleansEntireProcessGroup(t *testing.T) {
 	}
 	if !waitUntil(2*time.Second, func() bool { return !processAliveNonZombie(childPID) }) {
 		t.Fatalf("descendant %d survived process-group cleanup", childPID)
+	}
+}
+
+func TestServerGracefulStopReapsBeforeGroupAttestation(t *testing.T) {
+	workDir := t.TempDir()
+	runDir := t.TempDir()
+	pidFile := filepath.Join(runDir, "child.pid")
+	ctx, cancel := context.WithCancel(context.Background())
+	srv := NewServerWithConfig(Config{
+		Port: 0, Hostname: "127.0.0.1", Binary: os.Args[0],
+		CommandArgs:  []string{"-test.run=^TestLifecycleHelperProcess$", "--", "{port}"},
+		WorkDir:      workDir,
+		RunDir:       runDir,
+		EnvAllowlist: []string{"PATH"},
+		Env: map[string]string{
+			helperProcessEnv:                  "1",
+			"SKYNEX_LIFECYCLE_CHILD_PID_FILE": pidFile,
+		},
+		Timeout: 5 * time.Second, ShutdownTimeout: 2 * time.Second,
+		HealthTimeout: time.Second, HealthInterval: 10 * time.Millisecond,
+		ExpectedVersion: "test-v1",
+	})
+	if err := srv.Start(ctx); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cancel()
+		_ = srv.Stop()
+	})
+	raw, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID, err := strconv.Atoi(string(raw))
+	if err != nil || !processAliveNonZombie(childPID) {
+		t.Fatalf("graceful helper child = %d, err = %v", childPID, err)
+	}
+
+	stopStarted := time.Now()
+	if err := srv.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(stopStarted); elapsed >= time.Second {
+		t.Fatalf("graceful stop consumed shutdown escalation window: %s", elapsed)
+	}
+	if processGroupAlive(srv.pid) || processAliveNonZombie(childPID) {
+		t.Fatalf("graceful stop left process group %d or child %d live", srv.pid, childPID)
 	}
 }
 
@@ -309,7 +381,7 @@ func TestStopDuringLaunchWaitsForPIDPublicationAndReapsProcess(t *testing.T) {
 	}
 }
 
-func TestDefaultArgumentsArePureWithExplicitOptOut(t *testing.T) {
+func TestDefaultArgumentsArePureAndGenericImpureOptOutFailsClosed(t *testing.T) {
 	t.Parallel()
 	srv := NewServerWithConfig(Config{ExtraArgs: []string{"--log-level", "ERROR"}})
 	srv.mu.Lock()
@@ -327,8 +399,116 @@ func TestDefaultArgumentsArePureWithExplicitOptOut(t *testing.T) {
 	impure.port = 4321
 	got = impure.commandArgsLocked()
 	impure.mu.Unlock()
+	if !strings.Contains(strings.Join(got, " "), "--pure") {
+		t.Fatalf("uncontrolled impure argv = %v", got)
+	}
+	if err := verifyControlledPluginBoundary(impure.cfg); err == nil || !strings.Contains(err.Error(), "uncontrolled") {
+		t.Fatalf("generic AllowImpure boundary error = %v", err)
+	}
+}
+
+func TestControlledPluginIsOnlyPureOptOutAndRequiresExactConfig(t *testing.T) {
+	pluginPath := filepath.Join(t.TempDir(), "skynex-workflow.ts")
+	content := []byte("export default async function workflow() {}\n")
+	if err := os.WriteFile(pluginPath, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(content)
+	identity := &ControlledPluginIdentity{Path: pluginPath, ContentDigest: "sha256:" + hex.EncodeToString(sum[:])}
+	configHome := t.TempDir()
+	configDir := filepath.Join(configHome, "opencode")
+	if err := os.Mkdir(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pluginURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(pluginPath)}).String()
+	writeConfig := func(plugins []string) {
+		raw, err := json.Marshal(map[string]any{"plugin": plugins})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(configDir, "opencode.json"), raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeConfig([]string{pluginURL})
+
+	cfg := Config{ConfigHome: configHome, ControlledPlugin: identity}
+	if err := verifyControlledPluginBoundary(cfg); err != nil {
+		t.Fatalf("valid controlled plugin boundary: %v", err)
+	}
+	srv := NewServerWithConfig(cfg)
+	srv.mu.Lock()
+	srv.port = 4321
+	got := srv.commandArgsLocked()
+	srv.mu.Unlock()
 	if strings.Contains(strings.Join(got, " "), "--pure") {
-		t.Fatalf("explicit impure argv = %v", got)
+		t.Fatalf("controlled plugin argv = %v", got)
+	}
+
+	pure := cfg
+	pure.Pure = true
+	if err := verifyControlledPluginBoundary(pure); err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("controlled plugin plus Pure error = %v", err)
+	}
+	writeConfig([]string{pluginURL, "file:///ambient.ts"})
+	if err := verifyControlledPluginBoundary(cfg); err == nil || !strings.Contains(err.Error(), "exactly") {
+		t.Fatalf("additional plugin boundary error = %v", err)
+	}
+	writeConfig([]string{pluginURL})
+	ambientPlugin := filepath.Join(configDir, "ambient.ts")
+	if err := os.WriteFile(ambientPlugin, []byte("export default {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyControlledPluginBoundary(cfg); err == nil || !strings.Contains(err.Error(), "only regular opencode.json") {
+		t.Fatalf("ambient discovery surface error = %v", err)
+	}
+}
+
+func TestControlledPluginIsRevalidatedAfterLaunchHook(t *testing.T) {
+	pluginPath := filepath.Join(t.TempDir(), "skynex-workflow.ts")
+	content := []byte("export default async function workflow() {}\n")
+	if err := os.WriteFile(pluginPath, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(content)
+	identity := &ControlledPluginIdentity{Path: pluginPath, ContentDigest: "sha256:" + hex.EncodeToString(sum[:])}
+	configHome := t.TempDir()
+	configDir := filepath.Join(configHome, "opencode")
+	if err := os.Mkdir(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(map[string]any{"plugin": []string{(&url.URL{Scheme: "file", Path: filepath.ToSlash(pluginPath)}).String()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "opencode.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := NewServerWithConfig(Config{
+		Binary: os.Args[0], WorkDir: t.TempDir(), RunDir: t.TempDir(), ConfigHome: configHome,
+		CommandArgs:      []string{"-test.run=^TestLifecycleHelperProcess$", "--", "{port}"},
+		ControlledPlugin: identity,
+		Env:              map[string]string{helperProcessEnv: "1"},
+	})
+	var mutationErr error
+	srv.beforeCommandStart = func() {
+		mutationErr = os.WriteFile(pluginPath, []byte("export default async function changed() {}\n"), 0o644)
+	}
+	startErr := srv.Start(context.Background())
+	if mutationErr != nil {
+		_ = srv.Stop()
+		t.Fatal(mutationErr)
+	}
+	if startErr == nil || !strings.Contains(startErr.Error(), "revalidate controlled plugin before OpenCode launch") {
+		_ = srv.Stop()
+		t.Fatalf("Start error = %v", startErr)
+	}
+	srv.mu.RLock()
+	pid := srv.pid
+	srv.mu.RUnlock()
+	if pid != 0 {
+		t.Fatalf("process started before plugin revalidation: pid=%d", pid)
 	}
 }
 

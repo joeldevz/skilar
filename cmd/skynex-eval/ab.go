@@ -92,7 +92,7 @@ func commandAB(ctx context.Context, args []string, deps dependencies) (abCommand
 	openAIOAuth := set.String("openai-oauth", "", "OpenCode auth.json containing an OpenAI OAuth login")
 	traceDir := set.String("trace-dir", "eval/results/traces", "sanitized trace directory")
 	retainTrace := set.Bool("retain-trace", false, "persist sanitized traces")
-	allowImpure := set.Bool("allow-impure", false, "explicitly disable OpenCode --pure")
+	allowImpure := set.Bool("allow-impure", false, "legacy compatibility flag; A/B rejects uncontrolled plugin loading")
 	requireHoldout := set.Bool("require-holdout", false, "fail unless the frozen manifest includes an external holdout")
 	costCap := set.Float64(
 		"cost-cap", 0,

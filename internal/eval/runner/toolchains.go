@@ -20,6 +20,9 @@ const (
 	ProvenanceExtensionEffectiveToolchainsDigest = "x-effective-toolchains-digest"
 	ProvenanceExtensionEffectiveConfigDigest     = "x-effective-config-digest"
 	ProvenanceExtensionEffectiveAgentsDigest     = "x-effective-agents-digest"
+	// ProvenanceExtensionRuntimeCleanupAttested is true only when no runtime
+	// was started or the evaluator successfully closed its runtime boundary.
+	ProvenanceExtensionRuntimeCleanupAttested = contracts.ProvenanceExtensionRuntimeCleanupAttested
 )
 
 // ExecutableIdentity is the minimum reproducible identity for an executable.

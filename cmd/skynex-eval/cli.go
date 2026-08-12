@@ -40,12 +40,14 @@ type envelope struct {
 type dependencies struct {
 	probeRuntime func(context.Context, doctorOptions) (doctorResult, error)
 	runModel     func(context.Context, modelRunSpec) (modelRunResult, error)
+	runCanary    func(context.Context, canaryExecutionRequest) (canaryExecutionResult, error)
 }
 
 func defaultDependencies() dependencies {
 	return dependencies{
 		probeRuntime: probeOpenCode,
 		runModel:     executeModelRuns,
+		runCanary:    executeWorkflowV2Canary,
 	}
 }
 
@@ -81,6 +83,8 @@ func runCLI(ctx context.Context, args []string, deps dependencies, stdout, stder
 		data, err = commandBaseline(ctx, args[1:], deps)
 	case "ab":
 		data, err = commandAB(ctx, args[1:], deps)
+	case "canary":
+		data, err = commandCanary(ctx, args[1:], deps)
 	case "compare":
 		data, err = commandCompare(args[1:])
 	case "report":
@@ -244,14 +248,15 @@ func usageDocument() map[string]any {
 			"run":      "run --allow-model-calls --case ID [--n N] [--openai-oauth PATH] [runtime options]",
 			"baseline": "baseline --allow-model-calls --suite NAME [--n N] [--openai-oauth PATH] [--output PATH] [runtime options] (exploratory; use ab for frozen evidence)",
 			"ab":       "ab --allow-model-calls --manifest PATH --openai-oauth PATH [--require-holdout] [--output-prefix PATH] [--resume-partial PATH] [runtime options]",
+			"canary":   "canary --allow-model-calls --profile workflow-v2-canary-v1 --manifest PATH --openai-oauth PATH [--binary PATH] [--workflow-plugin PATH] [--output PATH]",
 			"compare":  "compare --control PATH --candidate PATH --manifest PATH [--output PATH]",
 			"report":   "report --input PATH [--control PATH --candidate PATH --manifest PATH (required for comparisons)]",
 		},
-		"safety": "run, baseline and ab require --allow-model-calls because they may consume subscription quota or incur provider charges; freeze, compare and report are offline",
+		"safety": "run, baseline, ab and canary require --allow-model-calls because they may consume subscription quota or incur provider charges; freeze, compare and report are offline",
 		"runtime_options": []string{
 			"--binary PATH", "--openai-oauth PATH (mutually exclusive with --provider-env)",
 			"--provider-env NAME[,NAME]", "--cost-cap USD (provider/API billing only; unsupported with --openai-oauth)", "--trace-dir DIR",
-			"--retain-trace", "--allow-impure (trusted-local only)",
+			"--retain-trace", "--allow-impure (legacy; uncontrolled plugin loading is forbidden)",
 		},
 		"limitations": []string{
 			"compare is fail-closed and cannot pass without a frozen manifest",
@@ -259,6 +264,8 @@ func usageDocument() map[string]any {
 			"manifest intent is required: development is explicitly non-release; release requires an external holdout and at least 10 pairs per case",
 			"public baseline artifacts retain only ordinal, content-redacted holdout samples sufficient for deterministic gates",
 			"ab currently requires manifest execution.concurrency=1",
+			"canary is a non-release screening gate: exactly 3 public Workflow V2 cases, 1 run per arm, no holdout, fail-fast, and a hard 30 minute wall-clock limit",
+			"a canary promotion only authorizes the full public suite for the exact frozen candidate digest; it is not statistical or release evidence",
 			"ab always uses OpenCode --pure and rejects ambient configuration",
 			"ab requires a dedicated OpenAI OAuth credential source and accepts only OpenAI effective models",
 			"ChatGPT subscription has no authoritative per-request USD: frozen samples and timeouts bound scheduled work, not provider calls/tokens/quota under trusted-local; tree_cost_usd is not applicable",

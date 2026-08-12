@@ -21,6 +21,7 @@ import (
 	"github.com/joeldevz/skynex/internal/eval/lifecycle"
 	"github.com/joeldevz/skynex/internal/eval/redact"
 	"github.com/joeldevz/skynex/internal/eval/sandbox"
+	"github.com/joeldevz/skynex/internal/eval/toolpolicy"
 	"github.com/joeldevz/skynex/internal/eval/trace"
 )
 
@@ -31,6 +32,7 @@ const (
 	provenanceExtensionEffectiveConfigDigest     = ProvenanceExtensionEffectiveConfigDigest
 	provenanceExtensionEffectiveAgentsDigest     = ProvenanceExtensionEffectiveAgentsDigest
 	provenanceExtensionEffectiveToolPolicyDigest = "x-effective-tool-policy-digest"
+	provenanceExtensionEffectiveAuthorization    = "x-effective-authorization-digest"
 	provenanceExtensionEffectiveToolCatalog      = "x-effective-tool-catalog-digest"
 	provenanceExtensionEffectiveToolStatus       = "x-effective-tool-catalog-status"
 	provenanceExtensionEffectiveProviderCatalog  = contracts.ProvenanceExtensionProviderCatalogDigest
@@ -53,6 +55,7 @@ const (
 	evaluationErrorMessageListEmpty         evaluationErrorCode = "message_list_empty"
 	evaluationErrorMessageListInvalid       evaluationErrorCode = "message_list_invalid"
 	evaluationErrorMessageListInconsistent  evaluationErrorCode = "message_list_inconsistent"
+	evaluationErrorWorkflowDriverInvalid    evaluationErrorCode = "workflow_driver_invalid"
 )
 
 type codedEvaluationError struct {
@@ -88,6 +91,13 @@ func NewEngine(config EngineConfig) (*Engine, error) {
 		if config.BundleDigest == "" {
 			return nil, fmt.Errorf("agent bundle digest is required")
 		}
+	}
+	if config.WorkflowPlugin != nil {
+		if err := toolpolicy.VerifyControlledPluginIdentity(config.WorkflowPlugin); err != nil {
+			return nil, fmt.Errorf("workflow plugin identity: %w", err)
+		}
+		plugin := *config.WorkflowPlugin
+		config.WorkflowPlugin = &plugin
 	}
 	if config.Clock == nil {
 		config.Clock = func() time.Time { return time.Now().UTC() }
@@ -184,6 +194,10 @@ func (e *Engine) Run(ctx context.Context, testCase contracts.Case, request RunRe
 	runTimeout, _ := time.ParseDuration(testCase.Completion.Timeout)
 	runCtx, cancel := context.WithTimeout(ctx, runTimeout)
 	defer cancel()
+	workflowDriver, workflowDriverErr := workflowDriverForCase(testCase)
+	if workflowDriverErr != nil {
+		return e.earlyResult(result, started, contracts.RunStatusInvalid, "workflow_driver_contract", workflowDriverErr)
+	}
 	if err := e.verifyExecutableClosureForCase(testCase); err != nil {
 		return e.earlyResult(result, started, contracts.RunStatusInvalid, "toolchain_closure", err)
 	}
@@ -236,11 +250,13 @@ func (e *Engine) Run(ctx context.Context, testCase contracts.Case, request RunRe
 	// Record the exact per-case policy before starting OpenCode so an early
 	// runtime failure remains auditable. The catalog cannot be known until the
 	// read-only runtime probe succeeds, so ToolsetDigest is intentionally the
-	// policy-only digest at this stage and is replaced with policy+catalog on
-	// successful startup.
+	// authorization-only digest at this stage and is replaced with
+	// authorization+catalog on successful startup. Prompt/model differences
+	// remain visible in ConfigDigest without creating a false toolset mismatch.
 	result.Provenance.ConfigDigest = effectiveToolPolicy.Digest
-	result.Provenance.ToolsetDigest = effectiveToolPolicy.Digest
+	result.Provenance.ToolsetDigest = effectiveToolPolicy.AuthorizationDigest
 	result.Provenance.Extensions[provenanceExtensionEffectiveToolPolicyDigest] = effectiveToolPolicy.Digest
+	result.Provenance.Extensions[provenanceExtensionEffectiveAuthorization] = effectiveToolPolicy.AuthorizationDigest
 	result.Provenance.Extensions[provenanceExtensionEffectiveToolStatus] = "unobserved"
 
 	runtimeHandle, err := e.config.Factory.Start(runCtx, RuntimeRequest{
@@ -256,12 +272,51 @@ func (e *Engine) Run(ctx context.Context, testCase contracts.Case, request RunRe
 		}
 		return e.earlyResult(result, started, contracts.RunStatusInfraError, "runtime_start", err)
 	}
+	// A started runtime is unclean until its complete close boundary succeeds.
+	// baseResult defaults this to true for paths that never start a runtime.
+	result.Provenance.Extensions[ProvenanceExtensionRuntimeCleanupAttested] = "false"
 	runtimeClosed := false
+	var managedCleanupErr error
+	closeRuntime := func() error {
+		if runtimeClosed {
+			return nil
+		}
+		closeErr := runtimeHandle.Close()
+		runtimeClosed = true
+		if closeErr != nil {
+			result.Provenance.Extensions[ProvenanceExtensionRuntimeCleanupAttested] = "false"
+		}
+		if workflowDriver == nil || workflowDriver.Mode != "managed-detach" {
+			if closeErr == nil {
+				result.Provenance.Extensions[ProvenanceExtensionRuntimeCleanupAttested] = "true"
+			}
+			return closeErr
+		}
+		if closeErr != nil {
+			managedCleanupErr = fmt.Errorf("managed workflow process-group cleanup was not attested: %w", closeErr)
+			return closeErr
+		}
+		managedCleanupErr = reconcileManagedWorkflowRuntime(workspace.Path(), workflowDriver, e.config.Clock())
+		if managedCleanupErr == nil {
+			result.Provenance.Extensions[ProvenanceExtensionRuntimeCleanupAttested] = "true"
+		} else {
+			result.Provenance.Extensions[ProvenanceExtensionRuntimeCleanupAttested] = "false"
+		}
+		return managedCleanupErr
+	}
 	defer func() {
 		if !runtimeClosed {
-			if closeErr := runtimeHandle.Close(); closeErr != nil {
+			if closeErr := closeRuntime(); closeErr != nil {
 				returnErr = errors.Join(returnErr, fmt.Errorf("stop private runtime: %w", closeErr))
 			}
+		}
+		if managedCleanupErr != nil {
+			returnErr = errors.Join(returnErr, managedCleanupErr)
+		}
+		// Return expressions copy result before defers run. Propagate the final
+		// close attestation into that named return value for every early path.
+		if runResult.Provenance.Extensions != nil {
+			runResult.Provenance.Extensions[ProvenanceExtensionRuntimeCleanupAttested] = result.Provenance.Extensions[ProvenanceExtensionRuntimeCleanupAttested]
 		}
 	}()
 	info := runtimeHandle.Info()
@@ -269,8 +324,7 @@ func (e *Engine) Run(ctx context.Context, testCase contracts.Case, request RunRe
 
 	recorder, recorderErr := trace.StartRecorder(runCtx, runtimeHandle)
 	if recorderErr != nil {
-		closeErr := runtimeHandle.Close()
-		runtimeClosed = true
+		closeErr := closeRuntime()
 		isolationErr := fmt.Errorf("%w: open global event stream before root session: %v", trace.ErrGlobalSessionIsolation, recorderErr)
 		return e.earlyResultForContext(runCtx, result, started, contracts.RunStatusInvalid, "session_isolation", errors.Join(isolationErr, closeErr))
 	}
@@ -279,8 +333,7 @@ func (e *Engine) Run(ctx context.Context, testCase contracts.Case, request RunRe
 	readyCancel()
 	if readyErr != nil {
 		recorder.PrepareForRuntimeStop()
-		closeErr := runtimeHandle.Close()
-		runtimeClosed = true
+		closeErr := closeRuntime()
 		_, stopErr := recorder.Stop()
 		isolationErr := fmt.Errorf("%w: global event readiness preflight: %v", trace.ErrGlobalSessionIsolation, readyErr)
 		return e.earlyResultForContext(runCtx, result, started, contracts.RunStatusInvalid, "session_isolation", errors.Join(isolationErr, closeErr, stopErr))
@@ -294,8 +347,7 @@ func (e *Engine) Run(ctx context.Context, testCase contracts.Case, request RunRe
 		if recorder != nil {
 			recorder.PrepareForRuntimeStop()
 		}
-		closeErr := runtimeHandle.Close()
-		runtimeClosed = true
+		closeErr := closeRuntime()
 		var stopErr error
 		if recorder != nil {
 			_, stopErr = recorder.Stop()
@@ -313,13 +365,26 @@ func (e *Engine) Run(ctx context.Context, testCase contracts.Case, request RunRe
 	}
 	if isolationErr != nil {
 		recorder.PrepareForRuntimeStop()
-		closeErr := runtimeHandle.Close()
-		runtimeClosed = true
+		closeErr := closeRuntime()
 		_, stopErr := recorder.Stop()
 		isolationErr = fmt.Errorf("%w: root session event preflight: %v", trace.ErrGlobalSessionIsolation, isolationErr)
 		return e.earlyResultForContext(runCtx, result, started, contracts.RunStatusInvalid, "session_isolation", errors.Join(isolationErr, closeErr, stopErr))
 	}
 	response, conversationErr := executeConversation(runCtx, runtimeHandle, session.ID, testCase)
+	if response != nil && conversationErr == nil && workflowDriver != nil {
+		initialAnchorCtx, initialAnchorCancel := context.WithTimeout(runCtx, durableResponseMaxWait)
+		initialAnchor := waitForDurableResponse(initialAnchorCtx, runtimeHandle, session.ID, response)
+		initialAnchorCancel()
+		if initialAnchor != durableResponseAnchorValid {
+			conversationErr = durableResponseAnchorError(initialAnchor)
+		} else {
+			var driverErr error
+			response, driverErr = waitForWorkflowDriverCompletion(
+				runCtx, runtimeHandle, workspace.Path(), session.ID, response, testCase, *workflowDriver,
+			)
+			conversationErr = errors.Join(conversationErr, workflowDriverError(driverErr))
+		}
+	}
 
 	anchorState := durableResponseAnchorNotAttempted
 	var durableWaitErr error
@@ -353,7 +418,11 @@ func (e *Engine) Run(ctx context.Context, testCase contracts.Case, request RunRe
 	}
 	responseTraceErr = errors.Join(durableWaitErr, responseTraceErr)
 	conversationErr = errors.Join(conversationErr, responseTraceErr)
-	observedProvider, observedModel, modelObservationErr := validateObservedRootModel(collectedTrace, testCase.Agent.Model)
+	observedProvider, observedModel, modelObservationErr := validateObservedRootModel(
+		collectedTrace,
+		testCase.Agent.Model,
+		testCase.Agent.Name,
+	)
 	// Observed identifiers are untrusted trace data. Publish them only after the
 	// entire session tree has been proven to use the frozen model selection; a
 	// mismatch must not become a channel for candidate-controlled artifact text.
@@ -369,8 +438,7 @@ func (e *Engine) Run(ctx context.Context, testCase contracts.Case, request RunRe
 	if recorder != nil {
 		recorder.PrepareForRuntimeStop()
 	}
-	closeErr := runtimeHandle.Close()
-	runtimeClosed = true
+	closeErr := closeRuntime()
 	if closeErr != nil {
 		runtimeCloseErr = closeErr
 		traceErr = errors.Join(traceErr, fmt.Errorf("stop runtime: %w", closeErr))
@@ -487,17 +555,21 @@ func (e *Engine) Run(ctx context.Context, testCase contracts.Case, request RunRe
 	return result, nil
 }
 
-func validateObservedRootModel(collected *trace.Trace, expected string) (string, string, error) {
+func validateObservedRootModel(collected *trace.Trace, expectedModelSelection, expectedAgent string) (string, string, error) {
 	if collected == nil {
 		return "", "", fmt.Errorf("root model identity is unavailable because trace collection failed")
 	}
-	expectedProvider, expectedModel, err := contracts.ParseModelSelection(expected)
+	if expectedAgent == "" || strings.TrimSpace(expectedAgent) != expectedAgent {
+		return "", "", fmt.Errorf("expected root agent identity is invalid")
+	}
+	expectedProvider, expectedModel, err := contracts.ParseModelSelection(expectedModelSelection)
 	if err != nil {
 		return "", "", fmt.Errorf("expected model: %w", err)
 	}
 	observedProvider := ""
 	observedModel := ""
 	observations := 0
+	rootAgentObservations := 0
 	for _, sessionTrace := range collected.Sessions {
 		if sessionTrace.Session.ParentID != "" && !sessionHasCompletedAssistantResponse(sessionTrace) {
 			return "", "", fmt.Errorf("trace child session %s has no completed assistant response", sessionTrace.Session.ID)
@@ -505,6 +577,12 @@ func validateObservedRootModel(collected *trace.Trace, expected string) (string,
 		for _, message := range sessionTrace.Messages {
 			if message.Info.Role != "assistant" {
 				continue
+			}
+			if sessionTrace.Session.ID == collected.RootSessionID {
+				rootAgentObservations++
+				if message.Info.Agent != expectedAgent {
+					return "", "", fmt.Errorf("trace root session used an unexpected agent identity")
+				}
 			}
 			providerID := message.Info.ProviderID
 			modelID := message.Info.ModelID
@@ -519,13 +597,16 @@ func validateObservedRootModel(collected *trace.Trace, expected string) (string,
 			}
 			observations++
 			observedProvider, observedModel = providerID, modelID
-			if providerID != expectedProvider || (modelID != expectedModel && modelID != expected) {
-				return providerID, modelID, fmt.Errorf("trace session %s used %s/%s, expected %s", sessionTrace.Session.ID, providerID, modelID, expected)
+			if providerID != expectedProvider || (modelID != expectedModel && modelID != expectedModelSelection) {
+				return providerID, modelID, fmt.Errorf("trace session %s used %s/%s, expected %s", sessionTrace.Session.ID, providerID, modelID, expectedModelSelection)
 			}
 		}
 	}
 	if observations == 0 {
 		return "", "", fmt.Errorf("trace tree contains no observed provider/model identity")
+	}
+	if rootAgentObservations == 0 {
+		return "", "", fmt.Errorf("trace root session contains no observed agent identity")
 	}
 	return observedProvider, observedModel, nil
 }
@@ -575,6 +656,7 @@ func (e *Engine) baseResult(testCase contracts.Case, request RunRequest, runID, 
 			provenanceExtensionHarnessBundleDigest:       e.config.Provenance.HarnessDigest,
 			provenanceExtensionManifestDigest:            e.config.Provenance.ManifestDigest,
 			ProvenanceExtensionEffectiveToolchainsDigest: e.config.Provenance.ToolchainsDigest,
+			ProvenanceExtensionRuntimeCleanupAttested:    "true",
 		},
 	}
 	return contracts.RunResult{
@@ -782,7 +864,7 @@ func executeConversation(ctx context.Context, api Runtime, sessionID string, tes
 		if sendErr != nil {
 			return nil, newCodedEvaluationError(evaluationErrorPostResponseInvalid)
 		}
-		if responseErr := validatePostedResponse(response, sessionID, messageID, providerID, modelID); responseErr != nil {
+		if responseErr := validatePostedResponse(response, sessionID, messageID, testCase.Agent.Name, providerID, modelID); responseErr != nil {
 			return response, responseErr
 		}
 		return response, nil
@@ -820,7 +902,7 @@ func responseLooksLikeQuestion(response *client.Response) bool {
 	return strings.HasSuffix(text, "?")
 }
 
-func validatePostedResponse(response *client.Response, sessionID, parentID, providerID, modelID string) error {
+func validatePostedResponse(response *client.Response, sessionID, parentID, agent, providerID, modelID string) error {
 	if response == nil {
 		return newCodedEvaluationError(evaluationErrorPostResponseInvalid)
 	}
@@ -835,6 +917,9 @@ func validatePostedResponse(response *client.Response, sessionID, parentID, prov
 		return newCodedEvaluationError(evaluationErrorPostResponseInvalid)
 	}
 	if info.ParentID == "" || info.ParentID != parentID {
+		return newCodedEvaluationError(evaluationErrorPostResponseInvalid)
+	}
+	if agent == "" || info.Agent != agent {
 		return newCodedEvaluationError(evaluationErrorPostResponseInvalid)
 	}
 	if info.ProviderID != providerID {
@@ -974,6 +1059,7 @@ func durableAssistantMatches(message client.Message, sessionID string, response 
 	info := message.Info
 	if info.Role != "assistant" || info.SessionID != sessionID ||
 		info.ParentID == "" || info.ParentID != response.Info.ParentID ||
+		info.Agent == "" || info.Agent != response.Info.Agent ||
 		info.ProviderID != response.Info.ProviderID || info.ModelID != response.Info.ModelID ||
 		info.Error != nil || info.Finish != response.Info.Finish || info.Finish != "stop" || info.Time.Completed == 0 {
 		return false
@@ -1109,7 +1195,8 @@ func hasResponseContractError(err error) bool {
 		evaluationErrorMessageListGetFailed,
 		evaluationErrorMessageListEmpty,
 		evaluationErrorMessageListInvalid,
-		evaluationErrorMessageListInconsistent:
+		evaluationErrorMessageListInconsistent,
+		evaluationErrorWorkflowDriverInvalid:
 		return true
 	default:
 		return false

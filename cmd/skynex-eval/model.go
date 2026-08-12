@@ -24,6 +24,7 @@ import (
 	"github.com/joeldevz/skynex/internal/eval/reporter"
 	"github.com/joeldevz/skynex/internal/eval/runner"
 	"github.com/joeldevz/skynex/internal/eval/sandbox"
+	"github.com/joeldevz/skynex/internal/eval/toolpolicy"
 	"github.com/joeldevz/skynex/internal/safefs"
 )
 
@@ -60,7 +61,7 @@ func bindModelFlags(set interface {
 		openAIOAuth:     set.String("openai-oauth", "", "OpenCode auth.json containing an OpenAI OAuth login"),
 		traceDir:        set.String("trace-dir", "eval/results/traces", "sanitized trace directory"),
 		retainTrace:     set.Bool("retain-trace", false, "persist a sanitized trace"),
-		allowImpure:     set.Bool("allow-impure", false, "explicitly disable OpenCode --pure"),
+		allowImpure:     set.Bool("allow-impure", false, "legacy compatibility flag; uncontrolled plugin loading is forbidden"),
 		costCap: set.Float64(
 			"cost-cap", 0,
 			"maximum observed USD before stopping; unsupported with --openai-oauth because ChatGPT subscription billing has no authoritative per-request USD",
@@ -87,6 +88,8 @@ type modelRunSpec struct {
 	ExpectedToolchainsDigest     string
 	ResolvedBinary               *resolvedOpenCodeBinary
 	ExecutableClosure            *runner.ExecutableClosure
+	WorkflowPlugin               *toolpolicy.ControlledPluginIdentity
+	SkynexBinary                 *runner.ExecutableSnapshot
 	EnvAllowlist                 []string
 	OpenAIOAuthFile              string
 	OpenAIOAuthSession           *lifecycle.OpenAIOAuthSession
@@ -356,6 +359,37 @@ func executeModelRuns(ctx context.Context, spec modelRunSpec) (result modelRunRe
 	if len(spec.Cases) == 0 {
 		return result, invalidf("empty_selection", "no cases selected")
 	}
+	workflowDriverCount := 0
+	for _, testCase := range spec.Cases {
+		if _, ok := testCase.Extensions["x-workflow-driver-v1"]; ok {
+			workflowDriverCount++
+		}
+	}
+	workflowDriverSelected := workflowDriverCount != 0
+	if workflowDriverSelected {
+		if workflowDriverCount != len(spec.Cases) || spec.Suite != workflowV2CanarySuite {
+			return result, invalidf("workflow_runtime_authority", "managed workflow runtime authority is restricted to an all-Workflow V2 canary selection")
+		}
+		for _, testCase := range spec.Cases {
+			if testCase.Suite != workflowV2CanarySuite {
+				return result, invalidf("workflow_runtime_authority", "managed workflow cases must belong to %s", workflowV2CanarySuite)
+			}
+		}
+		if spec.WorkflowPlugin == nil || spec.SkynexBinary == nil {
+			return result, invalidf("workflow_runtime_authority", "workflow driver cases require an attested plugin and skynex executable")
+		}
+		if spec.AllowImpure {
+			return result, invalidf("workflow_runtime_authority", "workflow driver cases forbid uncontrolled --allow-impure execution")
+		}
+		if err := toolpolicy.VerifyControlledPluginIdentity(spec.WorkflowPlugin); err != nil {
+			return result, invalidf("workflow_runtime_authority", "%v", err)
+		}
+		if err := spec.SkynexBinary.Revalidate(); err != nil {
+			return result, invalidf("workflow_runtime_authority", "revalidate skynex executable: %v", err)
+		}
+	} else if spec.WorkflowPlugin != nil || spec.SkynexBinary != nil {
+		return result, invalidf("workflow_runtime_authority", "workflow plugin authority is only valid for workflow driver cases")
+	}
 	var resolvedBinary resolvedOpenCodeBinary
 	var err error
 	if spec.ResolvedBinary != nil {
@@ -437,6 +471,15 @@ func executeModelRuns(ctx context.Context, spec modelRunSpec) (result modelRunRe
 	if spec.ExpectedToolchainsDigest != "" && executableClosure.Digest() != spec.ExpectedToolchainsDigest {
 		return result, invalidf("toolchains_mismatch", "got %s, expected %s", executableClosure.Digest(), spec.ExpectedToolchainsDigest)
 	}
+	if workflowDriverSelected {
+		skynexPath, pathErr := executableClosure.PathFor("skynex")
+		if pathErr != nil {
+			return result, invalidf("workflow_runtime_authority", "%v", pathErr)
+		}
+		if skPath := spec.SkynexBinary.Path(); skPath != skynexPath {
+			return result, invalidf("workflow_runtime_authority", "attested skynex executable differs from the frozen toolchain closure")
+		}
+	}
 	gitPath, err := executableClosure.PathFor("git")
 	if err != nil {
 		return result, invalidf("invalid_toolchain_closure", "%v", err)
@@ -463,15 +506,23 @@ func executeModelRuns(ctx context.Context, spec modelRunSpec) (result modelRunRe
 	}
 	toolsetDigest, _ := contracts.CanonicalDigest(toolPolicies(preparedCases))
 	judgeDigest, _ := contracts.CanonicalDigest(map[string]string{"authority": "deterministic-v1"})
+	runtimeEnv := map[string]string(nil)
+	if workflowDriverSelected {
+		runtimeEnv = map[string]string{
+			"SKYNEX_WORKFLOW_BINARY":                    spec.SkynexBinary.Path(),
+			lifecycle.EvaluatorManagedDetachEnvironment: "1",
+		}
+	}
 	openCodeFactory := runner.OpenCodeFactory{
 		Binary: spec.Binary, ExpectedVersion: spec.ExpectedVersion,
 		EnvAllowlist: append([]string(nil), spec.EnvAllowlist...), StartupTimeout: 30 * time.Second,
-		AllowImpure: spec.AllowImpure, OpenAIOAuthSession: oauthSession,
+		Env: runtimeEnv, AllowImpure: spec.AllowImpure, WorkflowPlugin: spec.WorkflowPlugin,
+		OpenAIOAuthSession: oauthSession,
 	}
 	engine, err := runner.NewEngine(runner.EngineConfig{
 		RunParent: runsRoot, FixtureRoot: preparedFixtures,
 		AgentBundleRoot: preparedBundle, BundleDigest: bundleSnapshot.Digest,
-		ExecutableClosure: executableClosure,
+		ExecutableClosure: executableClosure, WorkflowPlugin: spec.WorkflowPlugin,
 		Factory: pinnedRuntimeFactory{
 			Inner: openCodeFactory, Binary: spec.Binary,
 			ResolvedBinary:       &resolvedBinary,
@@ -563,6 +614,18 @@ func executeModelRuns(ctx context.Context, spec modelRunSpec) (result modelRunRe
 				contractResult.Complete = false
 				finalizeResult(true)
 				return result, invalidf("invalid_toolchain_closure", "effective executable closure drifted during sample: %v", closureErr)
+			}
+			if workflowDriverSelected {
+				if binaryErr := spec.SkynexBinary.Revalidate(); binaryErr != nil {
+					contractResult.Complete = false
+					finalizeResult(true)
+					return result, invalidf("workflow_runtime_authority", "skynex executable drifted during sample: %v", binaryErr)
+				}
+				if pluginErr := toolpolicy.VerifyControlledPluginIdentity(spec.WorkflowPlugin); pluginErr != nil {
+					contractResult.Complete = false
+					finalizeResult(true)
+					return result, invalidf("workflow_runtime_authority", "workflow plugin drifted during sample: %v", pluginErr)
+				}
 			}
 			if bundleErr := revalidatePreparedAgentBundle(preparedBundle, bundleSnapshot.Digest); bundleErr != nil {
 				contractResult.Complete = false

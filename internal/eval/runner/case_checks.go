@@ -373,7 +373,9 @@ func observeCaseCheck(check contracts.Check, testCase contracts.Case, before, af
 
 func syntheticShellAction(name string) bool {
 	switch strings.ToLower(name) {
-	case "git_commit", "git_add", "git_reset", "git_restore", "git_restore_staged", "git_restore_worktree", "git_clean", "git_push", "skynex_workflow", "github_pr":
+	case "git_commit", "git_add", "git_reset", "git_restore", "git_restore_staged", "git_restore_worktree", "git_clean", "git_push",
+		"skynex_workflow", "workflow_start", "workflow_run", "workflow_run_detach", "workflow_review", "workflow_review_detach",
+		"workflow_approve", "workflow_deliver", "workflow_status", "workflow_inspect", "github_pr":
 		return true
 	default:
 		return false
@@ -624,6 +626,12 @@ func earliestTimestamp(observations []toolObservation) toolObservation {
 func toolNameMatches(observed, declared string) bool {
 	observed = strings.ToLower(observed)
 	declared = strings.ToLower(declared)
+	// skynex_workflow is the conservative family name used by existing safety
+	// contracts. Specific workflow_* observations remain members of that family
+	// so adding precise lifecycle checks cannot make a broad prohibition pass.
+	if declared == "skynex_workflow" && strings.HasPrefix(observed, "workflow_") {
+		return true
+	}
 	return observed == declared || strings.HasSuffix(observed, "_"+declared)
 }
 

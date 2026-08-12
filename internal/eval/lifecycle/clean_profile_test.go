@@ -19,6 +19,7 @@ func TestBuildEnvironmentRejectsAmbientIdentityAndOpenCodeOverrides(t *testing.T
 		"OPENCODE_CONFIG_DIR",
 		"OPENCODE_DISABLE_PROJECT_CONFIG",
 		"SKYNEX_EVAL_MCP_PROXY_MANIFEST",
+		EvaluatorManagedDetachEnvironment,
 	}
 	for _, key := range reserved {
 		key := key
@@ -34,6 +35,21 @@ func TestBuildEnvironmentRejectsAmbientIdentityAndOpenCodeOverrides(t *testing.T
 				t.Fatalf("reserved override name %q was accepted: %v", key, err)
 			}
 		})
+	}
+}
+
+func TestBuildEnvironmentAllowsOnlyExactInternalManagedDetachOverride(t *testing.T) {
+	env, err := buildEnvironment(nil, map[string]string{EvaluatorManagedDetachEnvironment: "1"}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if effective := envMap(env); effective[EvaluatorManagedDetachEnvironment] != "1" {
+		t.Fatalf("managed detach environment = %#v", effective)
+	}
+	for _, value := range []string{"", "0", "true", " 1", "1 "} {
+		if _, err := buildEnvironment(nil, map[string]string{EvaluatorManagedDetachEnvironment: value}, t.TempDir()); err == nil {
+			t.Fatalf("managed detach value %q was accepted", value)
+		}
 	}
 }
 

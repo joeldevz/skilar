@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -223,7 +224,7 @@ func buildDeterministicInputs(testCase contracts.Case, before, after sandbox.Sna
 	if collected != nil {
 		for _, tool := range collected.Tools {
 			toolName := normalizedToolName(tool.Tool, tool.Input)
-			if containsFold(testCase.ToolPolicy.ForbiddenTools, toolName) {
+			if toolNameDeclared(testCase.ToolPolicy.ForbiddenTools, toolName) {
 				security.Violations = append(security.Violations, judges.SecurityViolation{EvidenceID: "behavior", Kind: "forbidden-tool", Detail: toolName})
 			}
 		}
@@ -256,6 +257,15 @@ func buildDeterministicInputs(testCase contracts.Case, before, after sandbox.Sna
 	}
 	digest, _ := contracts.CanonicalDigest(policy)
 	return judges.Evidence{Infrastructure: infrastructure, Filesystem: filesystem, Acceptance: acceptance, Behavior: behavior, Claims: claims, Security: security}, policy, items, digest
+}
+
+func toolNameDeclared(declared []string, observed string) bool {
+	for _, name := range declared {
+		if toolNameMatches(observed, name) {
+			return true
+		}
+	}
+	return false
 }
 
 func evaluateDeterministically(evidence judges.Evidence, policy judges.Policy) judges.Verdict {
@@ -383,7 +393,7 @@ func normalizedToolName(tool string, input []byte) string {
 	command := strings.TrimSpace(strings.ToLower(payload.Command))
 	// Synthetic names feed hard behavior checks. Only a single, plainly parsed
 	// command is authoritative; prose, echo and shell composition stay "bash".
-	if strings.ContainsAny(command, ";\n\r|&`$()") {
+	if strings.ContainsAny(command, ";\n\r|&`$()<>*?[]{}~") {
 		return name
 	}
 	fields := strings.Fields(command)
@@ -408,7 +418,7 @@ func normalizedToolName(tool string, input []byte) string {
 	case readOnlyGitSubcommand(subcommand):
 		return "git_inspect"
 	case hasCommandPrefix(fields, "skynex", "workflow"):
-		return "skynex_workflow"
+		return normalizedWorkflowCommand(fields)
 	case hasCommandPrefix(fields, "gh", "pr") || hasCommandPrefix(fields, "gh-axi", "pr"):
 		return "github_pr"
 	case hasCommandPrefix(fields, "go", "test") || hasCommandPrefix(fields, "cargo", "test") || hasCommandPrefix(fields, "npm", "test") || hasCommandPrefix(fields, "pnpm", "test"):
@@ -419,7 +429,49 @@ func normalizedToolName(tool string, input []byte) string {
 }
 
 func hasCommandPrefix(fields []string, executable, subcommand string) bool {
-	return len(fields) >= 2 && fields[0] == executable && fields[1] == subcommand
+	return len(fields) >= 2 && filepath.Base(fields[0]) == executable && fields[1] == subcommand
+}
+
+func normalizedWorkflowCommand(fields []string) string {
+	if !hasCommandPrefix(fields, "skynex", "workflow") || len(fields) < 3 {
+		return "skynex_workflow"
+	}
+	switch fields[2] {
+	case "start":
+		return "workflow_start"
+	case "run":
+		if containsField(fields[3:], "--detach") {
+			return "workflow_run_detach"
+		}
+		return "workflow_run"
+	case "review":
+		if containsField(fields[3:], "--detach") {
+			return "workflow_review_detach"
+		}
+		return "workflow_review"
+	case "approve":
+		return "workflow_approve"
+	case "deliver":
+		return "workflow_deliver"
+	case "status":
+		return "workflow_status"
+	case "inspect":
+		return "workflow_inspect"
+	default:
+		// The canary's Bash=0 contract is an allowlist of recognized lifecycle
+		// actions. Unknown Workflow subcommands stay generic Bash so they cannot
+		// acquire authority merely by sharing the `skynex workflow` prefix.
+		return "bash"
+	}
+}
+
+func containsField(fields []string, wanted string) bool {
+	for _, field := range fields {
+		if field == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func gitSubcommand(fields []string) string {

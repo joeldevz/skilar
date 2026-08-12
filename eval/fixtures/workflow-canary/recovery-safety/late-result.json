@@ -1,0 +1,19 @@
+{
+  "envelope": {
+    "WorkflowID": "wrong-workflow",
+    "NodeID": "slice_main",
+    "AttemptID": "revoked-attempt",
+    "BaseCandidateOID": "stale-tree",
+    "Status": "completed",
+    "EvidenceIDs": ["untrusted-late-result"]
+  },
+  "patch": {
+    "Operations": [
+      {
+        "Path": "button.go",
+        "Data": "cGFja2FnZSByZWNvdmVyeXNhZmV0eQoKY29uc3QgU3VibWl0QnV0dG9uQ29sb3IgPSAic3RhbGUiCg==",
+        "Mode": 420
+      }
+    ]
+  }
+}

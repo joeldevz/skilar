@@ -36,6 +36,13 @@ func (f OpenCodeFactory) Start(ctx context.Context, request RuntimeRequest) (Run
 	if request.RunPath == "" || !filepath.IsAbs(request.RunPath) {
 		return nil, fmt.Errorf("runtime run path must be absolute")
 	}
+	workflowPlugin, err := controlledLifecyclePlugin(f.WorkflowPlugin, request.ToolPolicy.Plugin)
+	if err != nil {
+		return nil, fmt.Errorf("%w: workflow plugin boundary: %w", ErrRuntimeContractIncompatible, err)
+	}
+	if f.AllowImpure && workflowPlugin == nil {
+		return nil, fmt.Errorf("%w: uncontrolled OpenCode plugin loading is forbidden", ErrRuntimeContractIncompatible)
+	}
 	startupTimeout := durationOr(f.StartupTimeout, 30*time.Second)
 	if f.OpenAIOAuthFile != "" && f.OpenAIOAuthSession != nil {
 		return nil, fmt.Errorf("configure either an OpenAI OAuth file or session, not both")
@@ -87,6 +94,7 @@ func (f OpenCodeFactory) Start(ctx context.Context, request RuntimeRequest) (Run
 		ExpectedVersion:            f.ExpectedVersion,
 		HTTPClient:                 f.HTTPClient,
 		AllowImpure:                f.AllowImpure,
+		ControlledPlugin:           workflowPlugin,
 	})
 	if err := server.Start(ctx); err != nil {
 		return nil, err
@@ -130,8 +138,8 @@ func (f OpenCodeFactory) Start(ctx context.Context, request RuntimeRequest) (Run
 		return fail(fmt.Errorf("%w: bind fail-closed runtime tool catalog: %w", ErrRuntimeContractIncompatible, err))
 	}
 	toolsetDigest, err := contracts.CanonicalDigest(map[string]string{
-		"policy":  request.ToolPolicy.Digest,
-		"catalog": toolCatalogDigest,
+		"authorization": request.ToolPolicy.AuthorizationDigest,
+		"catalog":       toolCatalogDigest,
 	})
 	if err != nil {
 		return fail(fmt.Errorf("digest effective OpenCode toolset: %w", err))
@@ -156,6 +164,27 @@ func (f OpenCodeFactory) Start(ctx context.Context, request RuntimeRequest) (Run
 			ExecutionMode:         contracts.ExecutionTrustedLocal,
 			Network:               contracts.NetworkHostUnisolated,
 		},
+	}, nil
+}
+
+func controlledLifecyclePlugin(factory, effective *toolpolicy.ControlledPluginIdentity) (*lifecycle.ControlledPluginIdentity, error) {
+	if factory == nil && effective == nil {
+		return nil, nil
+	}
+	if factory == nil || effective == nil {
+		return nil, fmt.Errorf("factory and effective policy plugin identities differ")
+	}
+	factoryIdentity := *factory
+	effectiveIdentity := *effective
+	if factoryIdentity != effectiveIdentity {
+		return nil, fmt.Errorf("factory and effective policy plugin identities differ")
+	}
+	if err := toolpolicy.VerifyControlledPluginIdentity(&effectiveIdentity); err != nil {
+		return nil, err
+	}
+	return &lifecycle.ControlledPluginIdentity{
+		Path:          effectiveIdentity.Path,
+		ContentDigest: effectiveIdentity.ContentDigest,
 	}, nil
 }
 

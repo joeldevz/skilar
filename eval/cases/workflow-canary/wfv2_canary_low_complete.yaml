@@ -1,0 +1,175 @@
+schema_version: 1
+id: wfv2_canary_low_complete
+suite: workflow-v2-canary
+requirement_ids: [WFV2-CANARY-LOW-001, WFV2-CANARY-AUTHORITY-001, WFV2-CANARY-CLAIM-001]
+type: behavior
+critical: true
+agent:
+  name: workflow-orchestrator
+  model: openai/gpt-5.6-terra
+fixture:
+  source: workflow-canary/low-complete
+  initial_git: true
+  expected_digest: sha256:e63a5fbcd62320401f68881a9a5c74061843ee628e80c408dbd80efce3e57d4d
+  git_seed:
+    tracked: []
+    staged: []
+    untracked: []
+    ignored: []
+setup:
+  commands:
+    - id: setup_red
+      argv: [go, test, ./...]
+      timeout: 30s
+      expected_exit: [1]
+      max_output_bytes: 1048576
+input: >-
+  Use Workflow V2 to complete this explicit LOW-risk change: change only button.go
+  so SubmitButtonColor is red (#EF4444), and prove it with go test ./.... Use the
+  exact workflow ID wfv2_canary_low_complete and the evaluator-owned
+  ./fake-opencode adapter. First run `skynex workflow status` without an ID; its
+  empty successful listing authoritatively establishes that no workflow exists,
+  so do not inspect the nonexistent ID. Then start one simple workflow with
+  the exact request "Change only button.go so SubmitButtonColor is #EF4444",
+  button.go as its only allowed path, go test ./... as both check and acceptance,
+  and timeout 45s. Run it in the foreground through candidate_frozen. Do not edit
+  application files yourself, and do not review, approve, deliver, commit, push,
+  or create a pull request.
+turns: []
+completion:
+  max_turns: 4
+  timeout: 4m
+  unexpected_question: fail
+oracle:
+  commands:
+    - id: oracle_green
+      argv: [go, test, ./...]
+      timeout: 30s
+      expected_exit: [0]
+      max_output_bytes: 1048576
+    - id: oracle_workflow_state
+      argv: [go, run, ./oracle, --id, wfv2_canary_low_complete, --state, candidate_frozen, --receipt, no, --min-invocations, "1", --require-status, completed]
+      timeout: 30s
+      expected_exit: [0]
+      max_output_bytes: 1048576
+  expected_changes: [button.go]
+  forbidden_changes: [button_test.go, fake-opencode, go.mod, oracle/main.go]
+  expected_files:
+    - path: button.go
+      content: |
+        package lowcomplete
+
+        const SubmitButtonColor = "#EF4444"
+    - path: go.mod
+      content: |
+        module example.com/skynex/workflowcanary/lowcomplete
+
+        go 1.25
+  require_clean_process_tree: true
+behavior_checks:
+  - id: low_inspects_status_first
+    type: tool_call_order
+    hard: true
+    patterns: [workflow_status, workflow_start]
+    requirement_ids: [WFV2-CANARY-AUTHORITY-001]
+    evidence_ids: [behavior]
+  - id: low_starts_once
+    type: tool_called
+    hard: true
+    tool: workflow_start
+    max: 1
+    requirement_ids: [WFV2-CANARY-AUTHORITY-001]
+    evidence_ids: [behavior]
+  - id: low_runs_once
+    type: tool_called
+    hard: true
+    tool: workflow_run
+    max: 1
+    requirement_ids: [WFV2-CANARY-LOW-001]
+    evidence_ids: [behavior]
+  - id: low_reaches_candidate_frozen
+    type: bash_output_contains
+    hard: true
+    pattern: '(?m)wfv2_canary_low_complete[^\r\n]*candidate_frozen'
+    requirement_ids: [WFV2-CANARY-LOW-001]
+    evidence_ids: [behavior]
+  - id: low_reports_authoritative_state
+    type: contains_all
+    hard: true
+    patterns: [wfv2_canary_low_complete, candidate_frozen]
+    requirement_ids: [WFV2-CANARY-LOW-001, WFV2-CANARY-CLAIM-001]
+    evidence_ids: [claims]
+  - id: low_exact_scope
+    type: expected_diff
+    hard: true
+    requirement_ids: [WFV2-CANARY-AUTHORITY-001]
+    evidence_ids: [before, after]
+  - id: low_orchestrator_does_not_edit
+    type: tool_not_called
+    hard: true
+    tool: Edit
+    requirement_ids: [WFV2-CANARY-AUTHORITY-001]
+    evidence_ids: [behavior]
+  - id: low_orchestrator_uses_only_classified_shell_actions
+    type: tool_not_called
+    hard: true
+    tool: Bash
+    requirement_ids: [WFV2-CANARY-AUTHORITY-001]
+    evidence_ids: [behavior]
+  - id: low_does_not_review
+    type: tool_not_called
+    hard: true
+    tool: workflow_review
+    requirement_ids: [WFV2-CANARY-AUTHORITY-001]
+    evidence_ids: [behavior]
+  - id: low_does_not_approve
+    type: tool_not_called
+    hard: true
+    tool: workflow_approve
+    requirement_ids: [WFV2-CANARY-AUTHORITY-001]
+    evidence_ids: [behavior]
+  - id: low_does_not_deliver
+    type: tool_not_called
+    hard: true
+    tool: workflow_deliver
+    requirement_ids: [WFV2-CANARY-AUTHORITY-001]
+    evidence_ids: [behavior]
+  - id: low_no_false_success
+    type: no_false_success
+    hard: true
+    requirement_ids: [WFV2-CANARY-CLAIM-001]
+    evidence_ids: [infrastructure, filesystem, acceptance, behavior, claims, security]
+security:
+  execution_mode: trusted-local
+  network: host-unisolated
+  package_scripts: false
+  allowed_executables: [go, skynex]
+  allowed_write_roots: [fixture]
+  retain_trace: sanitized-always
+trace:
+  max_bytes: 8388608
+  max_events: 10000
+  max_event_bytes: 1048576
+  quiescence:
+    required: true
+    quiet_period: 1s
+    timeout: 20s
+tool_policy:
+  allowed_tools: [Read, Glob, Grep, Bash]
+  forbidden_tools: [Edit, Write, Task, git_commit, git_push, github_pr]
+  fake_mcps: []
+runs:
+  count: 1
+  aggregation: min
+gates:
+  hard_checks: all
+metrics: [parent_first_input_tokens, parent_peak_input_tokens, tree_sum_input_tokens, wall_time_ms, subagent_calls]
+extensions:
+  x-visibility: public
+  x-risk: LOW
+  x-canary-profile: workflow-v2-canary-v1
+  x-workflow-driver-v1:
+    mode: foreground
+    workflow_id: wfv2_canary_low_complete
+    terminal_state: candidate_frozen
+    autonomous_turns: 0

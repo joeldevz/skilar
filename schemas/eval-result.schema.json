@@ -163,7 +163,8 @@
             "x-billing-mode": { "const": "chatgpt-subscription" },
             "x-credential-boundary": { "enum": ["runtime-readable", "provider-proxy"] },
             "x-auth-isolation": { "const": "dedicated-profile-fresh-token-fail-stop-v1" },
-            "x-effective-provider-catalog-digest": { "$ref": "#/$defs/digest" }
+            "x-effective-provider-catalog-digest": { "$ref": "#/$defs/digest" },
+            "x-runtime-cleanup-attested": { "enum": ["true", "false"] }
           },
           "dependentRequired": {
             "x-provider-auth-mode": ["x-billing-mode", "x-credential-boundary", "x-auth-isolation"],

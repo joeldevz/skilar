@@ -45,10 +45,8 @@ func VerifyRuntimeConfig(raw json.RawMessage, expected Effective) Verification {
 		return Verification{Violations: []string{"decode expected config: " + err.Error()}}
 	}
 
-	plugins, exists := runtime["plugin"]
-	array, ok := plugins.([]any)
-	if !exists || !ok || len(array) != 0 {
-		violations = append(violations, "runtime plugins/connectors are missing or not empty")
+	if !reflect.DeepEqual(runtime["plugin"], wanted["plugin"]) {
+		violations = append(violations, "runtime plugin configuration differs from the evaluator-owned policy")
 	}
 	if err := rejectInlineProviderCredentials(runtime["provider"]); err != nil {
 		violations = append(violations, "runtime provider authority is unsafe: "+err.Error())

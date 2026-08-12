@@ -84,6 +84,7 @@ type EngineConfig struct {
 	BundleDigest          string
 	Factory               RuntimeFactory
 	ExecutableClosure     *ExecutableClosure
+	WorkflowPlugin        *toolpolicy.ControlledPluginIdentity
 	Pricing               metrics.PricingTable
 	Provenance            ProvenanceInputs
 	SnapshotLimits        sandbox.SnapshotLimits
@@ -120,6 +121,7 @@ type OpenCodeFactory struct {
 	HTTPClient      *http.Client
 	StartupTimeout  time.Duration
 	AllowImpure     bool
+	WorkflowPlugin  *toolpolicy.ControlledPluginIdentity
 	// OpenAIOAuthFile is an explicit credential capability pointing to a
 	// dedicated profile containing exactly one OpenAI OAuth entry.
 	OpenAIOAuthFile    string

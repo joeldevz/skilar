@@ -48,7 +48,7 @@ func (e *Engine) freezeAgentBundle(workspace *sandbox.Workspace, testCase contra
 	if copied.Digest != source.Digest {
 		return "", "", "", toolpolicy.Effective{}, fmt.Errorf("copied agent bundle digest mismatch")
 	}
-	effective, err = prepareToolPolicy(bundleCopy, testCase, e.config.ExecutableClosure)
+	effective, err = prepareToolPolicyWithAuthority(bundleCopy, testCase, e.config.ExecutableClosure, "", e.config.WorkflowPlugin)
 	if err != nil {
 		return "", "", "", toolpolicy.Effective{}, err
 	}
@@ -67,10 +67,14 @@ func prepareToolPolicy(bundleCopy string, testCase contracts.Case, closures ...*
 	if len(closures) != 0 {
 		closure = closures[0]
 	}
-	return prepareToolPolicyWithProxy(bundleCopy, testCase, closure, "")
+	return prepareToolPolicyWithAuthority(bundleCopy, testCase, closure, "", nil)
 }
 
 func prepareToolPolicyWithProxy(bundleCopy string, testCase contracts.Case, closure *ExecutableClosure, proxyExecutable string) (toolpolicy.Effective, error) {
+	return prepareToolPolicyWithAuthority(bundleCopy, testCase, closure, proxyExecutable, nil)
+}
+
+func prepareToolPolicyWithAuthority(bundleCopy string, testCase contracts.Case, closure *ExecutableClosure, proxyExecutable string, plugin *toolpolicy.ControlledPluginIdentity) (toolpolicy.Effective, error) {
 	configPath := filepath.Join(bundleCopy, "opencode.json")
 	base, err := os.ReadFile(configPath)
 	if err != nil && !os.IsNotExist(err) {
@@ -125,7 +129,7 @@ func prepareToolPolicyWithProxy(bundleCopy string, testCase contracts.Case, clos
 	}
 	effective, err := toolpolicy.Generate(toolpolicy.Input{
 		Base: json.RawMessage(base), AllowedTools: testCase.ToolPolicy.AllowedTools,
-		ForbiddenTools: testCase.ToolPolicy.ForbiddenTools, FakeMCPs: fakes,
+		ForbiddenTools: testCase.ToolPolicy.ForbiddenTools, FakeMCPs: fakes, Plugin: plugin,
 	})
 	if err != nil {
 		return toolpolicy.Effective{}, fmt.Errorf("generate fail-closed tool policy: %w", err)

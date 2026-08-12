@@ -2,6 +2,7 @@ package review
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +12,190 @@ import (
 
 	"github.com/joeldevz/skynex/internal/workflow"
 )
+
+func TestHermeticReviewRuntimeProjectsOnlyParentXDGAuthAndSanitizedConfig(t *testing.T) {
+	parentData := t.TempDir()
+	parentConfig := t.TempDir()
+	ambientHome := t.TempDir()
+	dataDir := filepath.Join(parentData, "opencode")
+	configDir := filepath.Join(parentConfig, "opencode")
+	ambientData := filepath.Join(ambientHome, ".local", "share", "opencode")
+	for _, dir := range []string{dataDir, configDir, ambientData} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "auth.json"), []byte(`{"source":"parent-xdg"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{
+		"account.json":  `{"must":"not-copy"}`,
+		"mcp-auth.json": `{"must":"not-copy"}`,
+		"sessions.db":   "must-not-copy",
+	} {
+		if err := os.WriteFile(filepath.Join(dataDir, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(ambientData, "auth.json"), []byte(`{"source":"ambient-home"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config := `{"agent":{"workflow-reviewer":{"mode":"primary","prompt":"inline reviewer"}},"plugin":["ambient-plugin"],"mcp":{"neurox":{"type":"local","command":["neurox","mcp"]}}}`
+	if err := os.WriteFile(filepath.Join(configDir, "opencode.json"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "ambient-extra.json"), []byte(`{"must":"not-copy"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", ambientHome)
+	t.Setenv("XDG_DATA_HOME", parentData)
+	t.Setenv("XDG_CONFIG_HOME", parentConfig)
+	t.Setenv("OPENCODE_DISABLE_PROJECT_CONFIG", "1")
+	t.Setenv("OPENCODE_CONFIG_CONTENT", `{"plugin":["injected-plugin"]}`)
+
+	runtimeParent := t.TempDir()
+	result := filepath.Join(runtimeParent, "result.json")
+	env, err := reviewOpenCodeRuntimeEnv(runtimeParent, result, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := reviewTestEnvironmentMap(env)
+	exactKeys := []string{"PATH", "HOME", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "LANG", "LC_ALL", "TZ", "OPENCODE_DISABLE_PROJECT_CONFIG", "OPENCODE_DISABLE_MODELS_FETCH", "SKYNEX_RESULT_FILE"}
+	if len(values) != len(exactKeys) {
+		t.Fatalf("hermetic env keys=%v", values)
+	}
+	for _, key := range exactKeys {
+		if _, ok := values[key]; !ok {
+			t.Fatalf("hermetic env is missing %s: %v", key, values)
+		}
+	}
+	for _, key := range []string{"HOME", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR"} {
+		value := values[key]
+		if value == "" || !filepath.IsAbs(value) || !strings.HasPrefix(value, runtimeParent+string(filepath.Separator)) {
+			t.Fatalf("%s=%q is not a private runtime path", key, value)
+		}
+	}
+	if values["HOME"] == ambientHome {
+		t.Fatal("ambient HOME survived the hermetic profile")
+	}
+	if values["OPENCODE_DISABLE_PROJECT_CONFIG"] != "1" || values["OPENCODE_DISABLE_MODELS_FETCH"] != "1" {
+		t.Fatalf("OpenCode isolation flags=%#v", values)
+	}
+	if _, ok := values["OPENCODE_CONFIG_CONTENT"]; ok {
+		t.Fatal("ambient OPENCODE_CONFIG_CONTENT survived")
+	}
+	targetData := filepath.Join(values["XDG_DATA_HOME"], "opencode")
+	auth, err := os.ReadFile(filepath.Join(targetData, "auth.json"))
+	if err != nil || string(auth) != `{"source":"parent-xdg"}` {
+		t.Fatalf("auth=%q err=%v", auth, err)
+	}
+	if info, statErr := os.Stat(filepath.Join(targetData, "auth.json")); statErr != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("projected auth mode=%v err=%v", info, statErr)
+	}
+	entries, err := os.ReadDir(targetData)
+	if err != nil || len(entries) != 1 || entries[0].Name() != "auth.json" {
+		t.Fatalf("copied data entries=%v err=%v", entries, err)
+	}
+	targetConfig := filepath.Join(values["XDG_CONFIG_HOME"], "opencode")
+	entries, err = os.ReadDir(targetConfig)
+	if err != nil || len(entries) != 1 || entries[0].Name() != "opencode.json" {
+		t.Fatalf("copied config entries=%v err=%v", entries, err)
+	}
+	raw, err := os.ReadFile(filepath.Join(targetConfig, "opencode.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var projected map[string]any
+	if err := json.Unmarshal(raw, &projected); err != nil {
+		t.Fatal(err)
+	}
+	if plugins, ok := projected["plugin"].([]any); !ok || len(plugins) != 0 {
+		t.Fatalf("plugins=%#v", projected["plugin"])
+	}
+	if mcp, ok := projected["mcp"].(map[string]any); !ok || len(mcp) != 0 {
+		t.Fatalf("mcp=%#v", projected["mcp"])
+	}
+	if !strings.Contains(string(raw), "inline reviewer") || strings.Contains(strings.ToLower(string(raw)), "neurox") {
+		t.Fatalf("projected config=%s", raw)
+	}
+
+	args := reviewOpenCodeArgs("/private/worktree", "prompt", "openai/model", true)
+	if len(args) < 2 || args[0] != "run" || args[1] != "--pure" || !strings.Contains(strings.Join(args, " "), "--agent workflow-reviewer") {
+		t.Fatalf("hermetic argv=%q", args)
+	}
+	if legacy := reviewOpenCodeArgs("/worktree", "prompt", "", false); strings.Contains(strings.Join(legacy, " "), "--pure") {
+		t.Fatalf("legacy argv changed=%q", legacy)
+	}
+}
+
+func TestHermeticReviewResolvesOnlyExactConfiguredExecutable(t *testing.T) {
+	worktree := t.TempDir()
+	fixtureExecutable := filepath.Join(worktree, "fake-opencode")
+	if err := os.WriteFile(fixtureExecutable, []byte("fake"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := resolveHermeticReviewExecutable("./fake-opencode", worktree)
+	if err != nil || resolved != fixtureExecutable || !filepath.IsAbs(resolved) {
+		t.Fatalf("resolved fixture executable=%q err=%v", resolved, err)
+	}
+	identity, err := snapshotHermeticReviewExecutable(resolved)
+	if err != nil || revalidateHermeticReviewExecutable("./fake-opencode", worktree, resolved, identity) != nil {
+		t.Fatalf("stable executable identity=%v err=%v", identity, err)
+	}
+	replacement := filepath.Join(worktree, "replacement-opencode")
+	if err := os.WriteFile(replacement, []byte("replacement"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(fixtureExecutable); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, fixtureExecutable); err != nil {
+		t.Fatal(err)
+	}
+	if err := revalidateHermeticReviewExecutable("./fake-opencode", worktree, resolved, identity); err == nil {
+		t.Fatal("executable replacement passed launch revalidation")
+	}
+
+	absoluteExecutable := filepath.Join(t.TempDir(), "opencode")
+	if err := os.WriteFile(absoluteExecutable, []byte("fake"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err = resolveHermeticReviewExecutable(absoluteExecutable, worktree)
+	if err != nil || resolved != absoluteExecutable {
+		t.Fatalf("resolved absolute executable=%q err=%v", resolved, err)
+	}
+
+	for _, declared := range []string{"", "opencode", "../opencode", "./../opencode", ".//fake-opencode", "./fake\\opencode", "/tmp/../tmp/opencode"} {
+		if resolved, err := resolveHermeticReviewExecutable(declared, worktree); err == nil {
+			t.Fatalf("executable %q resolved to %q", declared, resolved)
+		}
+	}
+	nonExecutable := filepath.Join(worktree, "non-executable")
+	if err := os.WriteFile(nonExecutable, []byte("fake"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if resolved, err := resolveHermeticReviewExecutable("./non-executable", worktree); err == nil {
+		t.Fatalf("non-executable file resolved to %q", resolved)
+	}
+	symlink := filepath.Join(worktree, "linked-opencode")
+	if err := os.Symlink("fake-opencode", symlink); err != nil {
+		t.Fatal(err)
+	}
+	if resolved, err := resolveHermeticReviewExecutable("./linked-opencode", worktree); err == nil {
+		t.Fatalf("symlink resolved to %q", resolved)
+	}
+}
+
+func reviewTestEnvironmentMap(env []string) map[string]string {
+	result := make(map[string]string, len(env))
+	for _, item := range env {
+		key, value, ok := strings.Cut(item, "=")
+		if ok {
+			result[key] = value
+		}
+	}
+	return result
+}
 
 func TestReviewReadOnlyWorktreePreservesExecutableGitMode(t *testing.T) {
 	repo := filepath.Join(t.TempDir(), "repo")

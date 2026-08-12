@@ -4,14 +4,19 @@
 package lifecycle
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,6 +36,11 @@ const (
 	defaultHealthTimeout    = 2 * time.Second
 	defaultHealthInterval   = 100 * time.Millisecond
 	evaluatorServerUsername = "skynex-eval"
+	maxControlledPluginSize = 4 << 20
+	// EvaluatorManagedDetachEnvironment is an internal, exact-value capability.
+	// The evaluator injects it only for Workflow V2 canary runtimes so detached
+	// Skynex descendants remain inside the lifecycle-owned process group.
+	EvaluatorManagedDetachEnvironment = "SKYNEX_EVAL_MANAGED_DETACH"
 )
 
 var safeInheritedEnvironment = []string{
@@ -81,17 +91,149 @@ type Config struct {
 	ExpectedVersion string
 	HTTPClient      *http.Client
 
-	// Evaluation servers use --pure by default. AllowImpure is the explicit
-	// opt-out; Pure is retained as an affirmative override when configs are
-	// composed. ExtraArgs are appended without invoking a shell.
-	Pure        bool
-	AllowImpure bool
-	ExtraArgs   []string
+	// Evaluation servers use --pure unless ControlledPlugin proves the one
+	// evaluator-owned file URL present in the frozen config. AllowImpure is
+	// retained for compatibility but cannot bypass that identity fence. Pure is
+	// an affirmative override. ExtraArgs are appended without invoking a shell.
+	Pure             bool
+	AllowImpure      bool
+	ControlledPlugin *ControlledPluginIdentity
+	ExtraArgs        []string
 
 	// CommandArgs replaces the default arguments and is primarily useful for
 	// deterministic fake-server tests. {port}, {hostname}, and {workdir} are
 	// expanded without a shell.
 	CommandArgs []string
+}
+
+// ControlledPluginIdentity is the exact plugin authority that permits the
+// lifecycle to omit OpenCode's --pure flag.
+type ControlledPluginIdentity struct {
+	Path          string
+	ContentDigest string
+}
+
+func verifyControlledPluginBoundary(cfg Config) error {
+	if cfg.ControlledPlugin == nil {
+		if cfg.AllowImpure {
+			return errors.New("uncontrolled OpenCode plugin loading is forbidden")
+		}
+		return nil
+	}
+	if cfg.Pure {
+		return errors.New("controlled plugin and --pure are mutually exclusive")
+	}
+	if err := verifyControlledPluginIdentity(cfg.ControlledPlugin); err != nil {
+		return err
+	}
+	if cfg.ConfigHome == "" {
+		return errors.New("controlled plugin requires an evaluator-owned OpenCode config home")
+	}
+	if filepath.Clean(cfg.ConfigHome) != cfg.ConfigHome {
+		return errors.New("controlled OpenCode config home must be an exact clean path")
+	}
+	if err := validateControlledConfigHome(cfg.ConfigHome); err != nil {
+		return err
+	}
+	resolvedConfigHome, err := filepath.EvalSymlinks(cfg.ConfigHome)
+	if err != nil || filepath.Clean(resolvedConfigHome) != cfg.ConfigHome {
+		return errors.New("controlled OpenCode config home must not contain symlink components")
+	}
+	rootEntries, err := os.ReadDir(cfg.ConfigHome)
+	if err != nil || len(rootEntries) != 1 || rootEntries[0].Name() != "opencode" || !rootEntries[0].IsDir() {
+		return errors.New("controlled OpenCode config home must contain only the opencode directory")
+	}
+	configDir := filepath.Join(cfg.ConfigHome, "opencode")
+	dirInfo, err := os.Lstat(configDir)
+	if err != nil || !dirInfo.IsDir() || dirInfo.Mode()&os.ModeSymlink != 0 {
+		return errors.New("controlled OpenCode config directory is unavailable or symlinked")
+	}
+	configEntries, err := os.ReadDir(configDir)
+	if err != nil || len(configEntries) != 1 || configEntries[0].Name() != "opencode.json" || !configEntries[0].Type().IsRegular() {
+		return errors.New("controlled OpenCode config directory must contain only regular opencode.json")
+	}
+	configPath := filepath.Join(configDir, "opencode.json")
+	before, err := os.Lstat(configPath)
+	if err != nil || !before.Mode().IsRegular() || before.Size() > 8<<20 {
+		return errors.New("controlled OpenCode config file is unavailable, non-regular, or too large")
+	}
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		return fmt.Errorf("read controlled OpenCode config: %w", err)
+	}
+	after, err := os.Lstat(configPath)
+	if err != nil || !after.Mode().IsRegular() || !os.SameFile(before, after) || before.Size() != after.Size() {
+		return errors.New("controlled OpenCode config changed while it was verified")
+	}
+	var config map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&config); err != nil || config == nil {
+		return errors.New("controlled OpenCode config is not one JSON object")
+	}
+	if trailingErr := decoder.Decode(new(any)); !errors.Is(trailingErr, io.EOF) {
+		return errors.New("controlled OpenCode config contains trailing JSON")
+	}
+	plugins, ok := config["plugin"].([]any)
+	wantURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(cfg.ControlledPlugin.Path)}).String()
+	if !ok || len(plugins) != 1 || plugins[0] != wantURL {
+		return errors.New("controlled OpenCode config must contain exactly the attested plugin file URL")
+	}
+	return nil
+}
+
+func verifyControlledPluginIdentity(identity *ControlledPluginIdentity) error {
+	if identity == nil {
+		return nil
+	}
+	if identity.Path == "" || !filepath.IsAbs(identity.Path) || filepath.Clean(identity.Path) != identity.Path {
+		return errors.New("controlled plugin path must be exact, clean, and absolute")
+	}
+	if !strings.HasPrefix(identity.ContentDigest, "sha256:") || len(identity.ContentDigest) != len("sha256:")+sha256.Size*2 ||
+		strings.ToLower(identity.ContentDigest) != identity.ContentDigest {
+		return errors.New("controlled plugin digest must be a lowercase sha256 digest")
+	}
+	if _, err := hex.DecodeString(strings.TrimPrefix(identity.ContentDigest, "sha256:")); err != nil {
+		return errors.New("controlled plugin digest must be a lowercase sha256 digest")
+	}
+	resolved, err := filepath.EvalSymlinks(identity.Path)
+	if err != nil {
+		return fmt.Errorf("resolve controlled plugin path: %w", err)
+	}
+	if filepath.Clean(resolved) != identity.Path {
+		return errors.New("controlled plugin path must not contain symlink components")
+	}
+	before, err := os.Lstat(identity.Path)
+	if err != nil {
+		return fmt.Errorf("inspect controlled plugin: %w", err)
+	}
+	if !before.Mode().IsRegular() || before.Size() > maxControlledPluginSize {
+		return fmt.Errorf("controlled plugin must be a regular file no larger than %d bytes", maxControlledPluginSize)
+	}
+	file, err := os.Open(identity.Path)
+	if err != nil {
+		return fmt.Errorf("open controlled plugin: %w", err)
+	}
+	hash := sha256.New()
+	read, copyErr := io.Copy(hash, io.LimitReader(file, maxControlledPluginSize+1))
+	opened, statErr := file.Stat()
+	closeErr := file.Close()
+	if copyErr != nil || statErr != nil || closeErr != nil {
+		return errors.New("read controlled plugin")
+	}
+	if read > maxControlledPluginSize {
+		return fmt.Errorf("controlled plugin exceeds %d bytes", maxControlledPluginSize)
+	}
+	after, err := os.Lstat(identity.Path)
+	if err != nil || !opened.Mode().IsRegular() || !after.Mode().IsRegular() ||
+		!os.SameFile(before, opened) || !os.SameFile(before, after) || before.Size() != after.Size() {
+		return errors.New("controlled plugin changed while it was verified")
+	}
+	got := "sha256:" + hex.EncodeToString(hash.Sum(nil))
+	if got != identity.ContentDigest {
+		return errors.New("controlled plugin content digest mismatch")
+	}
+	return nil
 }
 
 type serverState uint8
@@ -335,6 +477,14 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.beforeCommandStart != nil {
 		s.beforeCommandStart()
 	}
+	if err := verifyControlledPluginBoundary(s.cfg); err != nil {
+		s.cmd = nil
+		s.waitDone = nil
+		s.state = stateNew
+		s.mu.Unlock()
+		unlockLaunch()
+		return errors.Join(fmt.Errorf("revalidate controlled plugin before OpenCode launch: %w", err), s.Stop())
+	}
 	if err := cmd.Start(); err != nil {
 		s.cmd = nil
 		s.waitDone = nil
@@ -359,6 +509,9 @@ func (s *Server) Start(ctx context.Context) error {
 		info, healthErr := s.Health(healthCtx)
 		cancel()
 		if healthErr == nil {
+			if err := verifyControlledPluginBoundary(s.cfg); err != nil {
+				return errors.Join(fmt.Errorf("revalidate controlled plugin after OpenCode startup: %w", err), s.Stop())
+			}
 			s.mu.Lock()
 			if s.state != stateStarting {
 				waitErr := s.waitErr
@@ -419,10 +572,11 @@ func (s *Server) prepare() error {
 			return err
 		}
 	}
-	if !s.cfg.AllowImpure {
-		if err := rejectManagedOpenCodeConfig(); err != nil {
-			return err
-		}
+	if err := verifyControlledPluginBoundary(s.cfg); err != nil {
+		return err
+	}
+	if err := rejectManagedOpenCodeConfig(); err != nil {
+		return err
 	}
 	serverPassword, err := randomServerPassword()
 	if err != nil {
@@ -523,7 +677,7 @@ func (s *Server) commandArgsLocked() []string {
 		return args
 	}
 	args := []string{"serve"}
-	if s.cfg.Pure || !s.cfg.AllowImpure {
+	if s.cfg.Pure || s.cfg.ControlledPlugin == nil {
 		args = append(args, "--pure")
 	}
 	args = append(args, "--port", fmt.Sprintf("%d", s.port), "--hostname", s.cfg.Hostname)
@@ -572,23 +726,44 @@ func (s *Server) Stop() error {
 		s.mu.Unlock()
 
 		var errs []error
+		reaped := waitDone == nil
+		waitForReap := func(timeout time.Duration) bool {
+			if reaped {
+				return true
+			}
+			timer := time.NewTimer(timeout)
+			defer timer.Stop()
+			select {
+			case <-waitDone:
+				reaped = true
+				return true
+			case <-timer.C:
+				return false
+			}
+		}
 		if pid > 0 {
 			if err := terminateProcessGroup(pid); err != nil && !isProcessGone(err) {
 				errs = append(errs, fmt.Errorf("terminate process group %d: %w", pid, err))
 			}
-			if !waitForProcessGroup(pid, s.cfg.ShutdownTimeout) {
+			// Reap the leader first when TERM is sufficient. A dead but unreaped
+			// leader makes kill(-pgid, 0) look live and would otherwise trigger a
+			// needless escalation on every graceful shutdown.
+			_ = waitForReap(s.cfg.ShutdownTimeout)
+			if processGroupAlive(pid) {
 				if err := killProcessGroup(pid); err != nil && !isProcessGone(err) {
 					errs = append(errs, fmt.Errorf("kill process group %d: %w", pid, err))
 				}
-				_ = waitForProcessGroup(pid, time.Second)
 			}
-		}
-		if waitDone != nil {
-			select {
-			case <-waitDone:
-			case <-time.After(time.Second):
+			if !waitForReap(time.Second) {
 				errs = append(errs, errors.New("timed out waiting for server process reap"))
 			}
+			// Always attest group disappearance after the bounded parent reap;
+			// successful cmd.Wait alone says nothing about descendants.
+			if !waitForProcessGroup(pid, time.Second) {
+				errs = append(errs, fmt.Errorf("process group %d remained live after shutdown and parent reap", pid))
+			}
+		} else if !waitForReap(time.Second) {
+			errs = append(errs, errors.New("timed out waiting for server process reap"))
 		}
 		if err := s.closeLog(); err != nil {
 			errs = append(errs, err)
@@ -598,6 +773,9 @@ func (s *Server) Stop() error {
 		}
 		if err := s.cleanupPrivateEnvironment(); err != nil {
 			errs = append(errs, err)
+		}
+		if err := verifyControlledPluginBoundary(s.cfg); err != nil {
+			errs = append(errs, fmt.Errorf("controlled plugin identity drifted during OpenCode execution: %w", err))
 		}
 		s.mu.Lock()
 		s.state = stateStopped
@@ -881,7 +1059,11 @@ func buildEnvironment(allowlist []string, overrides map[string]string, runDir st
 			return nil, err
 		}
 		if isReservedEvaluationEnvironment(key) {
-			return nil, fmt.Errorf("environment key %q is reserved for evaluation isolation", key)
+			if key != EvaluatorManagedDetachEnvironment || value != "1" {
+				return nil, fmt.Errorf("environment key %q is reserved for evaluation isolation", key)
+			}
+			values[key] = value
+			continue
 		}
 		if strings.IndexByte(value, 0) >= 0 {
 			return nil, fmt.Errorf("environment value for %q contains NUL", key)
@@ -995,6 +1177,9 @@ func privateEnvironmentPaths(env []string) []string {
 func isReservedEvaluationEnvironment(key string) bool {
 	upper := strings.ToUpper(key)
 	if upper == mcpproxy.ManifestEnvironment {
+		return true
+	}
+	if upper == EvaluatorManagedDetachEnvironment {
 		return true
 	}
 	if upper == "HOME" || upper == "TMPDIR" || upper == "TEMP" || upper == "TMP" ||

@@ -2,8 +2,11 @@ package runner
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -164,6 +167,39 @@ func TestPrepareToolPolicyOverlaysFrozenBundleFailClosed(t *testing.T) {
 	}
 	if len(effective.MCPAttestations) != 1 || effective.MCPAttestations[0].MCPName != "worker" || len(effective.MCPAttestations[0].Nonce) != 64 || effective.MCPProxy.Path != executable {
 		t.Fatalf("private MCP attestation authority = %#v / %#v", effective.MCPAttestations, effective.MCPProxy)
+	}
+}
+
+func TestPrepareToolPolicyWithControlledWorkflowPlugin(t *testing.T) {
+	bundle := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bundle, "opencode.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pluginPath := filepath.Join(t.TempDir(), "skynex-workflow.ts")
+	content := []byte("export default async function workflow() {}\n")
+	if err := os.WriteFile(pluginPath, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(content)
+	plugin := &toolpolicy.ControlledPluginIdentity{Path: pluginPath, ContentDigest: "sha256:" + hex.EncodeToString(sum[:])}
+	testCase := contracts.Case{
+		Agent:      contracts.AgentConfig{Name: "orchestrator", Model: "openai/gpt-5.6-terra"},
+		ToolPolicy: contracts.ToolPolicy{AllowedTools: []string{"read"}},
+	}
+	effective, err := prepareToolPolicyWithAuthority(bundle, testCase, nil, "", plugin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if effective.Plugin == nil || *effective.Plugin != *plugin {
+		t.Fatalf("effective plugin = %#v, want %#v", effective.Plugin, plugin)
+	}
+	var config map[string]any
+	if err := json.Unmarshal(effective.Config, &config); err != nil {
+		t.Fatal(err)
+	}
+	wantURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(pluginPath)}).String()
+	if plugins, ok := config["plugin"].([]any); !ok || len(plugins) != 1 || plugins[0] != wantURL {
+		t.Fatalf("effective plugin config = %#v, want [%q]", config["plugin"], wantURL)
 	}
 }
 

@@ -1,7 +1,7 @@
 // Package toolpolicy creates and verifies an evaluator-owned OpenCode tool
 // boundary. The generated policy is fail-closed: unknown tools are denied,
-// ambient MCPs are disabled, plugins/connectors are removed, and only declared
-// local stdio fakes may be enabled.
+// ambient MCPs are disabled, ambient plugins/connectors are removed, and only
+// one content-attested plugin plus declared local stdio fakes may be enabled.
 package toolpolicy
 
 import (
@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -23,12 +24,14 @@ import (
 const (
 	SchemaVersion      = 1
 	maxPolicyJSONBytes = 8 << 20
+	maxPluginBytes     = 4 << 20
 )
 
 var (
 	ErrUnsafePolicy = errors.New("unsafe evaluator tool policy")
 	namePattern     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$`)
 	envNamePattern  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	sha256Pattern   = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 )
 
 // These external mutation surfaces are denied even if a case accidentally
@@ -80,27 +83,112 @@ type FakeMCP struct {
 }
 
 type Input struct {
-	Base            json.RawMessage `json:"-"`
-	AllowedTools    []string        `json:"allowed_tools"`
-	ForbiddenTools  []string        `json:"forbidden_tools"`
-	AmbientMCPNames []string        `json:"ambient_mcp_names,omitempty"`
-	FakeMCPs        []FakeMCP       `json:"fake_mcps,omitempty"`
+	Base            json.RawMessage           `json:"-"`
+	AllowedTools    []string                  `json:"allowed_tools"`
+	ForbiddenTools  []string                  `json:"forbidden_tools"`
+	AmbientMCPNames []string                  `json:"ambient_mcp_names,omitempty"`
+	FakeMCPs        []FakeMCP                 `json:"fake_mcps,omitempty"`
+	Plugin          *ControlledPluginIdentity `json:"plugin,omitempty"`
 }
 
 type Effective struct {
-	SchemaVersion    int               `json:"schema_version"`
-	Config           json.RawMessage   `json:"config"`
-	Digest           string            `json:"digest"`
-	PromptTools      map[string]bool   `json:"prompt_tools"`
-	FakeToolBindings []FakeToolBinding `json:"fake_tool_bindings,omitempty"`
-	EnabledFakes     []string          `json:"enabled_fakes,omitempty"`
-	DisabledMCPs     []string          `json:"disabled_mcps,omitempty"`
+	SchemaVersion       int               `json:"schema_version"`
+	Config              json.RawMessage   `json:"config"`
+	Digest              string            `json:"digest"`
+	AuthorizationDigest string            `json:"authorization_digest"`
+	PromptTools         map[string]bool   `json:"prompt_tools"`
+	FakeToolBindings    []FakeToolBinding `json:"fake_tool_bindings,omitempty"`
+	EnabledFakes        []string          `json:"enabled_fakes,omitempty"`
+	DisabledMCPs        []string          `json:"disabled_mcps,omitempty"`
+	// Plugin is live execution authority rather than artifact data. The
+	// canonical config carries its file URL while this identity is revalidated
+	// against the filesystem immediately before it can be trusted.
+	Plugin *ControlledPluginIdentity `json:"-"`
 	// MCPAttestations and MCPProxy are fresh/private runtime authority. They
 	// are deliberately excluded from JSON so nonces and run-local paths cannot
 	// perturb the content-addressed effective OpenCode configuration or leak
 	// into evaluator artifacts.
 	MCPAttestations []MCPAttestationBinding `json:"-"`
 	MCPProxy        MCPProxyIdentity        `json:"-"`
+}
+
+// ControlledPluginIdentity is the only plugin authority accepted by the
+// evaluator. Path is an exact, clean absolute regular file path with no
+// symlink components; ContentDigest is its lowercase sha256 content digest.
+type ControlledPluginIdentity struct {
+	Path          string `json:"path"`
+	ContentDigest string `json:"content_digest"`
+}
+
+// VerifyControlledPluginIdentity revalidates optional plugin authority against
+// the current filesystem. It intentionally rejects symlinked paths so the file
+// URL OpenCode consumes identifies the same object that was hashed here.
+func VerifyControlledPluginIdentity(identity *ControlledPluginIdentity) error {
+	if identity == nil {
+		return nil
+	}
+	if identity.Path == "" || !filepath.IsAbs(identity.Path) || filepath.Clean(identity.Path) != identity.Path {
+		return fmt.Errorf("%w: controlled plugin path must be exact, clean, and absolute", ErrUnsafePolicy)
+	}
+	if !sha256Pattern.MatchString(identity.ContentDigest) {
+		return fmt.Errorf("%w: controlled plugin digest must be a lowercase sha256 digest", ErrUnsafePolicy)
+	}
+	resolved, err := filepath.EvalSymlinks(identity.Path)
+	if err != nil {
+		return fmt.Errorf("%w: resolve controlled plugin path: %v", ErrUnsafePolicy, err)
+	}
+	if filepath.Clean(resolved) != identity.Path {
+		return fmt.Errorf("%w: controlled plugin path must not contain symlink components", ErrUnsafePolicy)
+	}
+	before, err := os.Lstat(identity.Path)
+	if err != nil {
+		return fmt.Errorf("%w: inspect controlled plugin: %v", ErrUnsafePolicy, err)
+	}
+	if !before.Mode().IsRegular() || before.Size() > maxPluginBytes {
+		return fmt.Errorf("%w: controlled plugin must be a regular file no larger than %d bytes", ErrUnsafePolicy, maxPluginBytes)
+	}
+	file, err := os.Open(identity.Path)
+	if err != nil {
+		return fmt.Errorf("%w: open controlled plugin: %v", ErrUnsafePolicy, err)
+	}
+	hash := sha256.New()
+	read, copyErr := io.Copy(hash, io.LimitReader(file, maxPluginBytes+1))
+	opened, statErr := file.Stat()
+	closeErr := file.Close()
+	if copyErr != nil || statErr != nil || closeErr != nil {
+		return fmt.Errorf("%w: read controlled plugin", ErrUnsafePolicy)
+	}
+	if read > maxPluginBytes {
+		return fmt.Errorf("%w: controlled plugin exceeds %d bytes", ErrUnsafePolicy, maxPluginBytes)
+	}
+	after, err := os.Lstat(identity.Path)
+	if err != nil || !opened.Mode().IsRegular() || !after.Mode().IsRegular() ||
+		!os.SameFile(before, opened) || !os.SameFile(before, after) || before.Size() != after.Size() {
+		return fmt.Errorf("%w: controlled plugin changed while it was verified", ErrUnsafePolicy)
+	}
+	got := "sha256:" + hex.EncodeToString(hash.Sum(nil))
+	if got != identity.ContentDigest {
+		return fmt.Errorf("%w: controlled plugin content digest mismatch", ErrUnsafePolicy)
+	}
+	return nil
+}
+
+func controlledPluginURL(identity *ControlledPluginIdentity) (string, error) {
+	if identity == nil {
+		return "", nil
+	}
+	if err := VerifyControlledPluginIdentity(identity); err != nil {
+		return "", err
+	}
+	return (&url.URL{Scheme: "file", Path: filepath.ToSlash(identity.Path)}).String(), nil
+}
+
+func cloneControlledPluginIdentity(identity *ControlledPluginIdentity) *ControlledPluginIdentity {
+	if identity == nil {
+		return nil
+	}
+	clone := *identity
+	return &clone
 }
 
 type MCPAttestationBinding struct {
@@ -224,9 +312,8 @@ func validateEffective(effective Effective) (map[string]bool, error) {
 	if !ok || len(command) != 0 {
 		return nil, fmt.Errorf("%w: effective command catalogue must be an empty object", ErrUnsafePolicy)
 	}
-	plugins, ok := config["plugin"].([]any)
-	if !ok || len(plugins) != 0 {
-		return nil, fmt.Errorf("%w: effective plugins/connectors must be empty", ErrUnsafePolicy)
+	if err := validatePluginConfiguration(config["plugin"], effective.Plugin); err != nil {
+		return nil, err
 	}
 	for key, want := range map[string]any{
 		"formatter": false, "lsp": false, "share": "disabled", "autoshare": false, "autoupdate": false,
@@ -345,7 +432,94 @@ func validateEffective(effective Effective) (map[string]bool, error) {
 	if len(boundMCPs) != len(enabledMCPs) {
 		return nil, fmt.Errorf("%w: an enabled fake MCP has no declared tool binding", ErrUnsafePolicy)
 	}
+	wantAuthorizationDigest, err := authorizationDigest(config, effective.Plugin)
+	if err != nil {
+		return nil, err
+	}
+	if effective.AuthorizationDigest != wantAuthorizationDigest {
+		return nil, fmt.Errorf("%w: effective authorization digest mismatch", ErrUnsafePolicy)
+	}
 	return tools, nil
+}
+
+func validatePluginConfiguration(raw any, identity *ControlledPluginIdentity) error {
+	plugins, ok := raw.([]any)
+	if !ok {
+		return fmt.Errorf("%w: effective plugin configuration must be an array", ErrUnsafePolicy)
+	}
+	if identity == nil {
+		if len(plugins) != 0 {
+			return fmt.Errorf("%w: effective plugins/connectors must be empty without controlled plugin authority", ErrUnsafePolicy)
+		}
+		return nil
+	}
+	pluginURL, err := controlledPluginURL(identity)
+	if err != nil {
+		return err
+	}
+	if len(plugins) != 1 || plugins[0] != pluginURL {
+		return fmt.Errorf("%w: effective plugin configuration must contain exactly the controlled file URL", ErrUnsafePolicy)
+	}
+	return nil
+}
+
+func authorizationDigest(config map[string]any, plugin *ControlledPluginIdentity) (string, error) {
+	agents, err := authorizationAgentProjection(config, "agent")
+	if err != nil {
+		return "", err
+	}
+	modes, err := authorizationAgentProjection(config, "mode")
+	if err != nil {
+		return "", err
+	}
+	projection := map[string]any{
+		"schema":     "opencode-evaluator-authorization-v1",
+		"tools":      config["tools"],
+		"permission": config["permission"],
+		"mcp":        config["mcp"],
+		"plugin": map[string]any{
+			"enabled":        plugin != nil,
+			"content_digest": controlledPluginContentDigest(plugin),
+		},
+		"agent": agents,
+		"mode":  modes,
+	}
+	raw, err := json.Marshal(projection)
+	if err != nil {
+		return "", fmt.Errorf("%w: marshal effective authorization projection", ErrUnsafePolicy)
+	}
+	sum := sha256.Sum256(raw)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+func controlledPluginContentDigest(plugin *ControlledPluginIdentity) string {
+	if plugin == nil {
+		return ""
+	}
+	return plugin.ContentDigest
+}
+
+func authorizationAgentProjection(config map[string]any, field string) (map[string]any, error) {
+	projection := make(map[string]any)
+	raw, exists := config[field]
+	if !exists {
+		return projection, nil
+	}
+	agents, ok := raw.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("%w: effective %s field must be an object", ErrUnsafePolicy, field)
+	}
+	for name, rawEntry := range agents {
+		entry, ok := rawEntry.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("%w: effective %s %q must be an object", ErrUnsafePolicy, field, name)
+		}
+		projection[name] = map[string]any{
+			"tools":      entry["tools"],
+			"permission": entry["permission"],
+		}
+	}
+	return projection, nil
 }
 
 // Generate overlays a restrictive boundary on an evaluator-owned base config.
@@ -354,6 +528,10 @@ func validateEffective(effective Effective) (map[string]bool, error) {
 // the server's resolved /config response.
 func Generate(input Input) (Effective, error) {
 	normalized, err := normalizeInput(input)
+	if err != nil {
+		return Effective{}, err
+	}
+	pluginURL, err := controlledPluginURL(normalized.Plugin)
 	if err != nil {
 		return Effective{}, err
 	}
@@ -446,6 +624,9 @@ func Generate(input Input) (Effective, error) {
 	}
 	base["mcp"] = mcp
 	base["plugin"] = []string{}
+	if pluginURL != "" {
+		base["plugin"] = []string{pluginURL}
+	}
 	// Provider packages, endpoints, and options are runtime authority. The
 	// evaluator pins the provider/model selection separately; OpenCode supplies
 	// the built-in provider implementation.
@@ -470,10 +651,17 @@ func Generate(input Input) (Effective, error) {
 	if err := rejectRuntimeConfigSubstitutions(base); err != nil {
 		return Effective{}, err
 	}
+	if err := VerifyControlledPluginIdentity(normalized.Plugin); err != nil {
+		return Effective{}, err
+	}
 
 	raw, err := json.Marshal(base)
 	if err != nil {
 		return Effective{}, fmt.Errorf("marshal effective config: %w", err)
+	}
+	authorization, err := authorizationDigest(base, normalized.Plugin)
+	if err != nil {
+		return Effective{}, err
 	}
 	sum := sha256.Sum256(raw)
 	disabled := make([]string, 0, len(ambient))
@@ -482,13 +670,15 @@ func Generate(input Input) (Effective, error) {
 	}
 	sort.Strings(disabled)
 	return Effective{
-		SchemaVersion:    SchemaVersion,
-		Config:           raw,
-		Digest:           "sha256:" + hex.EncodeToString(sum[:]),
-		PromptTools:      tools,
-		FakeToolBindings: bindings,
-		EnabledFakes:     enabledFakes,
-		DisabledMCPs:     disabled,
+		SchemaVersion:       SchemaVersion,
+		Config:              raw,
+		Digest:              "sha256:" + hex.EncodeToString(sum[:]),
+		AuthorizationDigest: authorization,
+		PromptTools:         tools,
+		FakeToolBindings:    bindings,
+		EnabledFakes:        enabledFakes,
+		DisabledMCPs:        disabled,
+		Plugin:              cloneControlledPluginIdentity(normalized.Plugin),
 	}, nil
 }
 
@@ -819,6 +1009,10 @@ func applyAgentBoundary(base map[string]any, field string, tools map[string]bool
 }
 
 func normalizeInput(input Input) (Input, error) {
+	input.Plugin = cloneControlledPluginIdentity(input.Plugin)
+	if err := VerifyControlledPluginIdentity(input.Plugin); err != nil {
+		return Input{}, err
+	}
 	fakes := make([]FakeMCP, len(input.FakeMCPs))
 	for i, fake := range input.FakeMCPs {
 		fakes[i] = fake

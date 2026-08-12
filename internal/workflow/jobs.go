@@ -42,6 +42,7 @@ const WorkflowSessionPresenceTTL = 20 * time.Second
 const MaxWorkflowJobAttempts = 3
 
 const JobDisplacedErrorPrefix = "execution displaced: "
+const managedEvaluationCleanupJobError = "evaluator-managed cleanup"
 
 var workflowJobProcessAlive = workflowProcessAlive
 
@@ -89,6 +90,112 @@ func (s *SQLiteStore) ReconcileStaleWorkflowJobs(workflowID string, now time.Tim
 		}
 	}
 	return nil
+}
+
+// ReconcileManagedEvaluationJobs retires jobs after the evaluator has stopped
+// and verified the process group that owned them. It is deliberately not a
+// general recovery primitive: the caller must establish that external process
+// boundary before changing durable job state here.
+//
+// Approval gates are not process-owned work and are never rewritten. Their
+// presence makes reconciliation fail closed, with the whole transaction rolled
+// back, so a caller cannot mistake a partially cleaned workflow for quiescence.
+func (s *SQLiteStore) ReconcileManagedEvaluationJobs(workflowID string, now time.Time) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// SQLite transactions start deferred. Take the writer reservation before
+	// observing jobs so even an idempotent reconciliation cannot race a newly
+	// admitted row between the zero-live check and commit.
+	if _, err = tx.Exec(`UPDATE workflows SET state=state WHERE id=?`, workflowID); err != nil {
+		return err
+	}
+	var terminal State
+	if err = tx.QueryRow(`SELECT state FROM workflows WHERE id=?`, workflowID).Scan(&terminal); err != nil {
+		return err
+	}
+
+	rows, err := tx.Query(
+		`SELECT id FROM workflow_jobs WHERE workflow_id=? AND state IN (?,?,?) ORDER BY rowid`,
+		workflowID,
+		JobQueued,
+		JobRunning,
+		JobCancelRequested,
+	)
+	if err != nil {
+		return err
+	}
+	var jobIDs []string
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		jobIDs = append(jobIDs, id)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err = rows.Close(); err != nil {
+		return err
+	}
+
+	for _, id := range jobIDs {
+		result, updateErr := tx.Exec(
+			`UPDATE workflow_jobs SET state=?,terminal_state=?,error=?,finished_at=?,heartbeat_at=? WHERE id=? AND workflow_id=? AND state IN (?,?,?)`,
+			JobCancelled,
+			terminal,
+			managedEvaluationCleanupJobError,
+			dbTime(now),
+			dbTime(now),
+			id,
+			workflowID,
+			JobQueued,
+			JobRunning,
+			JobCancelRequested,
+		)
+		if updateErr != nil {
+			return updateErr
+		}
+		updated, affectedErr := result.RowsAffected()
+		if affectedErr != nil {
+			return affectedErr
+		}
+		if updated != 1 {
+			return fmt.Errorf("workflow: evaluator-managed cleanup lost job %s", id)
+		}
+		if _, err = tx.Exec(
+			`INSERT OR IGNORE INTO workflow_notifications(id,workflow_id,job_id,terminal_state,created_at) VALUES(?,?,?,?,?)`,
+			"notification:"+id,
+			workflowID,
+			id,
+			terminal,
+			dbTime(now),
+		); err != nil {
+			return err
+		}
+	}
+
+	var live int
+	if err = tx.QueryRow(
+		`SELECT COUNT(*) FROM workflow_jobs WHERE workflow_id=? AND state IN (?,?,?,?)`,
+		workflowID,
+		JobQueued,
+		JobRunning,
+		JobCancelRequested,
+		JobWaitingApproval,
+	).Scan(&live); err != nil {
+		return err
+	}
+	if live != 0 {
+		return fmt.Errorf("workflow: evaluator-managed cleanup left %d live job(s) for %s", live, workflowID)
+	}
+	return tx.Commit()
 }
 
 func (s *SQLiteStore) staleWorkflowJobs(workflowID string, now time.Time) ([]staleWorkflowJob, error) {

@@ -2,6 +2,8 @@ package runner
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -29,6 +31,40 @@ const (
 	runnerHelperTools   = "SKYNEX_RUNNER_TOOL_IDS_BODY"
 	runnerHelperMCP     = "SKYNEX_RUNNER_MCP_STATUS_BODY"
 )
+
+func TestControlledLifecyclePluginRequiresMatchingPinnedIdentity(t *testing.T) {
+	if plugin, err := controlledLifecyclePlugin(nil, nil); err != nil || plugin != nil {
+		t.Fatalf("nil plugin boundary = %#v, %v", plugin, err)
+	}
+	pluginPath := filepath.Join(t.TempDir(), "skynex-workflow.ts")
+	content := []byte("export default async function workflow() {}\n")
+	if err := os.WriteFile(pluginPath, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(content)
+	identity := &toolpolicy.ControlledPluginIdentity{Path: pluginPath, ContentDigest: "sha256:" + hex.EncodeToString(sum[:])}
+	if _, err := controlledLifecyclePlugin(identity, nil); err == nil {
+		t.Fatal("factory-only plugin identity was accepted")
+	}
+	different := *identity
+	different.ContentDigest = "sha256:" + strings.Repeat("0", 64)
+	if _, err := controlledLifecyclePlugin(identity, &different); err == nil {
+		t.Fatal("mismatched plugin identities were accepted")
+	}
+	mapped, err := controlledLifecyclePlugin(identity, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mapped.Path != identity.Path || mapped.ContentDigest != identity.ContentDigest {
+		t.Fatalf("mapped lifecycle plugin = %#v", mapped)
+	}
+	if err := os.WriteFile(pluginPath, []byte("export default async function changed() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controlledLifecyclePlugin(identity, identity); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
+		t.Fatalf("mutated plugin error = %v", err)
+	}
+}
 
 // TestRunnerOpenCodeFactoryHelperProcess is re-executed behind a tiny wrapper
 // as an evaluator-owned fake OpenCode server. It implements probe endpoints
@@ -168,7 +204,7 @@ func TestOpenCodeFactoryProbesAndBindsVerifiedToolCatalog(t *testing.T) {
 		t.Fatalf("probed tool catalog = %v", catalog)
 	}
 	info := runtimeHandle.Info()
-	wantToolset, err := contracts.CanonicalDigest(map[string]string{"policy": info.ToolPolicyDigest, "catalog": info.ToolCatalogDigest})
+	wantToolset, err := contracts.CanonicalDigest(map[string]string{"authorization": effective.AuthorizationDigest, "catalog": info.ToolCatalogDigest})
 	if err != nil {
 		t.Fatal(err)
 	}

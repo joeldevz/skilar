@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -43,7 +44,8 @@ func TestGenerateFailClosedEffectiveConfigAndCanonicalDigest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if effective.SchemaVersion != SchemaVersion || !strings.HasPrefix(effective.Digest, "sha256:") || len(effective.Digest) != 71 {
+	if effective.SchemaVersion != SchemaVersion || !strings.HasPrefix(effective.Digest, "sha256:") || len(effective.Digest) != 71 ||
+		!strings.HasPrefix(effective.AuthorizationDigest, "sha256:") || len(effective.AuthorizationDigest) != 71 {
 		t.Fatalf("effective metadata = %#v", effective)
 	}
 	if !reflect.DeepEqual(effective.EnabledFakes, []string{"neurox"}) || !reflect.DeepEqual(effective.DisabledMCPs, []string{"context7", "exa"}) {
@@ -118,6 +120,169 @@ func TestGenerateFailClosedEffectiveConfigAndCanonicalDigest(t *testing.T) {
 	}
 	if second.Digest != effective.Digest || string(second.Config) != string(effective.Config) {
 		t.Fatalf("canonical output changed with input order\nfirst:  %s %s\nsecond: %s %s", effective.Digest, effective.Config, second.Digest, second.Config)
+	}
+}
+
+func TestAuthorizationDigestExcludesPromptAndModelButTracksAuthority(t *testing.T) {
+	first, err := Generate(Input{
+		Base:         json.RawMessage(`{"model":"openai/model-a","agent":{"orchestrator":{"prompt":"candidate A","description":"A","model":"openai/model-a"}}}`),
+		AllowedTools: []string{"read"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := Generate(Input{
+		Base:         json.RawMessage(`{"model":"openai/model-b","agent":{"orchestrator":{"prompt":"candidate B","description":"B","model":"openai/model-b"}}}`),
+		AllowedTools: []string{"read"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Digest == second.Digest {
+		t.Fatal("full config digest did not observe prompt/model change")
+	}
+	if first.AuthorizationDigest != second.AuthorizationDigest {
+		t.Fatalf("authorization digest changed with prompt/model only: %s != %s", first.AuthorizationDigest, second.AuthorizationDigest)
+	}
+
+	widened, err := Generate(Input{
+		Base:         json.RawMessage(`{"model":"openai/model-b","agent":{"orchestrator":{"prompt":"candidate B"}}}`),
+		AllowedTools: []string{"read", "edit"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if widened.AuthorizationDigest == second.AuthorizationDigest {
+		t.Fatal("authorization digest ignored a tool-authority change")
+	}
+}
+
+func TestControlledPluginIsExactPinnedAuthorityAndRevalidated(t *testing.T) {
+	pluginPath := filepath.Join(t.TempDir(), "skynex-workflow.ts")
+	content := []byte("export default async function workflow() {}\n")
+	if err := os.WriteFile(pluginPath, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(content)
+	identity := ControlledPluginIdentity{
+		Path:          pluginPath,
+		ContentDigest: "sha256:" + hex.EncodeToString(sum[:]),
+	}
+	effective, err := Generate(Input{AllowedTools: []string{"read"}, Plugin: &identity})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if effective.Plugin == nil || effective.Plugin == &identity || *effective.Plugin != identity {
+		t.Fatalf("effective plugin identity = %#v", effective.Plugin)
+	}
+	serialized, err := json.Marshal(effective)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var serializedFields map[string]any
+	if err := json.Unmarshal(serialized, &serializedFields); err != nil {
+		t.Fatal(err)
+	}
+	if _, exposed := serializedFields["plugin"]; exposed {
+		t.Fatal("live plugin identity was serialized as effective-policy metadata")
+	}
+	var config map[string]any
+	if err := json.Unmarshal(effective.Config, &config); err != nil {
+		t.Fatal(err)
+	}
+	wantURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(pluginPath)}).String()
+	if plugins, ok := config["plugin"].([]any); !ok || len(plugins) != 1 || plugins[0] != wantURL {
+		t.Fatalf("controlled plugin config = %#v, want [%q]", config["plugin"], wantURL)
+	}
+	if verification := VerifyRuntimeConfig(effective.Config, effective); !verification.Valid {
+		t.Fatalf("controlled plugin config did not verify: %#v", verification)
+	}
+
+	var widened map[string]any
+	if err := json.Unmarshal(effective.Config, &widened); err != nil {
+		t.Fatal(err)
+	}
+	widened["plugin"] = []any{wantURL, "file:///ambient.ts"}
+	raw, err := json.Marshal(widened)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verification := VerifyRuntimeConfig(raw, effective); verification.Valid {
+		t.Fatal("runtime config with an additional plugin verified")
+	}
+
+	if err := os.WriteFile(pluginPath, []byte("export default async function changed() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := BindPromptTools(effective, []string{"read"}); !errors.Is(err, ErrUnsafePolicy) || !strings.Contains(err.Error(), "content digest mismatch") {
+		t.Fatalf("mutated controlled plugin error = %v", err)
+	}
+	if verification := VerifyRuntimeConfig(effective.Config, effective); verification.Valid {
+		t.Fatal("expected policy remained valid after controlled plugin mutation")
+	}
+}
+
+func TestControlledPluginRejectsRelativeSymlinkAndWrongDigest(t *testing.T) {
+	pluginPath := filepath.Join(t.TempDir(), "plugin.ts")
+	content := []byte("export default {}\n")
+	if err := os.WriteFile(pluginPath, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(content)
+	validDigest := "sha256:" + hex.EncodeToString(sum[:])
+
+	tests := []struct {
+		name     string
+		identity ControlledPluginIdentity
+	}{
+		{name: "relative", identity: ControlledPluginIdentity{Path: "plugin.ts", ContentDigest: validDigest}},
+		{name: "wrong digest", identity: ControlledPluginIdentity{Path: pluginPath, ContentDigest: "sha256:" + strings.Repeat("0", 64)}},
+		{name: "uppercase digest", identity: ControlledPluginIdentity{Path: pluginPath, ContentDigest: "sha256:" + strings.Repeat("A", 64)}},
+	}
+	if runtime.GOOS != "windows" {
+		symlinkPath := filepath.Join(t.TempDir(), "plugin-link.ts")
+		if err := os.Symlink(pluginPath, symlinkPath); err != nil {
+			t.Fatal(err)
+		}
+		tests = append(tests, struct {
+			name     string
+			identity ControlledPluginIdentity
+		}{name: "symlink", identity: ControlledPluginIdentity{Path: symlinkPath, ContentDigest: validDigest}})
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := Generate(Input{AllowedTools: []string{"read"}, Plugin: &test.identity}); !errors.Is(err, ErrUnsafePolicy) {
+				t.Fatalf("error = %v, want ErrUnsafePolicy", err)
+			}
+		})
+	}
+}
+
+func TestAuthorizationDigestUsesControlledPluginContentNotHostPath(t *testing.T) {
+	content := []byte("export default async function workflow() {}\n")
+	sum := sha256.Sum256(content)
+	digest := "sha256:" + hex.EncodeToString(sum[:])
+	identities := make([]ControlledPluginIdentity, 2)
+	for index := range identities {
+		path := filepath.Join(t.TempDir(), "skynex-workflow.ts")
+		if err := os.WriteFile(path, content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		identities[index] = ControlledPluginIdentity{Path: path, ContentDigest: digest}
+	}
+	first, err := Generate(Input{AllowedTools: []string{"read"}, Plugin: &identities[0]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := Generate(Input{AllowedTools: []string{"read"}, Plugin: &identities[1]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Digest == second.Digest {
+		t.Fatal("config digest ignored the different absolute plugin file URL")
+	}
+	if first.AuthorizationDigest != second.AuthorizationDigest {
+		t.Fatalf("authorization digest depended on host plugin path: %s != %s", first.AuthorizationDigest, second.AuthorizationDigest)
 	}
 }
 
@@ -425,5 +590,10 @@ func TestBindPromptToolsDeniesEntireRuntimeCatalog(t *testing.T) {
 	mutated.Config = append(append(json.RawMessage(nil), effective.Config...), ' ')
 	if verification := VerifyRuntimeConfig(effective.Config, mutated); verification.Valid || len(verification.Violations) == 0 {
 		t.Fatal("mutated expected config verified")
+	}
+	mutated = effective
+	mutated.AuthorizationDigest = "sha256:" + strings.Repeat("0", 64)
+	if _, err := BindPromptTools(mutated, []string{"github_push", "neurox_context", "read"}); !errors.Is(err, ErrUnsafePolicy) || !strings.Contains(err.Error(), "authorization digest mismatch") {
+		t.Fatalf("mutated authorization digest error = %v", err)
 	}
 }

@@ -203,6 +203,54 @@ func (s *SQLiteStore) Close() error      { return s.db.Close() }
 func (s *SQLiteStore) Path() string      { return s.path }
 func (s *SQLiteStore) Database() *sql.DB { return s.db }
 
+// TerminalQuiescent reports whether the persisted workflow has reached the
+// exact expected terminal state with no managed job still capable of mutating
+// it. Receipted additionally requires one durable receipt-authority binding.
+// It is intentionally narrow so evaluators do not depend on the workflow
+// database schema through Database().
+func (s *SQLiteStore) TerminalQuiescent(workflowID string, expected State) (bool, error) {
+	current, err := s.Get(workflowID)
+	if err != nil {
+		return false, err
+	}
+	if current.State != expected {
+		return false, nil
+	}
+	var live int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM workflow_jobs WHERE workflow_id=? AND state IN ('queued','running','cancel_requested','waiting_approval')`,
+		workflowID,
+	).Scan(&live); err != nil {
+		return false, err
+	}
+	if live != 0 {
+		return false, nil
+	}
+	var unacknowledged int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM workflow_notifications WHERE workflow_id=? AND acked_at=''`,
+		workflowID,
+	).Scan(&unacknowledged); err != nil {
+		return false, err
+	}
+	if unacknowledged != 0 {
+		return false, nil
+	}
+	if expected == StateReceipted {
+		var authority int
+		if err := s.db.QueryRow(
+			`SELECT COUNT(*) FROM receipt_authority a JOIN receipts r ON r.id=a.receipt_id WHERE a.workflow_id=?`,
+			workflowID,
+		).Scan(&authority); err != nil {
+			return false, err
+		}
+		if authority != 1 {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 func (s *SQLiteStore) migrate() error {
 	var version int
 	var err error

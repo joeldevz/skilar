@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+common=$(git rev-parse --git-common-dir)
+marker="$common/skynex/public-canary-recovery-seen"
+if [ ! -f "$marker" ]; then
+  printf 'seen\n' > "$marker"
+  printf '%s' '{malformed-public-canary-result' > "$SKYNEX_RESULT_FILE"
+  exit 0
+fi
+
+tree=$(git write-tree)
+printf '%s' '{"envelope":{"WorkflowID":"wfv2_canary_recovery_safety","NodeID":"slice_main","AttemptID":"wfv2_canary_recovery_safety:slice_main","BaseCandidateOID":"'"$tree"'","Status":"completed","EvidenceIDs":["public-canary-recovery"]},"patch":{"Operations":[{"Path":"button.go","Data":"cGFja2FnZSByZWNvdmVyeXNhZmV0eQoKY29uc3QgU3VibWl0QnV0dG9uQ29sb3IgPSAiI0VGNDQ0NCIK","Mode":420}]}}' > "$SKYNEX_RESULT_FILE"

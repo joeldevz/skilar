@@ -11,6 +11,11 @@ const (
 	// ProvenanceExtensionProviderCatalogDigest binds a run to the exact
 	// provider catalogue observed during the no-model runtime probe.
 	ProvenanceExtensionProviderCatalogDigest = "x-effective-provider-catalog-digest"
+	// ProvenanceExtensionRuntimeCleanupAttested records whether the evaluator
+	// successfully closed the private runtime boundary for this sample. It is
+	// optional for general result compatibility; stricter profiles may require
+	// the exact string value "true" before accepting a sample.
+	ProvenanceExtensionRuntimeCleanupAttested = "x-runtime-cleanup-attested"
 
 	ProviderAuthModeOpenAIOAuthCleanProfileV1  = "openai-oauth-clean-profile-v1"
 	BillingModeChatGPTSubscription             = "chatgpt-subscription"
@@ -47,6 +52,9 @@ func validateProviderBillingProvenance(p Provenance) error {
 	}
 	if digest, present := p.Extensions[ProvenanceExtensionProviderCatalogDigest]; present && !validDigest(digest) {
 		return fieldError("provenance.extensions."+ProvenanceExtensionProviderCatalogDigest, "must be a sha256 digest")
+	}
+	if attested, present := p.Extensions[ProvenanceExtensionRuntimeCleanupAttested]; present && attested != "true" && attested != "false" {
+		return fieldError("provenance.extensions."+ProvenanceExtensionRuntimeCleanupAttested, "must be true or false")
 	}
 	authMode, hasAuthMode := p.Extensions[ProvenanceExtensionProviderAuthMode]
 	billingMode, hasBillingMode := p.Extensions[ProvenanceExtensionBillingMode]

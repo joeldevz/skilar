@@ -63,8 +63,9 @@ func assertPRReviewEvidenceContract(t *testing.T, raw []byte) {
 		"hypothesis/unverified",
 		"delegated findings are provisional",
 		"primary verification",
-		"neurox is read-only",
-		"infrastructure-engineer is the only agent permitted to persist neurox memory",
+		"neurox is contextual memory only",
+		"this orchestrator may save or update",
+		"narrow neurox search to a subagent",
 		"baseline",
 		"base sha",
 	}
@@ -103,7 +104,7 @@ func validPRReviewEvidenceStructure(text string) bool {
 		strings.Index(section, "primary verification"),
 		strings.Index(section, "contradiction resolution"),
 		strings.Index(section, "drafted verdict"),
-		strings.LastIndex(section, "do not persist them to neurox"),
+		strings.LastIndex(section, "do not persist unverified findings"),
 	}
 	for index, position := range positions {
 		if position < 0 || (index > 0 && position <= positions[index-1]) {
@@ -116,14 +117,14 @@ func validPRReviewEvidenceStructure(text string) bool {
 func assertPRReviewEvidenceStructure(t *testing.T, text string) {
 	t.Helper()
 	if !validPRReviewEvidenceStructure(text) {
-		t.Error("workflow-orchestrator PR review contract must keep all provenance categories inside Evidence Gate and order primary verification, contradiction resolution, drafted verdict, then its read-only Neurox handoff")
+		t.Error("workflow-orchestrator PR review contract must keep all provenance categories inside Evidence Gate and forbid persisting unverified findings before a drafted verdict")
 	}
 }
 
 func TestPRReviewEvidenceStructureRejectsGlobalMarkersAndEarlySave(t *testing.T) {
 	text := `independently executed tool-observed author-claimed hypothesis/unverified
 ## PR review Evidence Gate
-do not persist them to neurox, then perform primary verification, resolve contradictions, and draft the verdict`
+persist a decision to neurox, then perform primary verification, resolve contradictions, and draft the verdict`
 	if validPRReviewEvidenceStructure(strings.ToLower(text)) {
 		t.Fatal("accepted provenance outside Evidence Gate and neurox.save before verification/synthesis")
 	}

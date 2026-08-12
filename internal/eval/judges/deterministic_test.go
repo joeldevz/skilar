@@ -1,9 +1,6 @@
 package judges
 
-import (
-	"regexp"
-	"testing"
-)
+import "testing"
 
 // Test contains_any check
 func TestContainsAny(t *testing.T) {
@@ -260,50 +257,4 @@ func TestToolCalled(t *testing.T) {
 			}
 		})
 	}
-}
-
-// Helper function implementations
-func ContainsAny(text string, patterns []string) bool {
-	if len(patterns) == 0 {
-		return false
-	}
-	for _, pattern := range patterns {
-		if pattern != "" && regexp.MustCompile(regexp.QuoteMeta(pattern)).MatchString(text) {
-			return true
-		}
-	}
-	return false
-}
-
-func NotContains(text, pattern string) bool {
-	if pattern == "" {
-		return true
-	}
-	return !regexp.MustCompile(regexp.QuoteMeta(pattern)).MatchString(text)
-}
-
-func RegexMatch(text, pattern string) (bool, error) {
-	re, err := regexp.Compile(pattern)
-	if err != nil {
-		return false, err
-	}
-	return re.MatchString(text), nil
-}
-
-func RegexCount(text, pattern string, threshold int) (bool, error) {
-	re, err := regexp.Compile(pattern)
-	if err != nil {
-		return false, err
-	}
-	count := len(re.FindAllString(text, -1))
-	return count >= threshold, nil
-}
-
-func ToolCalled(toolName string, toolCalls []string) bool {
-	for _, tool := range toolCalls {
-		if tool == toolName {
-			return true
-		}
-	}
-	return false
 }

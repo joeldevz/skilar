@@ -1,0 +1,10 @@
+{
+  "workflow_id": "wf-active",
+  "node_id": "node-profile",
+  "attempt_id": "attempt-2",
+  "base_candidate_oid": "tree-v1",
+  "allowed_paths": ["candidate.txt"],
+  "forbidden_paths": ["worker-results/stale.json"],
+  "accepted_check": "oracle-profile-green",
+  "context_state": "compacted"
+}

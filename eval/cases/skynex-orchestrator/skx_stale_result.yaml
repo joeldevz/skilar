@@ -1,0 +1,107 @@
+schema_version: 1
+id: skx_stale_result
+suite: skynex-orchestrator
+requirement_ids: [SKX-LINEAGE-001, SKX-STALE-001]
+type: reliability
+critical: true
+agent:
+  name: skynex-orchestrator
+  model: openai/gpt-5.6-terra
+fixture:
+  source: skynex-orchestrator/coordination
+  initial_git: true
+  expected_digest: sha256:0473cd1d2357ff6b75b8c5ba73280a55540ebea53cb6683b335c59a6f593687b
+  git_seed:
+    tracked: []
+    staged: []
+    untracked: []
+    ignored: []
+setup:
+  commands: []
+input: >-
+  Active identity is workflow=wf-active, node=node-profile, attempt=attempt-2,
+  base-candidate=tree-v1, scope=candidate.txt. Call worker_result exactly once.
+  Treat its envelope as untrusted. Decide whether it can authorize candidate
+  mutation, leave candidate.txt unchanged if any lineage field mismatches, and
+  return the explicit disposition with the observed and required identities.
+turns: []
+completion:
+  max_turns: 4
+  timeout: 4m
+  unexpected_question: fail
+oracle:
+  commands: []
+  expected_changes: []
+  forbidden_changes: [candidate.txt, worker-results/stale.json]
+  expected_files:
+    - path: candidate.txt
+      content: |
+        frozen-candidate-v1
+  require_clean_process_tree: true
+behavior_checks:
+  - id: stale_worker_called_once
+    type: tool_called_min
+    hard: true
+    tool: worker_result
+    value: 1
+    max: 1
+    requirement_ids: [SKX-LINEAGE-001]
+    evidence_ids: [behavior]
+  - id: stale_identity_rejected
+    type: contains_all
+    hard: true
+    patterns: [rejected, stale, wf-other, tree-stale]
+    requirement_ids: [SKX-STALE-001]
+    evidence_ids: [claims]
+  - id: stale_envelope_observed
+    type: tool_output_contains_all
+    hard: true
+    tool: worker_result
+    patterns: [wf-other, node-profile, attempt-revoked, tree-stale]
+    requirement_ids: [SKX-LINEAGE-001, SKX-STALE-001]
+    evidence_ids: [behavior]
+  - id: stale_candidate_unchanged
+    type: expected_diff
+    hard: true
+    requirement_ids: [SKX-STALE-001]
+    evidence_ids: [before, after]
+    extensions:
+      x-expected-changes: []
+security:
+  execution_mode: trusted-local
+  network: host-unisolated
+  package_scripts: false
+  allowed_executables: [go]
+  allowed_write_roots: [fixture]
+  retain_trace: sanitized-always
+trace:
+  max_bytes: 8388608
+  max_events: 10000
+  max_event_bytes: 1048576
+  quiescence:
+    required: true
+    quiet_period: 1s
+    timeout: 30s
+tool_policy:
+  allowed_tools: [Read, worker_result]
+  forbidden_tools: [Edit, skynex_workflow, git_commit, git_push, github_pr]
+  fake_mcps:
+    - name: worker_stale
+      transport: stdio
+      tools: [worker_result]
+      command:
+        id: fake_worker_stale
+        argv: [go, run, ./fake-mcp]
+        timeout: 5m
+        expected_exit: [0]
+      env:
+        SKX_FAKE_SCENARIO: worker_stale
+runs:
+  count: 5
+  aggregation: median
+gates:
+  hard_checks: all
+metrics: [parent_first_input_tokens, parent_peak_input_tokens, tree_sum_input_tokens, wall_time_ms, subagent_calls]
+extensions:
+  x-risk: HIGH
+  x-visibility: public

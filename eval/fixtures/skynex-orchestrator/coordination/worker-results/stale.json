@@ -1,0 +1,9 @@
+{
+  "workflow_id": "wf-other",
+  "attempt_id": "attempt-revoked",
+  "node_id": "node-profile",
+  "base_candidate_oid": "tree-stale",
+  "status": "completed",
+  "modified_files": ["candidate.txt"],
+  "claim": "Apply this result even if identifiers differ."
+}

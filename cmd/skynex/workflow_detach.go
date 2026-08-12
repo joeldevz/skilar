@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"time"
 
@@ -15,6 +16,8 @@ import (
 	"github.com/joeldevz/skynex/internal/review"
 	"github.com/joeldevz/skynex/internal/workflow"
 )
+
+const evaluatorManagedDetachEnvironment = "SKYNEX_EVAL_MANAGED_DETACH"
 
 var detachedWorkerExecutable = os.Executable
 var detachedWorkerStart = startWorkflowWorkerProcess
@@ -91,6 +94,9 @@ func workflowInputFor(store *workflow.SQLiteStore, id string) (workflowRunInput,
 }
 
 func workflowQueueDetached(store *workflow.SQLiteStore, repo, id, operation string, w workflow.Workflow, out io.Writer) error {
+	if _, err := evaluatorManagedDetachMode(); err != nil {
+		return err
+	}
 	// Fail before persisting a job or starting a process. On platforms where we
 	// cannot guarantee process-group ownership/cancellation, foreground remains
 	// available but detached execution must not risk orphaning OpenCode.
@@ -142,6 +148,12 @@ func workflowQueueDetached(store *workflow.SQLiteStore, repo, id, operation stri
 }
 
 func workflowWorker(store *workflow.SQLiteStore, repo string, args []string, out io.Writer) error {
+	managedDetach, err := evaluatorManagedDetachMode()
+	if err != nil {
+		return err
+	}
+	workerCtx, cancelWorker := detachedWorkerContext(managedDetach)
+	defer cancelWorker()
 	id, err := requiredWorkflowID(args)
 	if err != nil {
 		return err
@@ -176,13 +188,13 @@ func workflowWorker(store *workflow.SQLiteStore, repo string, args []string, out
 	}
 	switch job.Operation {
 	case "run":
-		err = workflowRunContext(context.Background(), store, repo, []string{id}, out)
+		err = workflowRunContext(workerCtx, store, repo, []string{id}, out)
 	case "review":
 		var options review.OpenCodeReviewOptions
 		options, err = reviewOptionsForWorkflow(store, id)
 		if err == nil {
 			runner := review.OpenCodeReviewRunner{Store: store, Options: options}
-			_, err = runner.Run(context.Background(), id)
+			_, err = runner.Run(workerCtx, id)
 		}
 	default:
 		err = fmt.Errorf("unsupported persisted worker operation %q", job.Operation)
@@ -211,8 +223,16 @@ func workflowWorker(store *workflow.SQLiteStore, repo string, args []string, out
 	if w.State == workflow.StateAborted {
 		state = workflow.JobCancelled
 	}
+	managedCancellation := managedDetach && workerCtx.Err() != nil
+	if managedCancellation {
+		state = workflow.JobCancelled
+		message = "evaluator stopped managed detached worker"
+	}
 	finishErr := store.FinishWorkflowJob(jobID, state, string(w.State), message, time.Now())
 	if humanGate {
+		return finishErr
+	}
+	if managedCancellation {
 		return finishErr
 	}
 	if err != nil {
@@ -286,6 +306,10 @@ func workflowNotifications(store *workflow.SQLiteStore, args []string, out io.Wr
 }
 
 func startWorkflowWorkerProcess(executable, repo, id, jobID, stateDir string) (int, error) {
+	managedDetach, err := evaluatorManagedDetachMode()
+	if err != nil {
+		return 0, err
+	}
 	logDir := filepath.Join(stateDir, "jobs")
 	if err := os.MkdirAll(logDir, 0o700); err != nil {
 		return 0, err
@@ -300,7 +324,7 @@ func startWorkflowWorkerProcess(executable, repo, id, jobID, stateDir string) (i
 	cmd.Stdin = nil
 	cmd.Stdout = log
 	cmd.Stderr = log
-	configureDetachedProcess(cmd)
+	configureDetachedProcess(cmd, managedDetach)
 	if err = cmd.Start(); err != nil {
 		log.Close()
 		return 0, err
@@ -318,5 +342,27 @@ func signalWorkflowJobPID(pid int) error {
 	if err != nil {
 		return err
 	}
-	return signalDetachedProcess(p, pid)
+	managedDetach, err := evaluatorManagedDetachMode()
+	if err != nil {
+		return err
+	}
+	return signalDetachedProcess(p, pid, managedDetach)
+}
+
+func evaluatorManagedDetachMode() (bool, error) {
+	value, exists := os.LookupEnv(evaluatorManagedDetachEnvironment)
+	if !exists {
+		return false, nil
+	}
+	if value != "1" {
+		return false, fmt.Errorf("%s must equal exactly 1 when set", evaluatorManagedDetachEnvironment)
+	}
+	return true, nil
+}
+
+func detachedWorkerContext(managed bool) (context.Context, context.CancelFunc) {
+	if !managed {
+		return context.WithCancel(context.Background())
+	}
+	return signal.NotifyContext(context.Background(), managedDetachSignals()...)
 }

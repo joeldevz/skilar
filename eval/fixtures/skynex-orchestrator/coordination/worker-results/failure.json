@@ -1,0 +1,13 @@
+{
+  "workflow_id": "wf-active",
+  "attempt_id": "attempt-1",
+  "node_id": "node-profile",
+  "base_candidate_oid": "tree-v1",
+  "status": "blocked",
+  "modified_files": [],
+  "verification": {
+    "argv": ["go", "test", "./..."],
+    "exit_code": 1,
+    "stderr": "focused test failed"
+  }
+}

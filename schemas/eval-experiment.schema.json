@@ -1,0 +1,246 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/joeldevz/skynex/schemas/eval-experiment.schema.json",
+  "title": "Skynex evaluation experiment manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "suite",
+    "intent",
+    "harness",
+    "control",
+    "candidate",
+    "intentional_differences",
+    "public_case_count",
+    "public_cases_digest",
+    "critical_case_ids",
+    "holdout_case_count",
+    "runs",
+    "randomization",
+    "execution",
+    "gates"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$" },
+    "suite": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$" },
+    "intent": { "enum": ["development", "release"] },
+    "harness": { "$ref": "#/$defs/frozenBundle" },
+    "control": { "$ref": "#/$defs/frozenBundle" },
+    "candidate": { "$ref": "#/$defs/frozenBundle" },
+    "holdout": {
+      "allOf": [
+        { "$ref": "#/$defs/frozenBundle" },
+        {
+          "not": {
+            "anyOf": [
+              { "required": ["source_git_sha"] },
+              { "required": ["source_dirty_patch_digest"] }
+            ]
+          }
+        }
+      ]
+    },
+    "model_assignment": { "$ref": "#/$defs/modelAssignment" },
+    "intentional_differences": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": [
+          "prompt_digest",
+          "agent_bundle_digest",
+          "model",
+          "provider"
+        ]
+      }
+    },
+    "public_case_count": { "type": "integer", "minimum": 1, "maximum": 10000 },
+    "public_cases_digest": { "$ref": "#/$defs/digest" },
+    "critical_case_ids": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 10000,
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$" }
+    },
+    "holdout_case_count": { "type": "integer", "minimum": 0, "maximum": 10000 },
+    "runs": { "type": "integer", "minimum": 2, "maximum": 100 },
+    "randomization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "seed", "serialize_within_block"],
+      "properties": {
+        "method": { "const": "balanced-blocked-ab-ba" },
+        "seed": { "type": "string", "pattern": "^[0-9]{1,20}$" },
+        "serialize_within_block": { "const": true }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "network", "concurrency", "provider_auth", "billing_mode", "credential_boundary", "opencode_version", "evaluator_binary_digest", "opencode_binary_digest", "opencode_openapi_digest", "toolchains_digest"],
+      "properties": {
+        "mode": { "enum": ["trusted-local", "isolated-container"] },
+        "network": { "enum": ["host-unisolated", "none", "provider-proxy-only", "registry-allowlist"] },
+        "concurrency": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "provider_auth": { "const": "openai-oauth-clean-profile-v1" },
+        "billing_mode": { "const": "chatgpt-subscription" },
+        "credential_boundary": { "enum": ["runtime-readable", "provider-proxy"] },
+        "opencode_version": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "evaluator_binary_digest": { "$ref": "#/$defs/digest" },
+        "opencode_binary_digest": { "$ref": "#/$defs/digest" },
+        "opencode_openapi_digest": { "$ref": "#/$defs/digest" },
+        "toolchains_digest": { "$ref": "#/$defs/digest" },
+        "container_image_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "critical_case_pass_rate",
+        "pass_to_fail_regressions",
+        "scope_violations",
+        "false_successes",
+        "max_parent_peak_input_ratio",
+        "max_tree_input_ratio",
+        "max_cost_ratio",
+        "max_wall_time_ratio",
+        "max_retry_rate_ratio"
+      ],
+      "properties": {
+        "critical_case_pass_rate": { "const": 1 },
+        "pass_to_fail_regressions": { "const": 0 },
+        "scope_violations": { "const": 0 },
+        "false_successes": { "const": 0 },
+        "max_parent_peak_input_ratio": { "$ref": "#/$defs/positiveRatio" },
+        "max_tree_input_ratio": { "$ref": "#/$defs/positiveRatio" },
+        "max_cost_ratio": { "$ref": "#/$defs/positiveRatio" },
+        "max_wall_time_ratio": { "$ref": "#/$defs/positiveRatio" },
+        "max_retry_rate_ratio": { "$ref": "#/$defs/positiveRatio" },
+        "confidence": { "type": "number", "exclusiveMinimum": 0.5, "exclusiveMaximum": 1, "default": 0.95 },
+        "minimum_pairs": { "type": "integer", "minimum": 2, "maximum": 100 }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "not": { "required": ["holdout"] } },
+      "then": { "properties": { "holdout_case_count": { "const": 0 } } }
+    },
+    {
+      "if": { "required": ["holdout"] },
+      "then": { "properties": { "holdout_case_count": { "minimum": 1 } } }
+    },
+    {
+      "if": {
+        "properties": { "intent": { "const": "release" } },
+        "required": ["intent"]
+      },
+      "then": {
+        "required": ["holdout"],
+        "properties": {
+          "runs": { "minimum": 10 },
+          "gates": {
+            "required": ["confidence", "minimum_pairs"],
+            "properties": {
+              "critical_case_pass_rate": { "const": 1 },
+              "pass_to_fail_regressions": { "const": 0 },
+              "scope_violations": { "const": 0 },
+              "false_successes": { "const": 0 },
+              "max_parent_peak_input_ratio": { "maximum": 0.7 },
+              "max_tree_input_ratio": { "maximum": 1 },
+              "max_cost_ratio": { "maximum": 1 },
+              "max_wall_time_ratio": { "maximum": 1.1 },
+              "max_retry_rate_ratio": { "maximum": 1 },
+              "confidence": { "minimum": 0.95 },
+              "minimum_pairs": { "minimum": 10 }
+            }
+          },
+          "execution": {
+            "properties": { "credential_boundary": { "const": "provider-proxy" } }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "execution": {
+            "properties": { "credential_boundary": { "const": "runtime-readable" } },
+            "required": ["credential_boundary"]
+          }
+        },
+        "required": ["execution"]
+      },
+      "then": {
+        "properties": {
+          "execution": {
+            "properties": { "mode": { "const": "trusted-local" }, "network": { "const": "host-unisolated" } },
+            "not": { "required": ["container_image_digest"] }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "execution": {
+            "properties": { "credential_boundary": { "const": "provider-proxy" } },
+            "required": ["credential_boundary"]
+          }
+        },
+        "required": ["execution"]
+      },
+      "then": {
+        "properties": {
+          "execution": {
+            "properties": { "mode": { "const": "isolated-container" }, "network": { "const": "provider-proxy-only" } },
+            "required": ["container_image_digest"]
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "positiveRatio": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 1000
+    },
+    "modelAssignment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["control", "candidate"],
+      "properties": {
+        "control": { "type": "string", "pattern": "^[!-.0-~]+/[!-~]+$", "maxLength": 256 },
+        "candidate": { "type": "string", "pattern": "^[!-.0-~]+/[!-~]+$", "maxLength": 256 }
+      }
+    },
+    "frozenBundle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["root", "digest"],
+      "properties": {
+        "root": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "digest": { "$ref": "#/$defs/digest" },
+        "git_sha": { "type": "string", "pattern": "^[0-9a-f]{40,64}$" },
+        "dirty_patch_digest": { "$ref": "#/$defs/digest" },
+        "source_git_sha": { "type": "string", "pattern": "^[0-9a-f]{40,64}$" },
+        "source_dirty_patch_digest": { "$ref": "#/$defs/digest" }
+      },
+      "dependentRequired": {
+        "dirty_patch_digest": ["git_sha"],
+        "source_dirty_patch_digest": ["source_git_sha"]
+      }
+    }
+  }
+}

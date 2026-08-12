@@ -9,7 +9,13 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func configureReviewProcess(cmd *exec.Cmd) {
+const evaluatorManagedDetachEnvironment = "SKYNEX_EVAL_MANAGED_DETACH"
+
+func evaluatorManagedReviewProcess() bool {
+	return os.Getenv(evaluatorManagedDetachEnvironment) == "1"
+}
+
+func configureReviewProcess(cmd *exec.Cmd, _ bool) {
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return os.ErrProcessDone

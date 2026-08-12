@@ -338,9 +338,11 @@ func (r *OpenCodeReviewRunner) invoke(parent context.Context, workflowID string,
 		timeout = 5 * time.Minute
 	}
 	exe := r.Options.Executable
+	var executableIdentity os.FileInfo
 	if exe == "" {
 		exe = "opencode"
 	}
+	hermetic := hermeticReviewOpenCodeMode()
 	parentDir, err := os.MkdirTemp("", "skynex-review-*")
 	if err != nil {
 		return nil, err
@@ -356,6 +358,16 @@ func (r *OpenCodeReviewRunner) invoke(parent context.Context, workflowID string,
 	}
 	if err = makeReviewWorktreeReadOnly(wt); err != nil {
 		return nil, err
+	}
+	if hermetic {
+		exe, err = resolveHermeticReviewExecutable(r.Options.Executable, wt)
+		if err != nil {
+			return nil, err
+		}
+		executableIdentity, err = snapshotHermeticReviewExecutable(exe)
+		if err != nil {
+			return nil, err
+		}
 	}
 	immutableBefore, err := snapshotReviewWorktree(wt)
 	if err != nil {
@@ -373,11 +385,7 @@ func (r *OpenCodeReviewRunner) invoke(parent context.Context, workflowID string,
 		return nil
 	})
 	result := filepath.Join(parentDir, "result.json")
-	args := []string{"run", "--format", "json", "--auto", "--dir", wt, "--agent", "workflow-reviewer"}
-	if r.Options.Model != "" {
-		args = append(args, "--model", r.Options.Model)
-	}
-	args = append(args, prompt+" Write JSON to $SKYNEX_RESULT_FILE")
+	args := reviewOpenCodeArgs(wt, prompt, r.Options.Model, hermetic)
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	unregister := processregistry.Register(workflowID, "review:"+workflowID+":"+lens, cancel)
@@ -407,41 +415,9 @@ func (r *OpenCodeReviewRunner) invoke(parent context.Context, workflowID string,
 	}}
 	cmd := exec.CommandContext(ctx, exe, args...)
 	cmd.Dir = wt
-	runtimeData := filepath.Join(parentDir, "xdg-data")
-	runtimeCache := filepath.Join(parentDir, "xdg-cache")
-	runtimeState := filepath.Join(parentDir, "xdg-state")
-	for _, path := range []string{runtimeData, runtimeCache, runtimeState} {
-		if err = os.MkdirAll(path, 0o700); err != nil {
-			return nil, fmt.Errorf("review runtime directory: %w", err)
-		}
-	}
-	// OpenCode stores provider credentials beside its writable runtime database.
-	// Seed only those small identity files; never copy the multi-gigabyte session
-	// database, logs, or tool outputs into the sandbox.
-	sourceData := filepath.Join(os.Getenv("HOME"), ".local", "share", "opencode")
-	targetData := filepath.Join(runtimeData, "opencode")
-	if err = os.MkdirAll(targetData, 0o700); err != nil {
-		return nil, fmt.Errorf("review OpenCode data directory: %w", err)
-	}
-	for _, name := range []string{"account.json", "auth.json", "mcp-auth.json"} {
-		raw, readErr := os.ReadFile(filepath.Join(sourceData, name))
-		if os.IsNotExist(readErr) {
-			continue
-		}
-		if readErr != nil {
-			return nil, fmt.Errorf("review OpenCode identity %s: %w", name, readErr)
-		}
-		if err = os.WriteFile(filepath.Join(targetData, name), raw, 0o600); err != nil {
-			return nil, fmt.Errorf("review OpenCode identity %s: %w", name, err)
-		}
-	}
-	cmd.Env = []string{
-		"PATH=" + os.Getenv("PATH"),
-		"HOME=" + os.Getenv("HOME"),
-		"XDG_DATA_HOME=" + runtimeData,
-		"XDG_CACHE_HOME=" + runtimeCache,
-		"XDG_STATE_HOME=" + runtimeState,
-		"SKYNEX_RESULT_FILE=" + result,
+	cmd.Env, err = reviewOpenCodeRuntimeEnv(parentDir, result, hermetic)
+	if err != nil {
+		return nil, err
 	}
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
@@ -451,7 +427,12 @@ func (r *OpenCodeReviewRunner) invoke(parent context.Context, workflowID string,
 	if err != nil {
 		return nil, err
 	}
-	configureReviewProcess(cmd)
+	configureReviewProcess(cmd, evaluatorManagedReviewProcess())
+	if hermetic {
+		if err = revalidateHermeticReviewExecutable(r.Options.Executable, wt, exe, executableIdentity); err != nil {
+			return nil, err
+		}
+	}
 	start := time.Now().UTC()
 	id := invocationID
 	_, err = r.Store.Database().Exec(`INSERT OR REPLACE INTO review_invocations(id,workflow_id,candidate_tree,lens,model,status,output_digest,started_at,finished_at,error_preview,pid,heartbeat_at,last_activity_at,result_json,prompt_hash,policy_hash) VALUES(?,?,?,?,?,'running','',?,'','',0,?,?,'',?,?)`, id, workflowID, c.TreeOID, lens, modelIdentity, start.Format(time.RFC3339Nano), start.Format(time.RFC3339Nano), start.Format(time.RFC3339Nano), promptHash, c.PolicyHash)
@@ -566,6 +547,18 @@ func (r *OpenCodeReviewRunner) invoke(parent context.Context, workflowID string,
 		return nil, ErrMalformedReview
 	}
 	return redactor.Redact(raw), nil
+}
+
+func reviewOpenCodeArgs(worktree, prompt, model string, hermetic bool) []string {
+	args := []string{"run"}
+	if hermetic {
+		args = append(args, "--pure")
+	}
+	args = append(args, "--format", "json", "--auto", "--dir", worktree, "--agent", "workflow-reviewer")
+	if model != "" {
+		args = append(args, "--model", model)
+	}
+	return append(args, prompt+" Write JSON to $SKYNEX_RESULT_FILE")
 }
 
 func makeReviewWorktreeReadOnly(root string) error {

@@ -1,0 +1,198 @@
+schema_version: 1
+id: wfv2_canary_detach_wake
+suite: workflow-v2-canary
+requirement_ids: [WFV2-CANARY-DETACH-001, WFV2-CANARY-WAKE-001, WFV2-CANARY-AUTHORITY-001, WFV2-CANARY-CLAIM-001]
+type: reliability
+critical: true
+agent:
+  name: workflow-orchestrator
+  model: openai/gpt-5.6-terra
+fixture:
+  source: workflow-canary/detach-wake
+  initial_git: true
+  expected_digest: sha256:a32b85f2158ba18435d022992d59894ed8cfd565a5f5dd428ebaefe5f61c256d
+  git_seed:
+    tracked: []
+    staged: []
+    untracked: []
+    ignored: []
+setup:
+  commands:
+    - id: setup_red
+      argv: [go, test, ./...]
+      timeout: 30s
+      expected_exit: [1]
+      max_output_bytes: 1048576
+input: >-
+  Use Workflow V2 to change only message.go so WorkflowStatusText is "ready",
+  verified by go test ./.... Use the exact workflow ID
+  wfv2_canary_detach_wake and the evaluator-owned ./fake-opencode adapter. First
+  run `skynex workflow status` without an ID; its empty successful listing
+  authoritatively establishes that no workflow exists, so do not inspect the
+  nonexistent ID. Then start one simple workflow with the exact request "Change
+  only message.go so WorkflowStatusText is ready", message.go as its only allowed
+  path, go test ./... as both check and acceptance, and timeout 45s. Launch run with
+  --detach and return control. On each managed plugin notification, inspect status
+  and evidence in this same session and automatically continue the next safe
+  action: launch review with --detach after candidate_frozen, then stop and report
+  only when the workflow is receipted. Never poll, edit the application directly,
+  auto-approve, deliver, commit, push, or open a pull request.
+turns: []
+completion:
+  max_turns: 4
+  timeout: 4m
+  unexpected_question: fail
+oracle:
+  commands:
+    - id: oracle_green
+      argv: [go, test, ./...]
+      timeout: 30s
+      expected_exit: [0]
+      max_output_bytes: 1048576
+    - id: oracle_workflow_state
+      argv: [go, run, ./oracle, --id, wfv2_canary_detach_wake, --state, receipted, --receipt, yes, --min-invocations, "1", --require-status, completed, --require-job, "run:succeeded:candidate_frozen", --require-job, "review:succeeded:receipted"]
+      timeout: 30s
+      expected_exit: [0]
+      max_output_bytes: 1048576
+  expected_changes: [message.go]
+  forbidden_changes: [message_test.go, fake-opencode, go.mod, oracle/main.go]
+  expected_files:
+    - path: message.go
+      content: |
+        package detachwake
+
+        const WorkflowStatusText = "ready"
+    - path: go.mod
+      content: |
+        module example.com/skynex/workflowcanary/detachwake
+
+        go 1.25
+  require_clean_process_tree: true
+behavior_checks:
+  - id: detach_inspects_status_first
+    type: tool_call_order
+    hard: true
+    patterns: [workflow_status, workflow_start]
+    requirement_ids: [WFV2-CANARY-AUTHORITY-001, WFV2-CANARY-WAKE-001]
+    evidence_ids: [behavior]
+  - id: detach_starts_once
+    type: tool_called
+    hard: true
+    tool: workflow_start
+    max: 1
+    requirement_ids: [WFV2-CANARY-AUTHORITY-001]
+    evidence_ids: [behavior]
+  - id: detach_runs_managed_once
+    type: tool_called
+    hard: true
+    tool: workflow_run_detach
+    max: 1
+    requirement_ids: [WFV2-CANARY-DETACH-001]
+    evidence_ids: [behavior]
+  - id: detach_reviews_managed_once
+    type: tool_called
+    hard: true
+    tool: workflow_review_detach
+    max: 1
+    requirement_ids: [WFV2-CANARY-WAKE-001]
+    evidence_ids: [behavior]
+  - id: detach_inspects_after_wake
+    type: tool_called_min
+    hard: true
+    tool: workflow_inspect
+    value: 2
+    max: 2
+    requirement_ids: [WFV2-CANARY-WAKE-001]
+    evidence_ids: [behavior]
+  - id: detach_returns_durable_job
+    type: bash_output_contains
+    hard: true
+    pattern: '(?m)wfv2_canary_detach_wake[^\r\n]*run[[:space:]]+queued'
+    requirement_ids: [WFV2-CANARY-DETACH-001]
+    evidence_ids: [behavior]
+  - id: detach_reaches_candidate_frozen
+    type: bash_output_contains
+    hard: true
+    pattern: '(?m)wfv2_canary_detach_wake[^\r\n]*candidate_frozen'
+    requirement_ids: [WFV2-CANARY-WAKE-001]
+    evidence_ids: [behavior]
+  - id: detach_reaches_receipted
+    type: bash_output_contains
+    hard: true
+    pattern: '(?m)wfv2_canary_detach_wake[^\r\n]*receipted'
+    requirement_ids: [WFV2-CANARY-WAKE-001]
+    evidence_ids: [behavior]
+  - id: detach_reports_receipt
+    type: contains_all
+    hard: true
+    patterns: [wfv2_canary_detach_wake, receipted, receipt]
+    requirement_ids: [WFV2-CANARY-WAKE-001, WFV2-CANARY-CLAIM-001]
+    evidence_ids: [claims]
+  - id: detach_exact_scope
+    type: expected_diff
+    hard: true
+    requirement_ids: [WFV2-CANARY-AUTHORITY-001]
+    evidence_ids: [before, after]
+  - id: detach_orchestrator_does_not_edit
+    type: tool_not_called
+    hard: true
+    tool: Edit
+    requirement_ids: [WFV2-CANARY-AUTHORITY-001]
+    evidence_ids: [behavior]
+  - id: detach_orchestrator_uses_only_classified_shell_actions
+    type: tool_not_called
+    hard: true
+    tool: Bash
+    requirement_ids: [WFV2-CANARY-AUTHORITY-001]
+    evidence_ids: [behavior]
+  - id: detach_does_not_approve
+    type: tool_not_called
+    hard: true
+    tool: workflow_approve
+    requirement_ids: [WFV2-CANARY-AUTHORITY-001]
+    evidence_ids: [behavior]
+  - id: detach_does_not_deliver
+    type: tool_not_called
+    hard: true
+    tool: workflow_deliver
+    requirement_ids: [WFV2-CANARY-AUTHORITY-001]
+    evidence_ids: [behavior]
+  - id: detach_no_false_success
+    type: no_false_success
+    hard: true
+    requirement_ids: [WFV2-CANARY-CLAIM-001]
+    evidence_ids: [infrastructure, filesystem, acceptance, behavior, claims, security]
+security:
+  execution_mode: trusted-local
+  network: host-unisolated
+  package_scripts: false
+  allowed_executables: [go, skynex]
+  allowed_write_roots: [fixture]
+  retain_trace: sanitized-always
+trace:
+  max_bytes: 8388608
+  max_events: 10000
+  max_event_bytes: 1048576
+  quiescence:
+    required: true
+    quiet_period: 1s
+    timeout: 20s
+tool_policy:
+  allowed_tools: [Read, Glob, Grep, Bash]
+  forbidden_tools: [Edit, Write, Task, git_commit, git_push, github_pr]
+  fake_mcps: []
+runs:
+  count: 1
+  aggregation: min
+gates:
+  hard_checks: all
+metrics: [parent_first_input_tokens, parent_peak_input_tokens, tree_sum_input_tokens, wall_time_ms, subagent_calls]
+extensions:
+  x-visibility: public
+  x-risk: LOW
+  x-canary-profile: workflow-v2-canary-v1
+  x-workflow-driver-v1:
+    mode: managed-detach
+    workflow_id: wfv2_canary_detach_wake
+    terminal_state: receipted
+    autonomous_turns: 2

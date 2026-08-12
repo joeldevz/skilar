@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+tree=$(git write-tree)
+printf '%s' '{"envelope":{"WorkflowID":"wfv2_canary_low_complete","NodeID":"slice_main","AttemptID":"wfv2_canary_low_complete:slice_main","BaseCandidateOID":"'"$tree"'","Status":"completed","EvidenceIDs":["public-canary-low"]},"patch":{"Operations":[{"Path":"button.go","Data":"cGFja2FnZSBsb3djb21wbGV0ZQoKY29uc3QgU3VibWl0QnV0dG9uQ29sb3IgPSAiI0VGNDQ0NCIK","Mode":420}]}}' > "$SKYNEX_RESULT_FILE"

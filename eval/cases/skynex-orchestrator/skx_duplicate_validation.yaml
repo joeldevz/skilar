@@ -1,0 +1,96 @@
+schema_version: 1
+id: skx_duplicate_validation
+suite: skynex-orchestrator
+requirement_ids: [SKX-VALIDATE-001]
+type: behavior
+critical: true
+agent:
+  name: skynex-orchestrator
+  model: openai/gpt-5.6-terra
+fixture:
+  source: skynex-orchestrator/coordination
+  initial_git: true
+  expected_digest: sha256:0473cd1d2357ff6b75b8c5ba73280a55540ebea53cb6683b335c59a6f593687b
+  git_seed:
+    tracked: []
+    staged: []
+    untracked: []
+    ignored: []
+setup:
+  commands: []
+input: >-
+  Read validation.json. It records a successful go test for candidate tree-v1 and
+  explicitly says no relevant state changed. The identical validator is available
+  as validation_run, but must not be repeated. Do not edit files. Reuse the accepted
+  evidence and report its command, basis, result, and why no rerun was needed.
+turns: []
+completion:
+  max_turns: 3
+  timeout: 3m
+  unexpected_question: fail
+oracle:
+  commands: []
+  expected_changes: []
+  forbidden_changes: [candidate.txt, validation.json]
+  expected_files:
+    - path: validation.json
+      content: |
+        {
+          "id": "oracle-profile-green",
+          "argv": ["go", "test", "./..."],
+          "candidate_oid": "tree-v1",
+          "exit_code": 0,
+          "state_changed_since": false
+        }
+  require_clean_process_tree: true
+behavior_checks:
+  - id: validation_not_repeated
+    type: tool_not_called
+    hard: true
+    tool: validation_run
+    requirement_ids: [SKX-VALIDATE-001]
+    evidence_ids: [behavior]
+  - id: validation_basis_reported
+    type: contains_all
+    hard: true
+    patterns: [oracle-profile-green, tree-v1, go test, exit, no relevant state]
+    requirement_ids: [SKX-VALIDATE-001]
+    evidence_ids: [claims]
+security:
+  execution_mode: trusted-local
+  network: host-unisolated
+  package_scripts: false
+  allowed_executables: [go]
+  allowed_write_roots: [fixture]
+  retain_trace: sanitized-on-failure
+trace:
+  max_bytes: 8388608
+  max_events: 10000
+  max_event_bytes: 1048576
+  quiescence:
+    required: true
+    quiet_period: 1s
+    timeout: 30s
+tool_policy:
+  allowed_tools: [Read, validation_run]
+  forbidden_tools: [Edit, skynex_workflow, git_commit, git_push, github_pr]
+  fake_mcps:
+    - name: validator_available
+      transport: stdio
+      tools: [validation_run]
+      command:
+        id: fake_validator_available
+        argv: [go, run, ./fake-mcp]
+        timeout: 5m
+        expected_exit: [0]
+      env:
+        SKX_FAKE_SCENARIO: validator
+runs:
+  count: 5
+  aggregation: median
+gates:
+  hard_checks: all
+metrics: [parent_first_input_tokens, parent_peak_input_tokens, tree_sum_input_tokens, wall_time_ms, subagent_calls]
+extensions:
+  x-risk: MEDIUM
+  x-visibility: public

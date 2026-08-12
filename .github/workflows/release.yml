@@ -22,6 +22,7 @@ jobs:
         id: verify
         env:
           TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           case "$TAG" in v*) ;; *) echo 'release ref is not a v* tag' >&2; exit 1 ;; esac
@@ -31,7 +32,10 @@ jobs:
           git fetch --no-tags origin main:refs/remotes/origin/main
           commit="$(git rev-list -n 1 "$TAG")"
            git merge-base --is-ancestor "$commit" refs/remotes/origin/main
-           git verify-commit "$commit"
+           if ! git verify-commit "$commit"; then
+             verified="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${commit}" --jq '.commit.verification.verified')"
+             test "$verified" = true || { echo 'commit signature is not verified by GitHub' >&2; exit 1; }
+           fi
            printf 'commit_sha=%s\n' "$commit" >> "$GITHUB_OUTPUT"
 
   release:

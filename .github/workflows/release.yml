@@ -25,6 +25,7 @@ jobs:
         run: |
           set -euo pipefail
           case "$TAG" in v*) ;; *) echo 'release ref is not a v* tag' >&2; exit 1 ;; esac
+          gpg --batch --import release/trust/skynex-tag-signing-key.asc
           git verify-tag "$TAG"
           git fetch --no-tags origin main:refs/remotes/origin/main
           commit="$(git rev-list -n 1 "$TAG")"

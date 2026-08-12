@@ -399,7 +399,7 @@ func removeOwnedABFile(path string, expected os.FileInfo) error {
 		return fmt.Errorf("owned file identity is required")
 	}
 	current, err := os.Lstat(path)
-	if err != nil || !current.Mode().IsRegular() || !os.SameFile(expected, current) {
+	if err != nil || !sameOwnedABFile(expected, current) {
 		return fmt.Errorf("refusing to remove changed result target")
 	}
 	directory := filepath.Dir(path)
@@ -416,7 +416,7 @@ func removeOwnedABFile(path string, expected os.FileInfo) error {
 		return fmt.Errorf("quarantine owned result: %w", err)
 	}
 	moved, statErr := os.Lstat(quarantinedPath)
-	if statErr != nil || !moved.Mode().IsRegular() || !os.SameFile(expected, moved) {
+	if statErr != nil || !sameOwnedABFile(expected, moved) {
 		restoreErr := os.Link(quarantinedPath, path)
 		if restoreErr == nil {
 			_ = os.Remove(quarantinedPath)
@@ -431,6 +431,11 @@ func removeOwnedABFile(path string, expected os.FileInfo) error {
 		return fmt.Errorf("remove result quarantine: %w", err)
 	}
 	return syncABDirectory(directory)
+}
+
+func sameOwnedABFile(expected, current os.FileInfo) bool {
+	return expected != nil && current != nil && current.Mode().IsRegular() &&
+		os.SameFile(expected, current) && current.Size() == expected.Size()
 }
 
 func validatePartialABArtifact(artifact partialABArtifact, expected abResumeExpectation) (abResumeState, error) {

@@ -2097,7 +2097,11 @@ func TestEngineV1GitStateEvidencePreservesDirtyWorktreeAndRejectsMutation(t *tes
 					if err != nil {
 						return response, err
 					}
-					command := exec.Command("git", append([]string{"-C", request.WorkspacePath}, mutation.args...)...)
+					args := append([]string{"-C", request.WorkspacePath}, mutation.args...)
+					if mutation.name == "commit" {
+						args = append([]string{"-c", "user.name=skynex-test", "-c", "user.email=skynex-test@example.invalid", "-C", request.WorkspacePath}, mutation.args...)
+					}
+					command := exec.Command("git", args...)
 					if output, commandErr := command.CombinedOutput(); commandErr != nil {
 						return nil, fmt.Errorf("git %s: %v: %s", mutation.name, commandErr, output)
 					}

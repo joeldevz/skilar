@@ -182,11 +182,9 @@ class TestSkillsRepoInstaller(unittest.TestCase):
             temp_root = Path(temp_dir)
             checkout_dir = temp_root / "checkout"
             checkout_dir.mkdir()
-            (checkout_dir / "scripts").mkdir()
-            (checkout_dir / "scripts" / "install_claude_assets.py").write_text(
-                "print('ok')\n",
-                encoding="utf-8",
-            )
+            (checkout_dir / "claude-code").mkdir()
+            (checkout_dir / "claude-code" / "CLAUDE.md").write_text("# Claude\n", encoding="utf-8")
+            (checkout_dir / "opencode" / "skills").mkdir(parents=True)
             opencode_source = checkout_dir / "opencode"
             opencode_source.mkdir()
             (opencode_source / "opencode.json").write_text(
@@ -278,9 +276,11 @@ class TestSkillsRepoInstaller(unittest.TestCase):
                 result.targets["opencode"].artifacts, ["~/.config/opencode"]
             )
 
-            claude_call = mock_run.call_args_list[0][0][0]
-            self.assertEqual(claude_call[0], sys.executable)
-            self.assertIn("install_claude_assets.py", claude_call[1])
+            self.assertEqual(
+                mock_run.call_args_list,
+                [],
+                "Windows native installation must not spawn legacy Python or shell installers",
+            )
 
             merged_config = json.loads(
                 (home_dir / ".config" / "opencode" / "opencode.json").read_text(

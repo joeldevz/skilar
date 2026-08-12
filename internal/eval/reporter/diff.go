@@ -2,181 +2,156 @@ package reporter
 
 import (
 	"fmt"
+	"io"
+	"os"
+	"sort"
 
 	"github.com/joeldevz/skynex/internal/eval/runner"
 )
 
-// DiffReport compares baseline vs current SuiteResult
+// DiffReport is the legacy unpaired view. Statistical authority lives in
+// ComparisonReport/gates; this structure remains for the current CLI adapter.
 type DiffReport struct {
-	Items   []ItemDiff
-	Summary DiffSummary
+	Items   []ItemDiff  `json:"items"`
+	Summary DiffSummary `json:"summary"`
 }
 
-// ItemDiff represents the difference for a single test case
 type ItemDiff struct {
-	CaseID     string
-	Item       string
-	BaseScore  float64
-	CurrScore  float64
-	Delta      float64
-	BaseStatus string
-	CurrStatus string
-	Regressed  bool
-	Improved   bool
-	PassCount  int
+	CaseID     string  `json:"case_id"`
+	Item       string  `json:"item"`
+	BaseScore  float64 `json:"base_score"`
+	CurrScore  float64 `json:"current_score"`
+	Delta      float64 `json:"delta"`
+	BaseStatus string  `json:"base_status"`
+	CurrStatus string  `json:"current_status"`
+	Comparable bool    `json:"comparable"`
+	Reason     string  `json:"reason,omitempty"`
+	Regressed  bool    `json:"regressed"`
+	Improved   bool    `json:"improved"`
+	PassCount  int     `json:"pass_count"`
 }
 
-// DiffSummary contains aggregated diff statistics
 type DiffSummary struct {
-	TotalCases    int
-	Improved      int
-	Regressed     int
-	Unchanged     int
-	BasePassRate  float64
-	CurrPassRate  float64
-	DeltaPassRate float64
-	BaseCost      float64
-	CurrCost      float64
+	TotalCases     int     `json:"total_cases"`
+	Improved       int     `json:"improved"`
+	Regressed      int     `json:"regressed"`
+	Unchanged      int     `json:"unchanged"`
+	MissingControl int     `json:"missing_control"`
+	MissingCurrent int     `json:"missing_current"`
+	BasePassRate   float64 `json:"base_pass_rate"`
+	CurrPassRate   float64 `json:"current_pass_rate"`
+	DeltaPassRate  float64 `json:"delta_pass_rate"`
+	BaseCost       float64 `json:"base_cost"`
+	CurrCost       float64 `json:"current_cost"`
 }
 
-// ComputeDiff compares baseline vs current SuiteResult
-func ComputeDiff(baseline, current *runner.SuiteResult) *DiffReport {
-	if baseline == nil || current == nil {
-		return &DiffReport{
-			Items:   []ItemDiff{},
-			Summary: DiffSummary{},
+func ComputeDiff(control, current *runner.SuiteResult) *DiffReport {
+	if control == nil || current == nil {
+		return &DiffReport{Items: []ItemDiff{}}
+	}
+	report := &DiffReport{Items: []ItemDiff{}}
+	controlCases := make(map[string]runner.CaseResult, len(control.Items))
+	currentCases := make(map[string]struct{}, len(current.Items))
+	for _, item := range control.Items {
+		controlCases[item.ID] = item
+	}
+	for _, candidate := range current.Items {
+		currentCases[candidate.ID] = struct{}{}
+		base, exists := controlCases[candidate.ID]
+		diff := ItemDiff{
+			CaseID: candidate.ID, Item: candidate.Item, CurrScore: candidate.Score,
+			CurrStatus: candidate.Status, PassCount: candidate.PassCount,
 		}
-	}
-
-	report := &DiffReport{
-		Items: []ItemDiff{},
-	}
-
-	// Build map of baseline cases for quick lookup
-	baselineMap := make(map[string]runner.CaseResult)
-	for _, c := range baseline.Items {
-		baselineMap[c.ID] = c
-	}
-
-	// Compare each current case against baseline
-	for _, currCase := range current.Items {
-		baseCase, exists := baselineMap[currCase.ID]
-
-		baseScore := 0.0
-		baseStatus := "missing"
-		if exists {
-			baseScore = baseCase.Score
-			baseStatus = baseCase.Status
+		if !exists {
+			diff.BaseStatus = "missing"
+			diff.Reason = "missing_control_case"
+			report.Summary.MissingControl++
+			report.Items = append(report.Items, diff)
+			continue
 		}
-
-		delta := currCase.Score - baseScore
-		improved := delta > 0.01 && exists // small epsilon for floating point
-		regressed := delta < -0.01 && exists
-
-		report.Items = append(report.Items, ItemDiff{
-			CaseID:     currCase.ID,
-			Item:       currCase.Item,
-			BaseScore:  baseScore,
-			CurrScore:  currCase.Score,
-			Delta:      delta,
-			BaseStatus: baseStatus,
-			CurrStatus: currCase.Status,
-			Regressed:  regressed,
-			Improved:   improved,
-			PassCount:  currCase.PassCount,
-		})
-
-		if improved {
+		diff.BaseScore = base.Score
+		diff.BaseStatus = base.Status
+		diff.Delta = candidate.Score - base.Score
+		diff.Comparable = true
+		diff.Improved = (base.Status != "pass" && candidate.Status == "pass") || (base.Status == candidate.Status && diff.Delta > 0.01)
+		diff.Regressed = (base.Status == "pass" && candidate.Status != "pass") || (base.Status == candidate.Status && diff.Delta < -0.01)
+		switch {
+		case diff.Improved:
 			report.Summary.Improved++
-		} else if regressed {
+		case diff.Regressed:
 			report.Summary.Regressed++
-		} else {
+		default:
 			report.Summary.Unchanged++
 		}
+		report.Items = append(report.Items, diff)
 	}
-
-	report.Summary.TotalCases = len(current.Items)
-	report.Summary.BasePassRate = baseline.PassRate
+	for _, base := range control.Items {
+		if _, exists := currentCases[base.ID]; exists {
+			continue
+		}
+		report.Summary.MissingCurrent++
+		report.Items = append(report.Items, ItemDiff{
+			CaseID: base.ID, Item: base.Item, BaseScore: base.Score, BaseStatus: base.Status,
+			CurrStatus: "missing", Reason: "missing_current_case",
+		})
+	}
+	sort.Slice(report.Items, func(i, j int) bool { return report.Items[i].CaseID < report.Items[j].CaseID })
+	report.Summary.TotalCases = len(report.Items)
+	report.Summary.BasePassRate = control.PassRate
 	report.Summary.CurrPassRate = current.PassRate
-	report.Summary.DeltaPassRate = current.PassRate - baseline.PassRate
-	report.Summary.BaseCost = baseline.TotalCost
+	report.Summary.DeltaPassRate = current.PassRate - control.PassRate
+	report.Summary.BaseCost = control.TotalCost
 	report.Summary.CurrCost = current.TotalCost
-
 	return report
 }
 
-// PrintDiff prints a formatted diff report to stdout
-func PrintDiff(report *DiffReport) {
+// WriteDiff renders the legacy diff without emitting ANSI sequences. Every
+// untrusted identifier is terminal-sanitized and bounded.
+func WriteDiff(writer io.Writer, report *DiffReport) error {
+	if writer == nil {
+		return fmt.Errorf("diff writer is nil")
+	}
 	if report == nil {
-		fmt.Println("No diff report available")
-		return
+		_, err := fmt.Fprintln(writer, "No diff report available")
+		return err
 	}
-
-	const (
-		ansiGreen = "\033[32m"
-		ansiRed   = "\033[31m"
-		ansiReset = "\033[0m"
-		ansiBlod  = "\033[1m"
-	)
-
-	// Print header
-	fmt.Println("╔══════════════════════════════════════════════════╗")
-	fmt.Println("║              EVALUATION DIFF REPORT              ║")
-	fmt.Println("╠══════════════════════════════════════════════════╣")
-
-	// Print metrics
-	passRateDelta := report.Summary.DeltaPassRate * 100
+	if _, err := fmt.Fprintln(writer, "Evaluation diff"); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(writer, "Pass rate: %.1f%% -> %.1f%% (%+.1f pp)\n",
+		report.Summary.BasePassRate*100, report.Summary.CurrPassRate*100, report.Summary.DeltaPassRate*100); err != nil {
+		return err
+	}
 	costDelta := report.Summary.CurrCost - report.Summary.BaseCost
-	costDeltaPercent := 0.0
-	if report.Summary.BaseCost > 0 {
-		costDeltaPercent = (costDelta / report.Summary.BaseCost) * 100
-	}
-
-	passRateIcon := ""
-	if passRateDelta > 0 {
-		passRateIcon = ansiGreen + "✅" + ansiReset
-	} else if passRateDelta < 0 {
-		passRateIcon = ansiRed + "❌" + ansiReset
-	}
-
-	costIcon := ""
-	if costDelta < 0 {
-		costIcon = ansiGreen + "✅" + ansiReset
-	} else if costDelta > 0 {
-		costIcon = ansiRed + "⚠️ " + ansiReset
-	}
-
-	fmt.Printf("║  Metric           Baseline   Current    Δ       ║\n")
-	fmt.Printf("║  Pass rate        %.0f%%        %.0f%%        %+.0f%% %s ║\n",
-		report.Summary.BasePassRate*100,
-		report.Summary.CurrPassRate*100,
-		passRateDelta,
-		passRateIcon)
-	fmt.Printf("║  Cost             $%.2f      $%.2f      %+.1f%% %s ║\n",
-		report.Summary.BaseCost,
-		report.Summary.CurrCost,
-		costDeltaPercent,
-		costIcon)
-
-	fmt.Println("╠══════════════════════════════════════════════════╣")
-
-	// Print summary counts
-	fmt.Printf("║  Cases improved:  %d                             ║\n", report.Summary.Improved)
-	if report.Summary.Regressed > 0 {
-		fmt.Printf("║  Cases regressed: %d  ← ", report.Summary.Regressed)
-		// Print first regressed case
-		for _, item := range report.Items {
-			if item.Regressed {
-				fmt.Printf("%s", item.CaseID)
-				break
-			}
+	if report.Summary.BaseCost == 0 {
+		if _, err := fmt.Fprintf(writer, "Cost: $%.6f -> $%.6f (%+.6f; ratio unavailable: zero baseline)\n",
+			report.Summary.BaseCost, report.Summary.CurrCost, costDelta); err != nil {
+			return err
 		}
-		fmt.Println()
-		fmt.Printf("║%-50s║\n", "")
-	} else {
-		fmt.Printf("║  Cases regressed: 0                              ║\n")
+	} else if _, err := fmt.Fprintf(writer, "Cost: $%.6f -> $%.6f (%+.2f%%)\n",
+		report.Summary.BaseCost, report.Summary.CurrCost, costDelta/report.Summary.BaseCost*100); err != nil {
+		return err
 	}
-	fmt.Printf("║  Cases unchanged: %d                            ║\n", report.Summary.Unchanged)
+	if _, err := fmt.Fprintf(writer, "Cases: %d improved, %d regressed, %d unchanged, %d missing control, %d missing current\n",
+		report.Summary.Improved, report.Summary.Regressed, report.Summary.Unchanged,
+		report.Summary.MissingControl, report.Summary.MissingCurrent); err != nil {
+		return err
+	}
+	for _, item := range report.Items {
+		if !item.Regressed && item.Reason == "" {
+			continue
+		}
+		status := "regressed"
+		if item.Reason != "" {
+			status = item.Reason
+		}
+		if _, err := fmt.Fprintf(writer, "  %s: %s\n", SanitizeTerminal(item.CaseID), SanitizeTerminal(status)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
-	fmt.Println("╚══════════════════════════════════════════════════╝")
+func PrintDiff(report *DiffReport) {
+	_ = WriteDiff(os.Stdout, report)
 }

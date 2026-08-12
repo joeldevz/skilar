@@ -22,6 +22,7 @@ type Profile struct {
 // AgentOrder defines the display order for known agents.
 var AgentOrder = []string{
 	"orchestrator",
+	"skynex-orchestrator",
 	"tech-planner",
 	"product-planner",
 	"coder",
@@ -30,12 +31,11 @@ var AgentOrder = []string{
 	"test-reviewer",
 	"security",
 	"skill-validator",
-	"advisor",
 }
 
 // SimpleGroups organizes agents into logical groups for simple mode.
 var SimpleGroups = map[string][]string{
-	"orchestrator": {"orchestrator", "manager"},
+	"orchestrator": {"orchestrator", "skynex-orchestrator", "manager"},
 	"workers": {
 		"tech-planner",
 		"product-planner",
@@ -45,7 +45,6 @@ var SimpleGroups = map[string][]string{
 		"security",
 		"skill-validator",
 	},
-	"advisor": {"advisor"},
 }
 
 // BuiltinTiers defines predefined tier profiles.
@@ -53,46 +52,46 @@ var BuiltinTiers = map[string]*Profile{
 	"cheap": {
 		Name: "cheap",
 		Models: map[string]string{
-			"orchestrator":    "anthropic/claude-haiku-4-5",
-			"tech-planner":    "anthropic/claude-haiku-4-5",
-			"product-planner": "anthropic/claude-haiku-4-5",
-			"coder":           "anthropic/claude-haiku-4-5",
-			"manager":         "anthropic/claude-haiku-4-5",
-			"verifier":        "anthropic/claude-haiku-4-5",
-			"test-reviewer":   "anthropic/claude-haiku-4-5",
-			"security":        "anthropic/claude-haiku-4-5",
-			"skill-validator": "anthropic/claude-haiku-4-5",
-			"advisor":         "anthropic/claude-opus-4-6",
+			"orchestrator":        "anthropic/claude-haiku-4-5",
+			"skynex-orchestrator": "anthropic/claude-haiku-4-5",
+			"tech-planner":        "anthropic/claude-haiku-4-5",
+			"product-planner":     "anthropic/claude-haiku-4-5",
+			"coder":               "anthropic/claude-haiku-4-5",
+			"manager":             "anthropic/claude-haiku-4-5",
+			"verifier":            "anthropic/claude-haiku-4-5",
+			"test-reviewer":       "anthropic/claude-haiku-4-5",
+			"security":            "anthropic/claude-haiku-4-5",
+			"skill-validator":     "anthropic/claude-haiku-4-5",
 		},
 	},
 	"balanced": {
 		Name: "balanced",
 		Models: map[string]string{
-			"orchestrator":    "anthropic/claude-sonnet-4-6",
-			"tech-planner":    "anthropic/claude-sonnet-4-6",
-			"product-planner": "anthropic/claude-haiku-4-5",
-			"coder":           "anthropic/claude-haiku-4-5",
-			"manager":         "anthropic/claude-haiku-4-5",
-			"verifier":        "anthropic/claude-haiku-4-5",
-			"test-reviewer":   "anthropic/claude-haiku-4-5",
-			"security":        "anthropic/claude-haiku-4-5",
-			"skill-validator": "anthropic/claude-haiku-4-5",
-			"advisor":         "anthropic/claude-opus-4-6",
+			"orchestrator":        "anthropic/claude-sonnet-4-6",
+			"skynex-orchestrator": "anthropic/claude-sonnet-4-6",
+			"tech-planner":        "anthropic/claude-sonnet-4-6",
+			"product-planner":     "anthropic/claude-haiku-4-5",
+			"coder":               "anthropic/claude-haiku-4-5",
+			"manager":             "anthropic/claude-haiku-4-5",
+			"verifier":            "anthropic/claude-haiku-4-5",
+			"test-reviewer":       "anthropic/claude-haiku-4-5",
+			"security":            "anthropic/claude-haiku-4-5",
+			"skill-validator":     "anthropic/claude-haiku-4-5",
 		},
 	},
 	"premium": {
 		Name: "premium",
 		Models: map[string]string{
-			"orchestrator":    "anthropic/claude-opus-4-6",
-			"tech-planner":    "anthropic/claude-sonnet-4-6",
-			"product-planner": "anthropic/claude-sonnet-4-6",
-			"coder":           "anthropic/claude-sonnet-4-6",
-			"manager":         "anthropic/claude-sonnet-4-6",
-			"verifier":        "anthropic/claude-haiku-4-5",
-			"test-reviewer":   "anthropic/claude-haiku-4-5",
-			"security":        "anthropic/claude-sonnet-4-6",
-			"skill-validator": "anthropic/claude-haiku-4-5",
-			"advisor":         "anthropic/claude-opus-4-6",
+			"orchestrator":        "anthropic/claude-opus-4-6",
+			"skynex-orchestrator": "anthropic/claude-opus-4-6",
+			"tech-planner":        "anthropic/claude-sonnet-4-6",
+			"product-planner":     "anthropic/claude-sonnet-4-6",
+			"coder":               "anthropic/claude-sonnet-4-6",
+			"manager":             "anthropic/claude-sonnet-4-6",
+			"verifier":            "anthropic/claude-haiku-4-5",
+			"test-reviewer":       "anthropic/claude-haiku-4-5",
+			"security":            "anthropic/claude-sonnet-4-6",
+			"skill-validator":     "anthropic/claude-haiku-4-5",
 		},
 	},
 }
@@ -149,6 +148,7 @@ func Load(name string) (*Profile, error) {
 	if err := json.Unmarshal(data, &p); err != nil {
 		return nil, fmt.Errorf("failed to parse profile %q: %w", name, err)
 	}
+	delete(p.Models, "advisor")
 
 	return &p, nil
 }
@@ -175,6 +175,7 @@ func Save(p *Profile) error {
 	if p.Models == nil {
 		p.Models = make(map[string]string)
 	}
+	delete(p.Models, "advisor")
 
 	data, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {

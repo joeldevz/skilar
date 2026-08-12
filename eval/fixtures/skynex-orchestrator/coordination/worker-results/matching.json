@@ -1,0 +1,12 @@
+{
+  "workflow_id": "wf-active",
+  "attempt_id": "attempt-1",
+  "node_id": "node-profile",
+  "base_candidate_oid": "tree-v1",
+  "scope": ["candidate.txt"],
+  "status": "completed",
+  "verification": {
+    "argv": ["go", "test", "./..."],
+    "exit_code": 0
+  }
+}

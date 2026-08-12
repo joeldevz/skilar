@@ -144,41 +144,19 @@ func TestSaveLoadDelete(t *testing.T) {
 }
 
 func TestBuiltinTiers(t *testing.T) {
-	tests := []struct {
-		name       string
-		tier       string
-		hasAdvisor bool
-	}{
-		{"cheap-has-advisor", "cheap", true},
-		{"balanced-has-advisor", "balanced", true},
-		{"premium-has-advisor", "premium", true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tier, ok := BuiltinTiers[tt.tier]
-			if !ok {
-				t.Fatalf("tier %q not found", tt.tier)
+	for _, tierName := range []string{"cheap", "balanced", "premium"} {
+		tier, ok := BuiltinTiers[tierName]
+		if !ok {
+			t.Fatalf("tier %q not found", tierName)
+		}
+		if _, exists := tier.Models["advisor"]; exists {
+			t.Errorf("%q retains retired advisor", tierName)
+		}
+		for _, agent := range AgentOrder {
+			if model := tier.Models[agent]; model == "" {
+				t.Errorf("%q missing model for %q", tierName, agent)
 			}
-
-			if tt.hasAdvisor {
-				model, ok := tier.Models["advisor"]
-				if !ok || model == "" {
-					t.Errorf("%q tier missing advisor model", tt.tier)
-				}
-
-				if model != "anthropic/claude-opus-4-6" {
-					t.Errorf("%q tier advisor model is %s, want anthropic/claude-opus-4-6", tt.tier, model)
-				}
-			}
-
-			// Verify all known agents have models
-			for _, agent := range AgentOrder {
-				if model, ok := tier.Models[agent]; !ok || model == "" {
-					t.Errorf("%q tier missing model for agent %q", tt.tier, agent)
-				}
-			}
-		})
+		}
 	}
 }
 
@@ -224,14 +202,37 @@ func TestSimpleGroups(t *testing.T) {
 	}
 
 	// Verify we have at least three groups
-	if len(SimpleGroups) != 3 {
-		t.Errorf("expected 3 groups, got %d", len(SimpleGroups))
+	if len(SimpleGroups) != 2 {
+		t.Errorf("expected 2 groups, got %d", len(SimpleGroups))
 	}
 
 	// Verify all required groups exist
-	for _, g := range []string{"orchestrator", "workers", "advisor"} {
+	for _, g := range []string{"orchestrator", "workers"} {
 		if _, ok := SimpleGroups[g]; !ok {
 			t.Errorf("required group %q not found", g)
 		}
+	}
+}
+
+func TestLoadMigratesLegacyAdvisorModel(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := Dir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte(`{"name":"legacy","models":{"advisor":"legacy/opus","coder":"current/model"}}`)
+	if err := os.WriteFile(filepath.Join(dir, "legacy.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	profile, err := Load("legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := profile.Models["advisor"]; ok {
+		t.Fatal("legacy advisor model remained public")
+	}
+	if profile.Models["coder"] != "current/model" {
+		t.Fatal("non-Advisor legacy data was not preserved")
 	}
 }

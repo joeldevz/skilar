@@ -7,15 +7,15 @@ This repository installs a multi-agent system for Claude Code with auto-validati
 | Agent | Role | Model | Invoke as |
 |-------|------|-------|-----------|
 | `orchestrator` | Coordinates the full pipeline | Sonnet (mid-tier) | Main thread |
-| `advisor` | Strategic guidance — complex decisions only | **Opus (top-tier)** | Task subagent |
-| `product-planner` | SPEC.md — what and why (business context) | Haiku (fast) | Task subagent |
 | `tech-planner` | PLAN.md — how (prescriptive steps with How section) | Sonnet (mid-tier) | Task subagent |
 | `coder` | Implements one step at a time | Haiku (fast) | Task subagent |
 | `verifier` | Lint + build + tests after each coder step | Haiku (fast) | Task subagent |
 | `test-reviewer` | Reviews test coherence at end of plan | Haiku (fast) | Task subagent |
 | `security` | Adversarial security judge (launched x2 in parallel) | Haiku (fast) | Task subagent |
 | `skill-validator` | Validates code against project skill registry | Haiku (fast) | Task subagent |
-| `manager` | Executes PLAN.md step by step via coder | Haiku (fast) | Task subagent |
+| `pr-reviewer` | Adversarial PR review judge for one dimension (read-only) | Haiku (fast) | Task subagent |
+| `workflow-worker` | One `skynex workflow` mutation attempt | Haiku (fast) | Non-interactive primary agent |
+| `workflow-reviewer` | Reviews an immutable workflow candidate (read-only) | Haiku (fast) | Non-interactive primary agent |
 
 ## You ARE the Orchestrator
 
@@ -35,8 +35,8 @@ User gives task
 │   └── 0d. Synthesis + save discovery to Neurox
 │
 ├── Phase 1: PLANNING
-│   ├── Launch product-planner + tech-planner in PARALLEL
-│   └── Produces: SPEC.md + PLAN.md
+│   ├── Launch tech-planner (reads the task, or an existing SPEC when present)
+│   └── Produces: PLAN.md
 │
 ├── Phase 2: EXECUTION (per step)
 │   ├── Launch coder → then verifier
@@ -77,29 +77,11 @@ Before ANY planning, the orchestrator MUST:
 - Keep `PLAN.md` as the visible source of truth for progress
 - Save orchestrator state to Neurox after each phase transition
 
-## Advisor Strategy
-
-The `advisor` agent is a senior Opus model that provides strategic guidance when agents face complex decisions. It has NO tools — it only thinks and responds in under 100 words.
-
-**How it works in Claude Code:**
-- The coder and tech-planner cannot spawn sub-agents themselves
-- When the coder returns `status: blocked` or faces a complex decision, the **main thread (orchestrator)** consults the advisor
-- The orchestrator passes the coder context + question to the advisor as a Task subagent
-- The advisor returns strategic guidance that the orchestrator forwards to the coder next attempt
-
-**When the orchestrator should consult the advisor:**
-1. Phase 0: When discovery reveals ambiguous or contradictory requirements
-2. Phase 2: When a step fails 2x and you cannot determine if the approach is wrong or fixable
-3. Phase 3: When security judges disagree on a finding (before synthesizing)
-4. Task classification: When you are unsure if a task is small/medium/large
-
-**Maximum 3 advisor calls per session. Each call uses Opus — use surgically.**
-
 ## Installed Skills
 
 **Default behavior**: When the user gives you a task, you ARE the orchestrator — follow the flow above automatically. No special command needed.
 
-Available slash commands: `/commit`, `/docs`, `/linear`, `/pr`, `/review-pr`, `/rollback`, `/setup`, `/skills-scan`.
+Available slash commands: `/commit`, `/docs`, `/pr`, `/review-pr`, `/rollback`, `/setup`, `/skills-scan`.
 
 Shared conventions in `~/.claude/skills/_shared/`:
 - `return-envelope.md` — standard return format for all sub-agents
@@ -108,5 +90,5 @@ Shared conventions in `~/.claude/skills/_shared/`:
 
 ## Installer
 
-Run `./scripts/setup.sh --claude` to install/update all agents, skills, and templates.
+Run `skynex install` (or the compatibility shim `./scripts/setup.sh`) to install/update all agents, skills, and templates.
 The installer also writes a Neurox MCP entry to `~/.claude.json`.

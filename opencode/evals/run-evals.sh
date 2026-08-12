@@ -8,7 +8,7 @@ set -euo pipefail
 # Usage:
 #   ./evals/run-evals.sh                              # Run all golden tests
 #   ./evals/run-evals.sh golden/01-planner-reads-conventions.yaml  # One test
-#   ./evals/run-evals.sh --agent planner   # Filter by agent
+#   ./evals/run-evals.sh --agent tech-planner   # Filter by agent
 # ================================================================
 
 EVALS_DIR="$(cd "$(dirname "$0")" && pwd)"

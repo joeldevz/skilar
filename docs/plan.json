@@ -162,7 +162,7 @@
       "specification": {
         "frontmatter": {
           "name": "review-workload",
-          "description": "Use before manager closes a slice or /pr creates the PR to evaluate review burden and recommend split strategy."
+          "description": "Use before the orchestrator closes a slice or /pr creates the PR to evaluate review burden and recommend split strategy."
         },
         "thresholds": {
           "single_pr_ok": "<=400 changed lines",
@@ -177,7 +177,7 @@
           "areas_touched": "array of paths"
         },
         "triggers": [
-          "manager about to mark slice done",
+          "orchestrator about to mark slice done",
           "/pr command invoked",
           "tech-planner finishing PLAN.md with large slices"
         ]
@@ -187,7 +187,7 @@
         "Líneas ≤120",
         "Frontmatter description sigue Description Trap (Use when X)",
         "Skill genera output con pr_strategy + reason + suggested_splits",
-        "Integrado en /pr command y en manager"
+        "Integrado en /pr command y en el orchestrator"
       ],
       "verification": [
         "wc -l opencode/skills/review-workload/SKILL.md devuelve <=120",

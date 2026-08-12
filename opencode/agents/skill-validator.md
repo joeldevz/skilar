@@ -18,7 +18,7 @@ Resolution order:
 2. Search Neurox: `neurox_recall(query: 'skill-registry', namespace: '{project}')`
 3. Read `.skynex/skill-registry.md` from project root if it exists
 4. Read `CONVENTIONS.md` from project root if it exists
-5. If nothing found: report 'No skill registry found — run /skills:scan to generate one' and return status: partial
+5. If nothing found: report 'No skill registry found — run /skills-scan to generate one' and return status: partial
 
 STEP 2 — Match relevant skills to modified files
 
@@ -70,3 +70,9 @@ RULES:
 - NEVER fail a validation based on personal preference — only documented rules
 - If a skill registry is not available, validate only against CONVENTIONS.md and report partial status
 - A COMPLIANT result is meaningful — acknowledge it in the summary
+
+## Git risk policy
+
+Read-only Git inspection is unrestricted. Before any mutation, run `git status` and verify the exact scope. When the user intent is explicit, a local reversible bounded action such as `git restore --staged <paths>` or stage exact paths may be executed directly by this agent or subagent; do not ask the user to run it manually and do not delegate to evade this policy.
+
+`git restore --worktree`, reset, or clean actions that discard working changes require explicit confirmation stating the exact paths and impact. Never touch untracked files outside the authorized scope. Commit, push, and PR actions still require the repository-defined user request or approval. Force push, `git reset --hard`, and `git clean -fd` are prohibited unless the user makes an extraordinary explicit request and passes the destructive-action gate. Subagents follow the same policy; role-specific stricter read-only boundaries still apply.

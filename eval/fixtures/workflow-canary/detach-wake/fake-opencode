@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+case "$*" in
+  *"Assess risk"*)
+    printf '%s' '{"requested_risk":"low","selected_lens":"","justification":"deterministic public canary"}' > "$SKYNEX_RESULT_FILE"
+    exit 0
+    ;;
+  *"Review lens"*)
+    printf '%s' '{"findings":[]}' > "$SKYNEX_RESULT_FILE"
+    exit 0
+    ;;
+esac
+
+sleep 2
+tree=$(git write-tree)
+printf '%s' '{"envelope":{"WorkflowID":"wfv2_canary_detach_wake","NodeID":"slice_main","AttemptID":"wfv2_canary_detach_wake:slice_main","BaseCandidateOID":"'"$tree"'","Status":"completed","EvidenceIDs":["public-canary"]},"patch":{"Operations":[{"Path":"message.go","Data":"cGFja2FnZSBkZXRhY2h3YWtlCgpjb25zdCBXb3JrZmxvd1N0YXR1c1RleHQgPSAicmVhZHkiCg==","Mode":420}]}}' > "$SKYNEX_RESULT_FILE"

@@ -33,13 +33,12 @@ opencode/
 - recomienda defaults razonables
 - genera `PLAN.md`
 
-### `manager`
+### `infrastructure-engineer`
 
-- lee `PLAN.md`
-- ejecuta un solo paso por vez
-- delega implementacion a `coder`
-- actualiza estados del plan
-- obliga a revision humana antes de continuar
+- gestiona tareas acotadas de infraestructura, CI/CD, runtime y despliegue
+- prepara las herramientas de calidad requeridas desde sus fuentes upstream
+- separa los límites no testeables y ejecuta la verificación relevante
+- conserva el acceso completo a Neurox para registrar decisiones operativas duraderas
 
 Estados de `PLAN.md`:
 
@@ -58,88 +57,20 @@ Estados de `PLAN.md`:
 
 ## Commands
 
-### Planificacion
+La lista canónica es el contenido de `opencode/commands/`:
 
-- `/onboard`
-  - explora un proyecto antes de trabajar
-  - resume stack, arquitectura, comandos y convenciones
-- `/plan <tarea>`
-  - investiga el codebase
-  - pregunta lo necesario
-  - crea o reemplaza `PLAN.md`
-- `/plan-rewrite`
-  - revisa y mejora `PLAN.md`
-  - rellena huecos y ajusta pasos
+`/commit`, `/docs`, `/pr`, `/review-pr`, `/rollback`, `/setup` y `/skills-scan`.
 
-### Ejecucion
-
-- `/execute`
-  - toma el siguiente paso pendiente o con fixes
-  - lo delega a `coder`
-  - presenta cambios y pide review humana
-- `/apply-feedback <cambios>`
-  - toma feedback humano
-  - vuelve a delegar correcciones
-- `/status`
-  - muestra completados, paso actual y siguientes pasos
-- `/diff`
-  - muestra los cambios del paso actual con anotaciones
-  - agrupa por proposito, no solo por archivo
-- `/rollback [step]`
-  - deshace los cambios del ultimo paso (o del paso indicado)
-  - pide confirmacion antes de revertir
-  - actualiza PLAN.md a `[ ] pending`
-- `/test [modulo]`
-  - genera tests para el paso actual o modulo especificado
-  - lee tests existentes para seguir los mismos patrones
-  - corre los tests y reporta resultados
-
-### Calidad
-
-- `/review`
-  - revisa todos los cambios contra CONVENTIONS.md
-  - verifica tipos, imports, arquitectura, tests faltantes
-  - produce un reporte estructurado (Passing / Warnings / Issues)
-  - quality gate antes de `/commit`
-- `/estimate`
-  - estima el esfuerzo de cada paso del PLAN.md
-  - asigna T-shirt sizes (XS a XL) con riesgos
-  - util para planificacion de sprint
-
-### Documentacion
-
-- `/docs <libreria> <tema>`
-  - busca docs en vivo via Context7 MCP
-  - filtra a lo relevante y presenta un resumen practico
-  - util cuando integras librerias nuevas o dudas de una API
-- `/context [observacion]`
-  - guarda descubrimientos y decisiones en Neurox
-  - si no se pasa argumento, extrae aprendizajes del trabajo reciente
-  - persiste entre sesiones para no repetir descubrimientos
-
-### Git
-
-- `/commit`
-  - crea un commit local con Conventional Commits
-- `/pr`
-  - crea un pull request con `gh`
-  - resume todos los cambios de la rama
+Los comandos descritos en documentos antiguos no forman parte de la distribución actual.
 
 ## Flujo recomendado
 
 ```text
-/onboard
-/plan implementar login con JWT
-/estimate
-/execute
-/diff
-/apply-feedback separar DTOs y agregar tests
-/execute
-/test
-/review
+/setup
+/docs Go testing
+/review-pr
 /commit
 /pr
-/context
 ```
 
 ## Setup para cada miembro del equipo
@@ -219,7 +150,7 @@ Reglas de Conventional Commits y estructura de PR.
 - `triage` — triage issues through a state-machine of roles (bug/enhancement + states)
 
 Compartidas en `_shared/`:
-- `advisor-protocol.md`, `neurox-protocol.md`, `return-envelope.md`, `skill-resolver.md`, `smart-zone-budget.md`
+- `neurox-protocol.md`, `return-envelope.md`, `skill-resolver.md`, `smart-zone-budget.md`
 
 ## Regla mas importante
 
@@ -236,7 +167,7 @@ DTOs si pueden usar primitivos porque son la frontera de serializacion.
 
 ## Eval Framework
 
-9 golden tests en `evals/golden/` que validan el comportamiento esperado de los 3 agentes y commands clave:
+9 golden tests en `evals/golden/` que validan el comportamiento esperado de los agentes y commands clave:
 
 | Test | Agente       | Valida                                        |
 | ---- | ------------ | --------------------------------------------- |

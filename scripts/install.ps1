@@ -6,19 +6,19 @@
 
 .DESCRIPTION
   Downloads and installs the skynex binary for Windows.
-  Supports installation via Go or pre-built binary from GitHub Releases.
+  Supports installation via a pre-built binary from GitHub Releases.
 
 .EXAMPLE
-  irm https://raw.githubusercontent.com/joeldevz/skynex/main/scripts/install.ps1 | iex
+  Download install.ps1 from a tagged release, verify its detached signature,
+  then run the local file. Never pipe an unverified network response to iex.
 
   # Force a specific method:
   .\install.ps1 -Method binary
-  .\install.ps1 -Method go
 #>
 
 [CmdletBinding()]
 param(
-  [ValidateSet("auto", "go", "binary")]
+  [ValidateSet("auto", "binary")]
   [string]$Method = "auto",
 
   [string]$InstallDir = ""
@@ -29,6 +29,9 @@ $ErrorActionPreference = "Stop"
 $GITHUB_OWNER = "joeldevz"
 $GITHUB_REPO  = "skynex"
 $BINARY_NAME  = "skynex"
+$MAX_COMPRESSED_BYTES = 100MB
+$MAX_EXTRACTED_BYTES = 250MB
+$RELEASE_BASE_URL = "https://github.com/$GITHUB_OWNER/$GITHUB_REPO/releases/download"
 
 # ============================================================================
 # Logging
@@ -44,6 +47,50 @@ function Stop-WithError {
   param([string]$Message)
   Write-Err $Message
   exit 1
+}
+
+function New-PrivateTempDirectory {
+  $root = [IO.Path]::GetTempPath()
+  for ($attempt = 0; $attempt -lt 10; $attempt++) {
+    $candidate = Join-Path $root ("skynex-install-" + [IO.Path]::GetRandomFileName())
+    try {
+      [IO.Directory]::CreateDirectory($candidate) | Out-Null
+      $acl = New-Object System.Security.AccessControl.DirectorySecurity
+      $acl.SetAccessRuleProtection($true, $false)
+      $identity = [Security.Principal.WindowsIdentity]::GetCurrent().User
+      $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($identity, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")))
+      [IO.Directory]::SetAccessControl($candidate, $acl)
+      return $candidate
+    } catch [IO.IOException] {
+      continue
+    }
+  }
+  Stop-WithError "Could not create a private temporary directory"
+}
+
+function Test-SafeZip {
+  param([string]$Path)
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  $archive = [IO.Compression.ZipFile]::OpenRead($Path)
+  try {
+    $entries = @($archive.Entries)
+    if ($entries.Count -ne 1) { Stop-WithError "Archive must contain exactly one entry: $BINARY_NAME.exe" }
+    foreach ($entry in $entries) {
+      $name = $entry.FullName.Replace('\', '/')
+      if ([IO.Path]::IsPathRooted($name) -or $name -match '(^|/)\.\.?(/|$)' -or $name -ne "$BINARY_NAME.exe") {
+        Stop-WithError "Unsafe archive member: $($entry.FullName)"
+      }
+      if ($entry.FullName.EndsWith('/') -or $entry.Length -lt 1) {
+        Stop-WithError "Archive member is not a non-empty regular file"
+      }
+      $unixType = ($entry.ExternalAttributes -shr 16) -band 0xF000
+      if ($unixType -eq 0xA000 -or $unixType -eq 0x4000) {
+        Stop-WithError "Archive member is a link or special file"
+      }
+    }
+  } finally {
+    $archive.Dispose()
+  }
 }
 
 # ============================================================================
@@ -88,13 +135,12 @@ function Test-Prerequisites {
 
   $missing = @()
   if (-not (Get-Command "curl" -ErrorAction SilentlyContinue)) { $missing += "curl" }
-  if (-not (Get-Command "git"  -ErrorAction SilentlyContinue)) { $missing += "git" }
 
   if ($missing.Count -gt 0) {
     Stop-WithError "Missing required tools: $($missing -join ', '). Please install them and try again."
   }
 
-  Write-Success "curl and git are available"
+  Write-Success "curl is available"
 }
 
 # ============================================================================
@@ -115,34 +161,6 @@ function Get-InstallMethod {
 }
 
 # ============================================================================
-# Install via go install
-# ============================================================================
-
-function Install-ViaGo {
-  Write-Step "Installing via go install"
-
-  $goPackage = "github.com/$GITHUB_OWNER/$GITHUB_REPO/cmd/$BINARY_NAME@latest"
-  Write-Info "Running: go install $goPackage"
-
-  & go install $goPackage
-  if ($LASTEXITCODE -ne 0) {
-    Stop-WithError "Failed to install via go install. Make sure Go is properly configured."
-  }
-
-  $gobin = & go env GOBIN 2>$null
-  if (-not $gobin) {
-    $gopath = & go env GOPATH 2>$null
-    $gobin = Join-Path $gopath "bin"
-  }
-
-  if ($env:PATH -notlike "*$gobin*") {
-    Write-Warn "$gobin is not in your PATH"
-    Write-Warn "Add it to your PATH environment variable."
-  }
-
-  Write-Success "Installed $BINARY_NAME via go install"
-}
-
 # ============================================================================
 # Install via binary download
 # ============================================================================
@@ -153,9 +171,9 @@ function Get-LatestVersion {
   $url = "https://api.github.com/repos/$GITHUB_OWNER/$GITHUB_REPO/releases/latest"
 
   try {
-    $response = Invoke-RestMethod -Uri $url -Headers @{ "User-Agent" = "skynex-installer" } -UseBasicParsing
+    $response = Invoke-RestMethod -Uri $url -Headers @{ "User-Agent" = "skynex-installer" } -TimeoutSec 60 -UseBasicParsing
   } catch {
-    Stop-WithError "Failed to fetch latest release. Rate limited? Try again later or use -Method go"
+    Stop-WithError "Failed to fetch latest release. Rate limited? Try again later or use a signed release asset"
   }
 
   $version = $response.tag_name
@@ -163,6 +181,7 @@ function Get-LatestVersion {
     Stop-WithError "Could not determine latest version from GitHub API response"
   }
 
+  if ($version -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$') { Stop-WithError "Release tag is not valid semver" }
   Write-Success "Latest version: $version"
   return $version
 }
@@ -176,55 +195,99 @@ function Install-ViaBinary {
   $versionNumber = $version.TrimStart("v")
 
   $archiveName = "${BINARY_NAME}_${versionNumber}_windows_${Arch}.zip"
-  $downloadUrl  = "https://github.com/$GITHUB_OWNER/$GITHUB_REPO/releases/download/$version/$archiveName"
-  $checksumsUrl = "https://github.com/$GITHUB_OWNER/$GITHUB_REPO/releases/download/$version/checksums.txt"
+  $downloadUrl  = "$RELEASE_BASE_URL/$version/$archiveName"
+  $checksumsUrl = "$RELEASE_BASE_URL/$version/checksums.txt"
+  $signatureUrl = "$checksumsUrl.sig"
 
-  $tmpDir = Join-Path $env:TEMP "skynex-install-$(Get-Random)"
-  New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
+  $tmpDir = New-PrivateTempDirectory
+  $tempDest = $null
 
   try {
     # Download archive
     Write-Info "Downloading $archiveName..."
     $archivePath = Join-Path $tmpDir $archiveName
-    Invoke-WebRequest -Uri $downloadUrl -OutFile $archivePath -UseBasicParsing
+    Invoke-WebRequest -Uri $downloadUrl -OutFile $archivePath -TimeoutSec 120 -UseBasicParsing
 
     $fileSize = (Get-Item $archivePath).Length
     if ($fileSize -lt 1000) {
       Stop-WithError "Downloaded file is suspiciously small ($fileSize bytes). Archive may not exist for this platform."
     }
+    $compressedLimit = if ($env:SKYNEX_MAX_COMPRESSED_BYTES) { [long]$env:SKYNEX_MAX_COMPRESSED_BYTES } else { $MAX_COMPRESSED_BYTES }
+    if ($fileSize -gt $compressedLimit) { Stop-WithError "Downloaded archive exceeds compressed size limit" }
     Write-Success "Downloaded $archiveName ($fileSize bytes)"
 
     # Verify checksum
     Write-Info "Verifying checksum..."
-    try {
-      $checksumsPath = Join-Path $tmpDir "checksums.txt"
-      Invoke-WebRequest -Uri $checksumsUrl -OutFile $checksumsPath -UseBasicParsing
-
-      $checksums = Get-Content $checksumsPath
-      $expectedLine = $checksums | Where-Object { $_ -match [regex]::Escape($archiveName) }
-      if ($expectedLine) {
-        $expectedChecksum = ($expectedLine -split "\s+")[0]
-        $actualChecksum = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash.ToLower()
-
-        if ($actualChecksum -ne $expectedChecksum) {
-          Stop-WithError "Checksum mismatch!`n  Expected: $expectedChecksum`n  Got:      $actualChecksum"
-        }
-        Write-Success "Checksum verified"
-      } else {
-        Write-Warn "Archive not found in checksums.txt — skipping verification"
-      }
-    } catch {
-      Write-Warn "Could not download checksums.txt — skipping verification"
+    $checksumsPath = Join-Path $tmpDir "checksums.txt"
+    try { Invoke-WebRequest -Uri $checksumsUrl -OutFile $checksumsPath -TimeoutSec 60 -UseBasicParsing } catch { Stop-WithError "Could not download checksums.txt; refusing unverified archive" }
+    $signaturePath = Join-Path $tmpDir "checksums.txt.sig"
+    try { Invoke-WebRequest -Uri $signatureUrl -OutFile $signaturePath -TimeoutSec 60 -UseBasicParsing } catch { Stop-WithError "Could not download checksums.txt.sig; refusing unverified archive" }
+    $sshKeygen = Get-Command "ssh-keygen" -ErrorAction SilentlyContinue
+    if (-not $sshKeygen) { Stop-WithError "ssh-keygen is required to verify release authenticity" }
+    $allowedSigners = Join-Path $tmpDir "allowed_signers"
+    $signer = "skynex-release ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINUht44Rk/nWIXqcKizh8SWdnECJZOQ5yuPjaxaWxAAF skynex release signing`n"
+    Set-Content -Path $allowedSigners -NoNewline -Encoding ascii -Value $signer
+    # `ssh-keygen -Y verify` reads the signed message from stdin, and the signature
+    # covers checksums.txt byte for byte. PowerShell must not produce those bytes:
+    # piping `Get-Content` re-encodes the text and appends a newline, and a
+    # redirected StandardInput writer emits the console encoding preamble (a UTF-8
+    # BOM when the code page is 65001) before anything is written. Let the command
+    # processor redirect the file itself, exactly like `< checksums.txt` on Unix.
+    $verifyCommand = '""{0}" -Y verify -f "{1}" -I skynex-release -n file -s "{2}" < "{3}""' -f $sshKeygen.Source, $allowedSigners, $signaturePath, $checksumsPath
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = if ($env:ComSpec) { $env:ComSpec } else { Join-Path $env:SystemRoot "System32\cmd.exe" }
+    $psi.Arguments = "/d /s /c $verifyCommand"
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $verify = [Diagnostics.Process]::Start($psi)
+    $verifyOutput = $verify.StandardOutput.ReadToEnd()
+    $verifyError = $verify.StandardError.ReadToEnd()
+    $verify.WaitForExit()
+    if ($verify.ExitCode -ne 0) {
+      $verifyDetail = (($verifyError + " " + $verifyOutput) -replace '\s+', ' ').Trim()
+      Stop-WithError ("Invalid checksums.txt signature. " + $verifyDetail).Trim()
     }
+    Write-Success "Release signature verified"
+    $matches = @(Get-Content $checksumsPath | Where-Object {
+      $parts = $_ -split "\s+"
+      $parts.Count -ge 2 -and ($parts[1] -eq $archiveName -or $parts[1] -eq "*$archiveName")
+    })
+    if ($matches.Count -ne 1) { Stop-WithError "checksums.txt must contain exactly one entry for $archiveName" }
+    $expectedChecksum = (($matches[0] -split "\s+")[0]).ToLower()
+    if ($expectedChecksum -notmatch '^[0-9a-f]{64}$') { Stop-WithError "Malformed checksum for $archiveName" }
+    $actualChecksum = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash.ToLower()
+    if ($actualChecksum -ne $expectedChecksum) { Stop-WithError "Checksum mismatch!`n  Expected: $expectedChecksum`n  Got:      $actualChecksum" }
+    Write-Success "Checksum verified"
 
-    # Extract binary
+    # Validate every entry before extracting anything.
+    Test-SafeZip -Path $archivePath
+    $recheck = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash.ToLower()
+    if ($recheck -ne $expectedChecksum) { Stop-WithError "Archive changed after checksum verification" }
+
+    # Extract only the expected regular binary.
     Write-Info "Extracting $BINARY_NAME..."
-    Expand-Archive -Path $archivePath -DestinationPath $tmpDir -Force
-
     $binaryPath = Join-Path $tmpDir "$BINARY_NAME.exe"
-    if (-not (Test-Path $binaryPath)) {
-      Stop-WithError "Binary '$BINARY_NAME.exe' not found in archive"
-    }
+    $archive = [IO.Compression.ZipFile]::OpenRead($archivePath)
+    try {
+      $entry = $archive.Entries[0]
+      $input = $entry.Open()
+      try {
+        $output = [IO.File]::Open($binaryPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+          $buffer = New-Object byte[] 65536
+          [long]$total = 0
+          while (($read = $input.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $total += $read
+            $extractedLimit = if ($env:SKYNEX_MAX_EXTRACTED_BYTES) { [long]$env:SKYNEX_MAX_EXTRACTED_BYTES } else { $MAX_EXTRACTED_BYTES }
+            if ($total -gt $extractedLimit) { Stop-WithError "Extracted binary exceeds size limit" }
+            $output.Write($buffer, 0, $read)
+          }
+        } finally { $output.Dispose() }
+      } finally { $input.Dispose() }
+    } finally { $archive.Dispose() }
+    $extractedSize = (Get-Item $binaryPath).Length
+    if ($extractedSize -lt 1 -or $extractedSize -gt $extractedLimit) { Stop-WithError "Extracted binary exceeds size limit" }
 
     # Determine install directory
     $installDir = $InstallDir
@@ -232,11 +295,19 @@ function Install-ViaBinary {
       $installDir = Join-Path $env:LOCALAPPDATA "skynex\bin"
     }
 
-    New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+    if (Test-Path -LiteralPath $installDir) {
+      $dirItem = Get-Item -LiteralPath $installDir -Force
+      if (($dirItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or -not $dirItem.PSIsContainer) {
+        Stop-WithError "Install directory is not a safe directory"
+      }
+    } else {
+      New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+    }
 
     $destPath = Join-Path $installDir "$BINARY_NAME.exe"
     Write-Info "Installing to $destPath..."
-    Copy-Item -Path $binaryPath -Destination $destPath -Force
+    & $binaryPath internal-install-binary $binaryPath $destPath
+    if ($LASTEXITCODE -ne 0) { Stop-WithError "Verified binary could not perform installation" }
 
     Write-Success "Installed $BINARY_NAME to $destPath"
 
@@ -274,11 +345,6 @@ function Test-Installation {
   $locations = @(
     (Join-Path $env:LOCALAPPDATA "skynex\bin\$BINARY_NAME.exe")
   )
-  if (Get-Command "go" -ErrorAction SilentlyContinue) {
-    $gopath = & go env GOPATH 2>$null
-    $locations += (Join-Path $gopath "bin\$BINARY_NAME.exe")
-  }
-
   foreach ($loc in $locations) {
     if ($loc -and (Test-Path $loc)) {
       Write-Success "Found $BINARY_NAME at $loc"
@@ -321,7 +387,6 @@ function Main {
   $installMethod = Get-InstallMethod -Forced $Method
 
   switch ($installMethod) {
-    "go"     { Install-ViaGo }
     "binary" { Install-ViaBinary -Arch $arch }
   }
 

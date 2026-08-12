@@ -1,0 +1,8 @@
+{
+  "workflow_id": "wf-active",
+  "attempt_id": "attempt-1",
+  "node_id": "node-profile",
+  "base_candidate_oid": "tree-v1",
+  "status": "blocked",
+  "retryable": true
+}

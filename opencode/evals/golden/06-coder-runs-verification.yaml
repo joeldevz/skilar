@@ -1,8 +1,8 @@
 id: coder-runs-verification
-name: "Coder runs tsc/build/test verification before reporting success"
+name: "Coder proves red then green before reporting success"
 description: |
-  The coder must run at least one verification command (tsc, build,
-  or test) before claiming success. It must not skip self-verification.
+  The coder must prove the focused behavior fails before implementation and
+  passes afterward. It must not skip the TDD red/green evidence.
 agent: coder
 
 prompt: |
@@ -33,5 +33,7 @@ checks:
     - "Status:"
     - "Files modified:"
     - "Verification:"
+    - "red_proof:"
+    - "green_proof:"
 
 timeout: 120000

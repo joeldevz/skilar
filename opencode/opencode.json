@@ -1,6 +1,27 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "agent": {
+    "workflow-orchestrator": {
+      "description": "Dedicated Skynex Workflow V2 coordinator. Uses skynex workflow as the sole workflow authority.",
+      "mode": "all",
+      "model": "openai/gpt-5.6-terra",
+      "prompt": "{file:./agents/workflow-orchestrator.md}",
+      "tools": {"bash": true, "edit": true, "read": true, "write": true, "glob": true, "grep": true, "neurox_context": true, "neurox_recall": true}
+    },
+    "workflow-reviewer": {
+      "description": "Primary read-only reviewer for one Skynex Workflow V2 semantic or lens review.",
+      "mode": "primary",
+      "model": "openai/gpt-5.6-luna",
+      "prompt": "{file:./agents/workflow-reviewer.md}",
+      "tools": {"bash": true, "read": true, "glob": true, "grep": true, "write": false, "edit": false, "task": false}
+    },
+    "workflow-worker": {
+      "description": "Primary non-interactive worker for one fenced Skynex Workflow V2 mutation attempt.",
+      "mode": "primary",
+      "model": "openai/gpt-5.6-luna",
+      "prompt": "{file:./agents/workflow-worker.md}",
+      "tools": {"bash": true, "read": true, "glob": true, "grep": true, "write": false, "edit": false, "task": false}
+    },
     "orchestrator": {
       "description": "Orchestrator — pure coordination agent. Delegates all work to sub-agents. NEVER writes code. Reads a few files to decide, launches parallel sub-agents, synthesizes results.",
       "mode": "all",
@@ -12,19 +33,15 @@
         "write": true,
         "glob": true,
         "grep": true,
-        "neurox_session_start": true,
         "neurox_context": true,
-        "neurox_recall": true,
-        "neurox_save": true,
-        "neurox_update": true,
-        "neurox_session_end": true
+        "neurox_recall": true
       },
-      "model": "anthropic/claude-sonnet-4-6"
+      "model": "openai/gpt-5.6-terra"
     },
-    "linear-orchestrator": {
-      "description": "Linear-driven orchestrator — drives a single Linear issue end-to-end with strict TDD and human gates. Reads/clarifies the issue, writes 6 phase comments, spawns parallel sub-agents to write failing tests (red), waits for explicit human validation, implements to green, and opens a PR. Never writes code itself.",
+    "skynex-orchestrator": {
+      "description": "Lean standalone orchestrator — risk-based delegation and lineage-bound results without using the Skynex workflow engine.",
       "mode": "all",
-      "prompt": "{file:./agents/linear-orchestrator.md}",
+      "prompt": "{file:./agents/skynex-orchestrator.md}",
       "tools": {
         "bash": true,
         "edit": true,
@@ -32,27 +49,15 @@
         "write": true,
         "glob": true,
         "grep": true,
-        "linear*": true,
-        "neurox_session_start": true,
         "neurox_context": true,
-        "neurox_recall": true,
-        "neurox_save": true,
-        "neurox_update": true,
-        "neurox_session_end": true
+        "neurox_recall": true
       },
-      "model": "anthropic/claude-sonnet-4-6"
-    },
-    "advisor": {
-      "description": "Senior strategic advisor for complex decisions. Pure thinking — no file tools.",
-      "model": "anthropic/claude-opus-4-6",
-      "mode": "subagent",
-      "prompt": "{file:./agents/advisor.md}",
-      "tools": {}
+      "model": "openai/gpt-5.6-terra"
     },
     "coder": {
-      "description": "Use when the orchestrator delegates one bounded coding task with execution-first focus.",
+      "description": "Use for one bounded coding task. TDD is mandatory: prove the focused test red, make the minimal change, and hand off only with relevant tests green.",
       "mode": "subagent",
-      "model": "anthropic/claude-haiku-4-5",
+      "model": "openai/gpt-5.6-luna",
       "prompt": "{file:./agents/coder.md}",
       "tools": {
         "read": true,
@@ -61,35 +66,51 @@
         "bash": true,
         "glob": true,
         "grep": true,
-        "neurox_session_start": true,
         "neurox_context": true,
-        "neurox_recall": true,
-        "neurox_save": true,
-        "neurox_update": true,
-        "neurox_session_end": true,
-        "advisor_consult": true
+        "neurox_recall": true
       }
     },
 
-    "manager": {
-      "description": "Project Manager Agent - reads PLAN.md, delegates one step at a time to coder, and enforces the human review loop",
+    "infrastructure-engineer": {
+      "description": "Owns bounded infrastructure, CI/CD, runtime, deployment, build, and developer-environment work with fresh upstream quality-tool resolution and safe verification.",
       "mode": "subagent",
-      "prompt": "{file:./agents/manager.md}",
+      "model": "openai/gpt-5.6-terra",
+      "prompt": "{file:./agents/infrastructure-engineer.md}",
       "tools": {
         "bash": true,
         "read": true,
+        "write": true,
+        "edit": true,
+        "glob": true,
+        "grep": true,
         "neurox_session_start": true,
         "neurox_context": true,
         "neurox_recall": true,
         "neurox_save": true,
         "neurox_update": true,
-        "neurox_session_end": true,
-        "advisor_consult": true
-      },
-      "model": "anthropic/claude-haiku-4-5"
+        "neurox_session_end": true
+      }
     },
+
+    "test-engineer": {
+      "description": "Writes the behavior-focused red test contract before coder implementation; never changes production code.",
+      "mode": "subagent",
+      "model": "openai/gpt-5.6-luna",
+      "prompt": "{file:./agents/test-engineer.md}",
+      "tools": {
+        "bash": true,
+        "read": true,
+        "write": true,
+        "edit": true,
+        "glob": true,
+        "grep": true,
+        "neurox_context": true,
+        "neurox_recall": true
+      }
+    },
+
     "tech-planner": {
-      "model": "anthropic/claude-sonnet-4-6",
+      "model": "openai/gpt-5.6-terra",
       "description": "Technical Planner - reads the task (or an existing SPEC), does deep codebase discovery, and produces a prescriptive PLAN.md where every step has a mandatory How section with exact file paths, signatures, and snippets",
       "mode": "subagent",
       "prompt": "{file:./agents/tech-planner.md}",
@@ -98,13 +119,8 @@
         "edit": true,
         "read": true,
         "write": true,
-        "neurox_session_start": true,
         "neurox_context": true,
-        "neurox_recall": true,
-        "neurox_save": true,
-        "neurox_update": true,
-        "neurox_session_end": true,
-        "advisor_consult": true
+        "neurox_recall": true
       }
     },
     "verifier": {
@@ -115,23 +131,27 @@
         "bash": true,
         "read": true,
         "glob": true,
-        "grep": true
+        "grep": true,
+        "neurox_context": true,
+        "neurox_recall": true
       },
-      "model": "anthropic/claude-haiku-4-5"
+      "model": "openai/gpt-5.6-luna"
     },
     "test-reviewer": {
-      "model": "anthropic/claude-haiku-4-5",
+      "model": "openai/gpt-5.6-luna",
       "description": "Use after plan completion to review test coherence and quality. Classifies each test file as SOUND, WEAK, or MISLEADING.",
       "mode": "subagent",
       "prompt": "{file:./agents/test-reviewer.md}",
       "tools": {
         "read": true,
         "glob": true,
-        "grep": true
+        "grep": true,
+        "neurox_context": true,
+        "neurox_recall": true
       }
     },
     "security": {
-      "model": "anthropic/claude-haiku-4-5",
+      "model": "openai/gpt-5.6-terra",
       "description": "Use as one of two parallel adversarial security judges. Finds vulnerabilities in injection, auth, data exposure, rate limiting, crypto, dependencies.",
       "mode": "subagent",
       "prompt": "{file:./agents/security.md}",
@@ -139,11 +159,13 @@
         "read": true,
         "glob": true,
         "grep": true,
-        "bash": true
+        "bash": true,
+        "neurox_context": true,
+        "neurox_recall": true
       }
     },
     "skill-validator": {
-      "model": "anthropic/claude-haiku-4-5",
+      "model": "openai/gpt-5.6-luna",
       "description": "Skill Validator - validates implemented code against project skill registry at end of plan. Flags deviations from documented patterns, naming conventions, and architectural rules.",
       "mode": "subagent",
       "prompt": "{file:./agents/skill-validator.md}",
@@ -156,7 +178,7 @@
       }
     },
     "pr-reviewer": {
-      "model": "anthropic/claude-sonnet-4-6",
+      "model": "openai/gpt-5.6-terra",
       "description": "Adversarial PR review judge for a single 4R+1 dimension (Correctness/Risk/Readability/Reliability/Resilience). Launched in parallel by the orchestrator. Read-only.",
       "mode": "subagent",
       "prompt": "{file:./agents/pr-reviewer.md}",

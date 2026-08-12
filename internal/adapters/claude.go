@@ -2,13 +2,17 @@ package adapters
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/joeldevz/skynex/internal/models"
+	"github.com/joeldevz/skynex/internal/safefs"
 )
 
 const neuroxSkillBlock = `
@@ -22,36 +26,46 @@ Esta skill DEBE usar Neurox para memoria persistente:
 `
 
 var skillMap = map[string][]string{
-	"orchestrator":    {"security"},
-	"advisor":         {},
-	"product-planner": {"prd"},
-	"tech-planner":    {"prd", "nestjs-patterns", "typescript-advanced-types"},
-	"coder":           {"nestjs-patterns", "typescript-advanced-types"},
-	"verifier":        {},
-	"test-reviewer":   {},
-	"security":        {"security"},
-	"skill-validator": {},
-	"manager":         {},
+	"orchestrator":        {"security"},
+	"skynex-orchestrator": {"security"},
+	"product-planner":     {"prd"},
+	"tech-planner":        {"prd", "nestjs-patterns", "typescript-advanced-types"},
+	"coder":               {"nestjs-patterns", "typescript-advanced-types"},
+	"verifier":            {},
+	"test-reviewer":       {},
+	"security":            {"security"},
+	"skill-validator":     {},
+	"manager":             {},
 }
 
 // InstallClaude installs all Claude Code assets from srcDir.
 // srcDir is the checkout/workspace root (contains opencode/, claude-code/, etc.)
 // req contains cleanup preference from CLI flags.
 func InstallClaude(srcDir string, req *models.InstallRequest) error {
+	return InstallClaudeWithReporter(srcDir, req, discardReporter())
+}
+
+func InstallClaudeWithReporter(srcDir string, req *models.InstallRequest, reporter Reporter) error {
 	target := claudeDir()
 	if err := validateInstallDestinationTree(target); err != nil {
 		return fmt.Errorf("validate Claude install destination: %w", err)
 	}
-	if err := os.MkdirAll(target, 0o755); err != nil {
+	targetRoot, err := safefs.OpenOrCreate(target, 0o700)
+	if err != nil {
 		return fmt.Errorf("create claude dir: %w", err)
 	}
+	if err := safefs.ChmodRoot(targetRoot, 0o700); err != nil {
+		_ = targetRoot.Close()
+		return fmt.Errorf("tighten claude dir: %w", err)
+	}
+	_ = targetRoot.Close()
 
-	fmt.Println("    Rendering agents...")
+	reporter.Detail("Rendering agents...")
 	if err := renderAgents(srcDir, target); err != nil {
 		return fmt.Errorf("render agents: %w", err)
 	}
 
-	fmt.Println("    Copying shared skills...")
+	reporter.Detail("Copying shared skills...")
 	if err := copyDir(
 		filepath.Join(srcDir, "opencode", "skills"),
 		filepath.Join(target, "skills"),
@@ -59,7 +73,7 @@ func InstallClaude(srcDir string, req *models.InstallRequest) error {
 		return fmt.Errorf("copy skills: %w", err)
 	}
 
-	fmt.Println("    Copying templates...")
+	reporter.Detail("Copying templates...")
 	templatesSrc := filepath.Join(srcDir, "opencode", "templates")
 	if _, err := os.Stat(templatesSrc); err == nil {
 		if err := copyDir(templatesSrc, filepath.Join(target, "templates")); err != nil {
@@ -67,12 +81,12 @@ func InstallClaude(srcDir string, req *models.InstallRequest) error {
 		}
 	}
 
-	fmt.Println("    Rendering command skills...")
+	reporter.Detail("Rendering command skills...")
 	if err := renderCommandSkills(srcDir, target); err != nil {
 		return fmt.Errorf("render command skills: %w", err)
 	}
 
-	fmt.Println("    Updating CLAUDE.md...")
+	reporter.Detail("Updating CLAUDE.md...")
 	if err := appendMarkedBlock(
 		filepath.Join(target, "CLAUDE.md"),
 		filepath.Join(srcDir, "claude-code", "CLAUDE.md"),
@@ -81,7 +95,7 @@ func InstallClaude(srcDir string, req *models.InstallRequest) error {
 		return fmt.Errorf("update CLAUDE.md: %w", err)
 	}
 
-	fmt.Println("    Configuring Neurox MCP...")
+	reporter.Detail("Configuring Neurox MCP...")
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("get home directory: %w", err)
@@ -89,41 +103,29 @@ func InstallClaude(srcDir string, req *models.InstallRequest) error {
 	if err := validateInstallDestination(filepath.Join(home, ".claude.json")); err != nil {
 		return fmt.Errorf("validate Claude config destination: %w", err)
 	}
-	if err := configureClaudeNeuroxMCP(); err != nil {
+	if err := configureClaudeNeuroxMCPWithReporter(reporter); err != nil {
 		return fmt.Errorf("configure neurox mcp: %w", err)
 	}
 
-	// Handle deprecated file cleanup only with explicit consent.
+	// Deprecated entries are informational only. Never delete them implicitly.
 	deprecated, err := FindDeprecatedFiles()
 	if err != nil {
 		return fmt.Errorf("discover deprecated Claude files: %w", err)
 	}
 	if len(deprecated) > 0 && deprecated["claude"] != nil {
-		files := deprecated["claude"]
-		shouldRemove := req != nil && req.CleanupDeprecated
-		if req != nil && req.Interactive {
-			shouldRemove = PromptCleanupDeprecated(map[string][]DeprecatedFile{"claude": files})
-		} else if !shouldRemove {
-			fmt.Println("    Deprecated files retained; rerun with --cleanup-deprecated to remove them.")
-		}
-		if shouldRemove {
-			if req == nil || !req.Interactive {
-				NotifyDeprecatedFiles("claude", files)
-			}
-			if _, err := RemoveDeprecatedFiles(files); err != nil {
-				return fmt.Errorf("cleanup deprecated Claude files: %w", err)
-			}
-		}
+		reporter.Detail("Deprecated files detected and preserved (no recursive cleanup is performed):")
+		notifyDeprecatedFiles(reporter, "claude", deprecated["claude"])
 	}
 
-	fmt.Printf("    Claude Code assets installed at %s\n", target)
+	reporter.Detail("Claude Code assets installed at %s", target)
 	return nil
 }
 
 // renderAgents reads opencode.json and generates ~/.claude/agents/{name}.md
 func renderAgents(srcDir, target string) error {
-	configPath := filepath.Join(srcDir, "opencode", "opencode.json")
-	data, err := os.ReadFile(configPath)
+	opencodePath := filepath.Join(srcDir, "opencode")
+	configPath := filepath.Join(opencodePath, "opencode.json")
+	data, err := safefs.ReadFileAbsoluteVerified(configPath, 4<<20)
 	if err != nil {
 		return err
 	}
@@ -147,14 +149,24 @@ func renderAgents(srcDir, target string) error {
 	if err := validateInstallDestinationTree(agentsDir); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+	agentsRoot, err := safefs.OpenOrCreate(agentsDir, 0o700)
+	if err != nil {
 		return err
 	}
+	if err := safefs.ChmodRoot(agentsRoot, 0o700); err != nil {
+		_ = agentsRoot.Close()
+		return err
+	}
+	_ = agentsRoot.Close()
 
 	for name, agent := range agents {
 		var prompt, description string
 		if err := json.Unmarshal(agent["prompt"], &prompt); err != nil {
 			continue
+		}
+		prompt, err = resolveAgentPrompt(opencodePath, prompt)
+		if err != nil {
+			return fmt.Errorf("resolve agent %s prompt: %w", name, err)
 		}
 		if err := json.Unmarshal(agent["description"], &description); err != nil {
 			description = name
@@ -163,8 +175,8 @@ func renderAgents(srcDir, target string) error {
 		skills := skillMap[name]
 		var sb strings.Builder
 		sb.WriteString("---\n")
-		sb.WriteString(fmt.Sprintf("name: %s\n", name))
-		sb.WriteString(fmt.Sprintf("description: %s\n", description))
+		sb.WriteString(fmt.Sprintf("name: %s\n", yamlScalar(name)))
+		sb.WriteString(fmt.Sprintf("description: %s\n", yamlScalar(description)))
 		sb.WriteString("model: inherit\n")
 		sb.WriteString("memory: local\n")
 		if len(skills) > 0 {
@@ -189,6 +201,32 @@ func renderAgents(srcDir, target string) error {
 	return nil
 }
 
+func resolveAgentPrompt(opencodePath, prompt string) (string, error) {
+	const prefix = "{file:"
+	if !strings.HasPrefix(prompt, prefix) || !strings.HasSuffix(prompt, "}") {
+		return prompt, nil
+	}
+	reference := strings.TrimSuffix(strings.TrimPrefix(prompt, prefix), "}")
+	reference = strings.TrimPrefix(reference, "./")
+	reference, err := safefs.Relative(reference)
+	if err != nil {
+		return "", err
+	}
+	if !strings.HasPrefix(reference, "agents/") {
+		return "", fmt.Errorf("agent prompt must be below agents/: %q", reference)
+	}
+	root, err := safefs.Open(opencodePath)
+	if err != nil {
+		return "", err
+	}
+	defer root.Close()
+	data, err := safefs.ReadFileVerified(root, reference, 4<<20)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
 func validateAgentName(name string) error {
 	if name == "" || name == "." || name == ".." {
 		return fmt.Errorf("name must be a non-empty managed segment")
@@ -209,7 +247,15 @@ func renderCommandSkills(srcDir, target string) error {
 	commandsDir := filepath.Join(srcDir, "opencode", "commands")
 	commandRoot := filepath.Join(target, "skills")
 
-	entries, err := os.ReadDir(commandsDir)
+	commandsRoot, err := safefs.Open(commandsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer commandsRoot.Close()
+	entries, err := fs.ReadDir(commandsRoot.FS(), ".")
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -227,7 +273,10 @@ func renderCommandSkills(srcDir, target string) error {
 			continue
 		}
 		name := strings.TrimSuffix(entry.Name(), ".md")
-		content, err := os.ReadFile(filepath.Join(commandsDir, entry.Name()))
+		if err := validateCommandBasename(name); err != nil {
+			return fmt.Errorf("reject command %q: %w", entry.Name(), err)
+		}
+		content, err := safefs.ReadFileAbsoluteVerified(filepath.Join(commandsDir, entry.Name()), 4<<20)
 		if err != nil {
 			return err
 		}
@@ -247,8 +296,8 @@ func renderCommandSkills(srcDir, target string) error {
 
 		var sb strings.Builder
 		sb.WriteString("---\n")
-		sb.WriteString(fmt.Sprintf("name: %s\n", name))
-		sb.WriteString(fmt.Sprintf("description: %s\n", description))
+		sb.WriteString(fmt.Sprintf("name: %s\n", yamlScalar(name)))
+		sb.WriteString(fmt.Sprintf("description: %s\n", yamlScalar(description)))
 		sb.WriteString("disable-model-invocation: true\n")
 		sb.WriteString("---\n\n")
 		sb.WriteString(commandIntro(name, agentName))
@@ -262,6 +311,16 @@ func renderCommandSkills(srcDir, target string) error {
 		}
 	}
 	return nil
+}
+
+func validateCommandBasename(name string) error {
+	return validateAgentName(name)
+}
+
+// yamlScalar emits a JSON double-quoted scalar, which is also a strict YAML scalar.
+// This keeps repository-controlled metadata on one syntactic YAML value.
+func yamlScalar(value string) string {
+	return strconv.Quote(value)
 }
 
 func parseFrontmatter(text string) (map[string]string, string) {
@@ -319,7 +378,7 @@ func commandIntro(commandName, agentName string) string {
 // appendMarkedBlock idempotently merges blockFile content into targetFile
 // using <!-- BEGIN marker --> / <!-- END marker --> delimiters
 func appendMarkedBlock(targetFile, blockFile, marker string) error {
-	blockContent, err := os.ReadFile(blockFile)
+	blockContent, err := safefs.ReadFileAbsoluteVerified(blockFile, 4<<20)
 	if err != nil {
 		return err
 	}
@@ -329,8 +388,10 @@ func appendMarkedBlock(targetFile, blockFile, marker string) error {
 	wrapped := start + "\n" + strings.TrimRight(string(blockContent), "\n") + "\n" + end + "\n"
 
 	var existing string
-	if data, err := os.ReadFile(targetFile); err == nil {
+	if data, err := safefs.ReadFileAbsoluteVerified(targetFile, 4<<20); err == nil {
 		existing = string(data)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("read existing Claude file securely: %w", err)
 	}
 
 	var updated string
@@ -359,6 +420,10 @@ func appendMarkedBlock(targetFile, blockFile, marker string) error {
 
 // configureClaudeNeuroxMCP merges neurox MCP into ~/.claude.json
 func configureClaudeNeuroxMCP() error {
+	return configureClaudeNeuroxMCPWithReporter(discardReporter())
+}
+
+func configureClaudeNeuroxMCPWithReporter(reporter Reporter) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("get home directory: %w", err)
@@ -367,16 +432,18 @@ func configureClaudeNeuroxMCP() error {
 
 	var data map[string]json.RawMessage
 	var rawBackup []byte
-	if raw, err := os.ReadFile(claudeJSON); err == nil {
+	if raw, err := safefs.ReadFileAbsoluteVerified(claudeJSON, 1<<20); err == nil {
 		rawBackup = raw
 		if err := json.Unmarshal(raw, &data); err != nil {
 			// File exists but can't be parsed — save backup
-			fmt.Fprintf(os.Stderr, "Warning: existing .claude.json is malformed, preserving as .bak\n")
+			reporter.Warning("existing .claude.json is malformed, preserving as .bak")
 			backupPath := claudeJSON + ".bak"
 			if err := writeFile(backupPath, string(rawBackup)); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: could not save backup: %v\n", err)
+				reporter.Warning("could not save backup: %v", err)
 			}
 		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read Claude config securely: %w", err)
 	}
 	if data == nil {
 		data = make(map[string]json.RawMessage)
@@ -385,7 +452,7 @@ func configureClaudeNeuroxMCP() error {
 	var mcpServers map[string]json.RawMessage
 	if raw, ok := data["mcpServers"]; ok {
 		if err := json.Unmarshal(raw, &mcpServers); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not parse mcpServers: %v\n", err)
+			reporter.Warning("could not parse mcpServers: %v", err)
 		}
 	}
 	if mcpServers == nil {
@@ -413,8 +480,7 @@ func configureClaudeNeuroxMCP() error {
 func claudeDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: cannot determine home directory: %v\n", err)
-		// Return a fallback path that will likely fail gracefully downstream
+		// Return a fallback path that will likely fail gracefully downstream.
 		return "~/.claude"
 	}
 	return filepath.Join(home, ".claude")

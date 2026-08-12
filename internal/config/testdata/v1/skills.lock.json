@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "generatedAt": "2026-01-02T03:04:05Z",
+  "packages": {
+    "skills": {
+      "requestedVersion": "latest",
+      "resolvedVersion": "latest",
+      "resolvedRef": "",
+      "commit": "embedded",
+      "targets": {
+        "claude": {
+          "status": "installed",
+          "installedAt": "2026-01-02T03:04:05Z",
+          "artifacts": [
+            "agents",
+            "skills"
+          ]
+        },
+        "opencode": {
+          "status": "installed",
+          "installedAt": "2026-01-02T03:04:05Z",
+          "artifacts": [
+            "opencode.json",
+            "plugins"
+          ]
+        }
+      }
+    }
+  }
+}

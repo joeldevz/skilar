@@ -37,7 +37,7 @@ _skynex_completions() {
                     return 0
                     ;;
                 install)
-                    COMPREPLY=($(compgen -W "--package --target --version --non-interactive --yes --trust-setup-scripts --state-dir --advisor-model" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "--package --target --version --non-interactive --yes --verbose --trust-setup-scripts --state-dir" -- "${cur}"))
                     return 0
                     ;;
             esac
@@ -168,7 +168,6 @@ complete -c skynex -n "__fish_seen_subcommand_from install" -l target -d "Target
 complete -c skynex -n "__fish_seen_subcommand_from install" -l version -d "Package version" -r
 complete -c skynex -n "__fish_seen_subcommand_from install" -l non-interactive -d "Skip prompts"
 complete -c skynex -n "__fish_seen_subcommand_from install" -s y -l yes -d "Skip confirmation"
+complete -c skynex -n "__fish_seen_subcommand_from install" -l verbose -d "Show detailed install progress"
 `
 }
-
-

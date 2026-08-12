@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Verify PR body references an issue
-        uses: actions/github-script@v7
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
           script: |
             const body = context.payload.pull_request.body || '';
@@ -28,7 +28,7 @@ jobs:
     needs: check-issue-reference
     steps:
       - name: Verify linked issue has status:approved label
-        uses: actions/github-script@v7
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
           script: |
             const body = context.payload.pull_request.body || '';
@@ -55,7 +55,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Verify type label
-        uses: actions/github-script@v7
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
           script: |
             const labels = context.payload.pull_request.labels.map(l => l.name);
@@ -72,41 +72,50 @@ jobs:
     name: SKILL.md compliance (Description Trap + ≤120 lines)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
       - name: Get changed SKILL.md files
         id: changed
         run: |
-          BASE=${{ github.event.pull_request.base.sha }}
-          HEAD=${{ github.event.pull_request.head.sha }}
-          CHANGED=$(git diff --name-only "$BASE" "$HEAD" | grep 'SKILL\.md$' || true)
-          echo "files<<EOF" >> $GITHUB_OUTPUT
-          echo "$CHANGED" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          git diff --name-only -z "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" \
+            | grep -zE 'SKILL\.md$' > "$RUNNER_TEMP/changed-skill-files.null" || true
+          if [ -s "$RUNNER_TEMP/changed-skill-files.null" ]; then
+            echo "has_files=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_files=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Verify line count and Description Trap
-        if: steps.changed.outputs.files != ''
+        if: steps.changed.outputs.has_files == 'true'
         run: |
           set -e
           FAIL=0
-          while IFS= read -r file; do
-            [ -z "$file" ] && continue
+          while IFS= read -r -d '' file; do
             [ ! -f "$file" ] && continue
 
             # Line count check
             LINES=$(wc -l < "$file")
             if [ "$LINES" -gt 120 ]; then
-              echo "::error file=$file::SKILL.md exceeds 120 lines ($LINES). Split into references/*.md (≤200 each)."
+              printf 'ERROR: SKILL.md exceeds 120 lines (%s); file=%q; split into references/*.md (≤200 each).\n' "$LINES" "$file"
               FAIL=1
             fi
 
             # Description Trap check (heuristic: description should start with "Use when")
             DESC=$(grep -A1 '^description:' "$file" | tr -d '\n' | head -c 300)
             if echo "$DESC" | grep -qiE '(triggers when|generates|produces|creates|implements|provides) '; then
-              echo "::warning file=$file::Description may resume workflow. Should start with 'Use when X'. Review Description Trap rule."
+               printf 'WARNING: description may resume workflow; file=%q; should start with "Use when X".\n' "$file"
             fi
-          done <<< "${{ steps.changed.outputs.files }}"
+          done < "$RUNNER_TEMP/changed-skill-files.null"
 
           if [ "$FAIL" = "1" ]; then
             exit 1
           fi
+
+  installer-windows-runtime:
+    name: Windows installer runtime acceptance
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Run native PowerShell installer fixtures
+        shell: pwsh
+        run: ./scripts/test-installers.ps1

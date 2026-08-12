@@ -45,6 +45,13 @@ func SkillsFS() (fs.FS, error) {
 	return fs.Sub(dataFS, "data/skills")
 }
 
+// OpencodeSkillsFS is the exact skills bundle shipped with the OpenCode
+// adapter. Keeping this separate prevents a stale/generated generic tree from
+// becoming the ownership source.
+func OpencodeSkillsFS() (fs.FS, error) {
+	return fs.Sub(dataFS, "data/opencode/skills")
+}
+
 // ExtractTo extracts a sub-FS to a destination directory on disk.
 // Used to materialize embedded assets before running install logic.
 func ExtractTo(sub fs.FS, destDir string) error {
@@ -54,7 +61,7 @@ func ExtractTo(sub fs.FS, destDir string) error {
 		}
 		dest := filepath.Join(destDir, filepath.FromSlash(path))
 		if d.IsDir() {
-			return os.MkdirAll(dest, 0o755)
+			return os.MkdirAll(dest, 0o700)
 		}
 
 		data, err := fs.ReadFile(sub, path)
@@ -62,14 +69,14 @@ func ExtractTo(sub fs.FS, destDir string) error {
 			return err
 		}
 
-		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
 			return err
 		}
-		mode := fs.FileMode(0o644)
+		mode := fs.FileMode(0o600)
 		if runtime.GOOS != "windows" {
 			info, _ := d.Info()
 			if info != nil {
-				mode = info.Mode()
+				mode |= info.Mode().Perm() & 0o111
 			}
 		}
 		return os.WriteFile(dest, data, mode)

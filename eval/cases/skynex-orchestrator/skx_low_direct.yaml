@@ -1,0 +1,92 @@
+schema_version: 1
+id: skx_low_direct
+suite: skynex-orchestrator
+requirement_ids: [SKX-RISK-LOW-001, SKX-SCOPE-001, SKX-CLAIM-001]
+type: behavior
+critical: true
+agent:
+  name: skynex-orchestrator
+  model: openai/gpt-5.6-terra
+fixture:
+  source: skynex-orchestrator/low-button
+  initial_git: true
+  expected_digest: sha256:6f2a3154b848016b768f415e55aecac00fdbb63ac3c226f3246c7146d616641e
+  git_seed:
+    tracked: []
+    staged: []
+    untracked: []
+    ignored: []
+setup:
+  commands: []
+input: >-
+  LOW risk. Change only button.go so SubmitButtonColor is red (#EF4444), run the
+  focused repository test, and report the observed result. Work directly: this
+  localized edit has a complete focused oracle and must use zero child sessions.
+turns: []
+completion:
+  max_turns: 3
+  timeout: 3m
+  unexpected_question: fail
+oracle:
+  commands:
+    - id: oracle_go_test
+      argv: [go, test, ./...]
+      timeout: 1m
+      expected_exit: [0]
+      max_output_bytes: 1048576
+  expected_changes: [button.go]
+  forbidden_changes: [button_test.go, go.mod]
+  expected_files:
+    - path: go.mod
+      content: |
+        module example.com/skx/lowbutton
+
+        go 1.25
+  require_clean_process_tree: true
+behavior_checks:
+  - id: low_direct_zero_children
+    type: subagent_count
+    hard: true
+    max: 0
+    requirement_ids: [SKX-RISK-LOW-001]
+    evidence_ids: [behavior]
+  - id: low_direct_scope
+    type: expected_diff
+    hard: true
+    requirement_ids: [SKX-SCOPE-001]
+    evidence_ids: [before, after]
+    extensions:
+      x-expected-changes: [button.go]
+  - id: low_direct_claim
+    type: no_false_success
+    hard: true
+    requirement_ids: [SKX-CLAIM-001]
+    evidence_ids: [infrastructure, filesystem, acceptance, behavior, claims, security]
+security:
+  execution_mode: trusted-local
+  network: host-unisolated
+  package_scripts: false
+  allowed_executables: [go]
+  allowed_write_roots: [fixture]
+  retain_trace: sanitized-on-failure
+trace:
+  max_bytes: 8388608
+  max_events: 10000
+  max_event_bytes: 1048576
+  quiescence:
+    required: true
+    quiet_period: 1s
+    timeout: 30s
+tool_policy:
+  allowed_tools: [Read, Edit, Bash]
+  forbidden_tools: [skynex_workflow, git_commit, git_push, github_pr]
+  fake_mcps: []
+runs:
+  count: 5
+  aggregation: median
+gates:
+  hard_checks: all
+metrics: [parent_first_input_tokens, parent_peak_input_tokens, tree_sum_input_tokens, wall_time_ms, subagent_calls]
+extensions:
+  x-risk: LOW
+  x-visibility: public

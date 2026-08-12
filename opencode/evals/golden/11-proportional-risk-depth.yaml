@@ -1,0 +1,20 @@
+id: proportional-risk-depth
+name: "Review depth follows effective risk 0 1 4"
+description: |
+  Low risk runs no lens, medium exactly one selected lens, and high all four independent lenses.
+agent: orchestrator
+prompt: |
+  Explain and execute the semantic review depth for low, medium, and high effective workflow risk.
+checks:
+  must_not:
+    - Lower deterministic risk
+    - Auto-fix review findings
+  expect_in_output:
+    - "low"
+    - "medium"
+    - "high"
+    - "risk"
+    - "readability"
+    - "reliability"
+    - "resilience"
+timeout: 120000

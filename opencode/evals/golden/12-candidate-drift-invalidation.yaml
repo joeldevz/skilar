@@ -1,0 +1,16 @@
+id: candidate-drift-invalidation
+name: "Candidate drift invalidates review authority"
+description: |
+  A changed worktree, HEAD, ref, policy, or candidate basis must stop review or delivery and require replan.
+agent: orchestrator
+prompt: |
+  The repository changed after candidate freeze. Continue workflow wf-drift safely.
+checks:
+  must_not:
+    - Recapture context and continue
+    - Reuse the old receipt
+    - Deliver the changed worktree
+  expect_in_output:
+    - "drift"
+    - "replan"
+timeout: 120000

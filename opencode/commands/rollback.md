@@ -1,6 +1,6 @@
 ---
 description: Undo the last step's changes and reset PLAN.md status
-agent: manager
+agent: skynex-orchestrator
 ---
 
 Undo the changes from the current or last completed step and reset its status in PLAN.md.

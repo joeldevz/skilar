@@ -1,6 +1,6 @@
 ---
 description: Create a conventional commit for the current changes
-agent: manager
+agent: skynex-orchestrator
 subtask: true
 ---
 

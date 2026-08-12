@@ -1,0 +1,7 @@
+{
+  "id": "oracle-profile-green",
+  "argv": ["go", "test", "./..."],
+  "candidate_oid": "tree-v1",
+  "exit_code": 0,
+  "state_changed_since": false
+}

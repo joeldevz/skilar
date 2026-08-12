@@ -12,14 +12,18 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Styles (shared across this file; titleStyle, dimStyle, etc. live in prompts.go)
+// Styles shared by the legacy profile form.
 // ---------------------------------------------------------------------------
 
 var (
-	errorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	warnStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	checkStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("82"))
-	keyStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Bold(true)
+	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
+	dimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	activeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("212")).Bold(true)
+	groupStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
+	errorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	warnStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	checkStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("82"))
+	keyStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Bold(true)
 )
 
 // shortModel strips the provider prefix: "anthropic/claude-haiku-4-5" → "claude-haiku-4-5"
@@ -65,17 +69,12 @@ var simpleGroups = []simpleGroup{
 	{
 		key:    "Orchestrator",
 		desc:   "Plans, coordinates and delegates all work",
-		agents: []string{"orchestrator", "manager"},
+		agents: []string{"orchestrator", "skynex-orchestrator", "manager"},
 	},
 	{
 		key:    "Workers",
 		desc:   "Execute tasks: plan, code, verify, review",
 		agents: []string{"tech-planner", "product-planner", "coder", "verifier", "test-reviewer", "security", "skill-validator"},
-	},
-	{
-		key:    "Advisor",
-		desc:   "Senior strategic consultant (use best model)",
-		agents: []string{"advisor"},
 	},
 }
 
@@ -85,22 +84,22 @@ type agentConfig struct {
 }
 
 var agentDescriptions = map[string]string{
-	"orchestrator":    "Coordinates all agents, decides strategy",
-	"tech-planner":    "Writes PLAN.md with technical steps",
-	"product-planner": "Writes SPEC.md with business context",
-	"coder":           "Implements code changes",
-	"manager":         "Executes plan step by step",
-	"verifier":        "Runs lint, build, tests",
-	"test-reviewer":   "Reviews test quality",
-	"security":        "Adversarial security judge",
-	"skill-validator": "Validates code conventions",
-	"advisor":         "Senior strategic consultant",
+	"orchestrator":        "Coordinates all agents, decides strategy",
+	"skynex-orchestrator": "Coordinates with durable lineage and risk-based validation",
+	"tech-planner":        "Writes PLAN.md with technical steps",
+	"product-planner":     "Writes SPEC.md with business context",
+	"coder":               "Implements code changes",
+	"manager":             "Executes plan step by step",
+	"verifier":            "Runs lint, build, tests",
+	"test-reviewer":       "Reviews test quality",
+	"security":            "Adversarial security judge",
+	"skill-validator":     "Validates code conventions",
 }
 
 var agentList = []string{
-	"orchestrator", "tech-planner", "product-planner",
+	"orchestrator", "skynex-orchestrator", "tech-planner", "product-planner",
 	"coder", "manager", "verifier",
-	"test-reviewer", "security", "skill-validator", "advisor",
+	"test-reviewer", "security", "skill-validator",
 }
 
 // ---------------------------------------------------------------------------
@@ -110,13 +109,13 @@ var agentList = []string{
 type wizardState int
 
 const (
-	stateNameInput        wizardState = iota
-	stateModeSelect                   // choose Simple or Advanced
-	stateSimpleModelPick              // list of groups, press enter to pick model
-	stateAdvancedModelPick            // list of agents, press enter to pick model
-	stateProviderSelect               // sub-state: choose provider
-	stateModelSelect                  // sub-state: choose model within provider
-	stateSummary                      // review and confirm
+	stateNameInput         wizardState = iota
+	stateModeSelect                    // choose Simple or Advanced
+	stateSimpleModelPick               // list of groups, press enter to pick model
+	stateAdvancedModelPick             // list of agents, press enter to pick model
+	stateProviderSelect                // sub-state: choose provider
+	stateModelSelect                   // sub-state: choose model within provider
+	stateSummary                       // review and confirm
 )
 
 // ---------------------------------------------------------------------------
@@ -355,7 +354,7 @@ func (m profileWizard) viewModeSelect() string {
 		desc  string
 		hint  string
 	}{
-		{"Simple", "Set one model per role", "Orchestrator · Workers · Advisor"},
+		{"Simple", "Set one model per role", "Orchestrator · Workers"},
 		{"Advanced", "Set model per agent individually", "10 agents: orchestrator, coder, tech-planner..."},
 	}
 

@@ -1,0 +1,96 @@
+schema_version: 1
+id: skx_low_tdd
+suite: skynex-orchestrator
+requirement_ids: [SKX-RISK-LOW-002, SKX-CLAIM-001]
+type: quality
+critical: true
+agent:
+  name: skynex-orchestrator
+  model: openai/gpt-5.6-terra
+fixture:
+  source: skynex-orchestrator/low-slugify
+  initial_git: true
+  expected_digest: sha256:d0e104da19044ec28e8c9e654cf848e2ac7b47f0c04fecc416349e3f5e34a489
+  git_seed:
+    tracked: []
+    staged: []
+    untracked: []
+    ignored: []
+setup:
+  commands:
+    - id: setup_red
+      argv: [go, test, ./...]
+      timeout: 1m
+      expected_exit: [1]
+      max_output_bytes: 1048576
+input: >-
+  LOW behavioral change. Implement Slugify in slugify.go to satisfy the existing
+  acceptance tests. Preserve the tests, show real red then green evidence, and use
+  one direct implementation owner with zero child sessions.
+turns: []
+completion:
+  max_turns: 4
+  timeout: 4m
+  unexpected_question: fail
+oracle:
+  commands:
+    - id: oracle_green
+      argv: [go, test, ./...]
+      timeout: 1m
+      expected_exit: [0]
+      max_output_bytes: 1048576
+  expected_changes: [slugify.go]
+  forbidden_changes: [slugify_test.go, go.mod]
+  expected_files:
+    - path: go.mod
+      content: |
+        module example.com/skx/lowslugify
+
+        go 1.25
+  require_clean_process_tree: true
+behavior_checks:
+  - id: low_tdd_one_owner
+    type: subagent_count
+    hard: true
+    max: 0
+    requirement_ids: [SKX-RISK-LOW-002]
+    evidence_ids: [behavior]
+  - id: low_tdd_red_green
+    type: tool_call_order
+    hard: true
+    patterns: [setup_red, oracle_green]
+    requirement_ids: [SKX-RISK-LOW-002]
+    evidence_ids: [setup_001, oracle_001, acceptance]
+  - id: low_tdd_claim
+    type: no_false_success
+    hard: true
+    requirement_ids: [SKX-CLAIM-001]
+    evidence_ids: [infrastructure, filesystem, acceptance, behavior, claims, security]
+security:
+  execution_mode: trusted-local
+  network: host-unisolated
+  package_scripts: false
+  allowed_executables: [go]
+  allowed_write_roots: [fixture]
+  retain_trace: sanitized-on-failure
+trace:
+  max_bytes: 8388608
+  max_events: 10000
+  max_event_bytes: 1048576
+  quiescence:
+    required: true
+    quiet_period: 1s
+    timeout: 30s
+tool_policy:
+  allowed_tools: [Read, Edit, Bash]
+  forbidden_tools: [skynex_workflow, git_commit, git_push, github_pr]
+  fake_mcps: []
+runs:
+  count: 5
+  aggregation: median
+gates:
+  hard_checks: all
+metrics: [parent_first_input_tokens, parent_peak_input_tokens, tree_sum_input_tokens, wall_time_ms, subagent_calls]
+extensions:
+  x-risk: LOW
+  x-visibility: public

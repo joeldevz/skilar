@@ -5,32 +5,82 @@ on:
     tags:
       - 'v*'
 
-permissions:
-  contents: write
-  packages: write
-
 jobs:
-  goreleaser:
-    name: Release
+  preflight:
+    name: Verify release ref
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      commit_sha: ${{ steps.verify.outputs.commit_sha }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout full history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+      - name: Verify protected signed tag and main ancestry
+        id: verify
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          case "$TAG" in v*) ;; *) echo 'release ref is not a v* tag' >&2; exit 1 ;; esac
+          git verify-tag "$TAG"
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          commit="$(git rev-list -n 1 "$TAG")"
+           git merge-base --is-ancestor "$commit" refs/remotes/origin/main
+           git verify-commit "$commit"
+           printf 'commit_sha=%s\n' "$commit" >> "$GITHUB_OUTPUT"
 
+  release:
+    name: Sign and publish release
+    needs: preflight
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.preflight.outputs.commit_sha }}
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
           go-version-file: go.mod
           cache: true
-
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
+        uses: goreleaser/goreleaser-action@9c156ee8a17a598857849441385a2041ef570552 # v6.3.0
         with:
           distribution: goreleaser
-          version: latest
+          version: v2.8.2
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      - name: Sign release metadata and installers
+        env:
+          SKYNEX_RELEASE_SIGNING_KEY: ${{ secrets.SKYNEX_RELEASE_SIGNING_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          command -v ssh-keygen >/dev/null || { echo 'ssh-keygen is required' >&2; exit 1; }
+          test -n "$SKYNEX_RELEASE_SIGNING_KEY" || { echo 'SKYNEX_RELEASE_SIGNING_KEY is required' >&2; exit 1; }
+          for installer in scripts/install.sh scripts/install.ps1; do
+            cp -- "$installer" "dist/$(basename "$installer")"
+            sha256sum "$installer" | sed 's#  scripts/#  #' >> dist/checksums.txt
+          done
+          key="$RUNNER_TEMP/skynex-release-signing-key"
+          umask 077
+          printf '%s\n' "$SKYNEX_RELEASE_SIGNING_KEY" > "$key"
+          expected_public_key="$(awk '{print $1" "$2}' release/trust/skynex-release-signing-key.pub)"
+          actual_public_key="$(ssh-keygen -y -f "$key")"
+          test "$actual_public_key" = "$expected_public_key" || { echo 'release signing key does not match the pinned public key' >&2; exit 1; }
+          ssh-keygen -Y sign -n file -f "$key" dist/checksums.txt
+          ssh-keygen -Y sign -n file -f "$key" dist/install.sh
+          ssh-keygen -Y sign -n file -f "$key" dist/install.ps1
+          gh release upload "$GITHUB_REF_NAME" dist/checksums.txt.sig --clobber
+          gh release upload "$GITHUB_REF_NAME" dist/checksums.txt dist/install.sh dist/install.sh.sig dist/install.ps1 dist/install.ps1.sig --clobber
+          rm -f "$key"

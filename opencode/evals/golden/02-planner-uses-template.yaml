@@ -1,10 +1,10 @@
-id: planner-uses-template
-name: "Planner selects correct template for CRUD task"
+id: tech-planner-uses-template
+name: "Tech planner selects correct template for CRUD task"
 description: |
-  When the task is clearly a CRUD module, the planner should read the
+  When the task is clearly a CRUD module, the tech planner should read the
   PLAN-crud.md template from ~/.config/opencode/templates/ and use it
   as a starting point.
-agent: planner
+agent: tech-planner
 
 prompt: |
   Create a complete CRUD for managing "invoices" in this NestJS backend.

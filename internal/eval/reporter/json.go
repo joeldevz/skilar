@@ -1,55 +1,38 @@
 package reporter
 
 import (
-	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 
+	"github.com/joeldevz/skynex/internal/eval/baseline"
 	"github.com/joeldevz/skynex/internal/eval/runner"
 )
 
-// SaveResult marshals a SuiteResult to JSON and writes it to a file.
-func SaveResult(result *runner.SuiteResult, path string) error {
-	if result == nil {
+// Save writes any machine-readable report as canonical, atomic, mode-0600 JSON.
+func Save(value any, path string) error {
+	if value == nil {
 		return fmt.Errorf("result is nil")
 	}
-
-	// Ensure directory exists
-	dir := filepath.Dir(path)
-	if dir != "." && dir != "" {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return fmt.Errorf("create directory %s: %w", dir, err)
-		}
-	}
-
-	// Marshal to JSON
-	data, err := json.MarshalIndent(result, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal JSON: %w", err)
-	}
-
-	// Write to file
-	if err := os.WriteFile(path, data, 0644); err != nil {
-		return fmt.Errorf("write file %s: %w", path, err)
-	}
-
-	return nil
+	return baseline.SaveJSON(path, value, baseline.IOOptions{})
 }
 
-// LoadResult reads a JSON file and unmarshals it into a SuiteResult.
+// Load reads bounded JSON. Strict controls rejection of unknown struct fields.
+func Load(path string, destination any, strict bool) error {
+	if destination == nil {
+		return fmt.Errorf("destination is nil")
+	}
+	return baseline.LoadJSON(path, destination, baseline.IOOptions{Strict: strict})
+}
+
+// SaveResult is the legacy runner adapter.
+func SaveResult(result *runner.SuiteResult, path string) error {
+	return Save(result, path)
+}
+
+// LoadResult is the legacy runner adapter. It remains strict and size-bounded.
 func LoadResult(path string) (*runner.SuiteResult, error) {
-	// Read file
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read file %s: %w", path, err)
-	}
-
-	// Unmarshal JSON
 	var result runner.SuiteResult
-	if err := json.Unmarshal(data, &result); err != nil {
-		return nil, fmt.Errorf("unmarshal JSON: %w", err)
+	if err := Load(path, &result, true); err != nil {
+		return nil, err
 	}
-
 	return &result, nil
 }

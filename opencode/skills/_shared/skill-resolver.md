@@ -20,7 +20,7 @@ Orden de resolución:
 1. ¿Ya está cacheado de antes en esta sesión? → usar cache
 2. `neurox_recall(query: "skill-registry", namespace: "{project}")` → si encontrado, leer contenido completo
 3. Fallback: leer `.skynex/skill-registry.md` desde la raíz del proyecto si existe
-4. ¿No hay registry? → continuar sin skills y advertir: "⚠️ No skill registry found — sub-agentes trabajarán sin project standards. Corré `/skills:scan` para generarlo."
+4. ¿No hay registry? → continuar sin skills y advertir: "⚠️ No skill registry found — sub-agentes trabajarán sin project standards. Corré `/skills-scan` para generarlo."
 
 ### Paso 2: Matching de skills relevantes
 

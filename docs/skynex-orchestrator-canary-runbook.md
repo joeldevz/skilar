@@ -482,6 +482,8 @@ artefacto manual.
 
 ## Referencias
 
+- Suite pública completa posterior al canario:
+  [`docs/skynex-orchestrator-full-suite-runbook.md`](skynex-orchestrator-full-suite-runbook.md)
 - Contrato normativo: [`eval/specs/skynex-orchestrator-contract.md`](../eval/specs/skynex-orchestrator-contract.md)
 - Contrato general de freeze: [`docs/skynex-eval-freeze.md`](skynex-eval-freeze.md)
 - Canario Workflow V2, que es un perfil distinto:

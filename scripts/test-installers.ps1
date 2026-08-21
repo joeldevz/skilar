@@ -12,6 +12,12 @@ try {
   & ssh-keygen -q -t ed25519 -N '' -f $key
   $pub = (& ssh-keygen -y -f $key).Trim()
   $pubKey = ($pub -split '\s+')[1]
+  $trustedPubKey = ((Get-Content -Raw (Join-Path $root 'release/trust/skynex-release-signing-key.pub')).Trim() -split '\s+')[1]
+  foreach ($installerPath in @((Join-Path $root 'scripts/install.sh'), (Join-Path $root 'scripts/install.ps1'))) {
+    if (-not (Get-Content -Raw $installerPath).Contains($trustedPubKey)) {
+      throw "installer trust pin is not current: $installerPath"
+    }
+  }
   $allowed = Join-Path $tmp 'allowed_signers'
   "skynex-release $pub fixture" | Set-Content -NoNewline -Encoding ascii $allowed
 
@@ -60,7 +66,7 @@ while ($true) { $c = $l.GetContext(); if ($c.Request.Url.AbsolutePath -eq '/api/
     $text = Get-Content -Raw (Join-Path $root 'scripts/install.ps1')
     $text = $text.Replace('https://api.github.com/repos/$GITHUB_OWNER/$GITHUB_REPO/releases/latest', "${prefix}api/repos/joeldevz/skynex/releases/latest")
     $text = $text.Replace('https://github.com/$GITHUB_OWNER/$GITHUB_REPO/releases/download', "${prefix}release")
-    if ($FixtureSigner) { $text = $text.Replace('AAAAC3NzaC1lZDI1NTE5AAAAINUht44Rk/nWIXqcKizh8SWdnECJZOQ5yuPjaxaWxAAF', $pubKey) }
+    if ($FixtureSigner) { $text = $text.Replace($trustedPubKey, $pubKey) }
     if ($text -match 'https://api\.github\.com' -or $text -match 'https://github\.com/\$GITHUB_OWNER/\$GITHUB_REPO/releases/download') { throw 'installer fixture failed to redirect a GitHub endpoint' }
     $text | Set-Content -Encoding utf8 $Path
   }

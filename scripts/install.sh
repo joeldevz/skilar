@@ -288,7 +288,7 @@ install_binary() {
   curl --connect-timeout 10 --max-time 60 -sfL -o "${tmpdir}/checksums.txt.sig" "$signature_url" || fatal "Could not download checksums.txt.sig; refusing unverified archive"
   command -v ssh-keygen >/dev/null 2>&1 || fatal "ssh-keygen is required to verify release authenticity"
   cat > "${tmpdir}/allowed_signers" <<'EOF'
-skynex-release ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINUht44Rk/nWIXqcKizh8SWdnECJZOQ5yuPjaxaWxAAF skynex release signing
+skynex-release ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFyDcCsQ5k4P8zC/qrmMlFi5nfV02DhT+ADQiqX65ynf skynex release signing
 EOF
   ssh-keygen -Y verify -f "${tmpdir}/allowed_signers" -I skynex-release -n file -s "${tmpdir}/checksums.txt.sig" < "${tmpdir}/checksums.txt" >/dev/null 2>&1 || fatal "Invalid checksums.txt signature"
   success "Release signature verified"

@@ -225,7 +225,7 @@ function Install-ViaBinary {
     $sshKeygen = Get-Command "ssh-keygen" -ErrorAction SilentlyContinue
     if (-not $sshKeygen) { Stop-WithError "ssh-keygen is required to verify release authenticity" }
     $allowedSigners = Join-Path $tmpDir "allowed_signers"
-    $signer = "skynex-release ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINUht44Rk/nWIXqcKizh8SWdnECJZOQ5yuPjaxaWxAAF skynex release signing`n"
+    $signer = "skynex-release ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFyDcCsQ5k4P8zC/qrmMlFi5nfV02DhT+ADQiqX65ynf skynex release signing`n"
     Set-Content -Path $allowedSigners -NoNewline -Encoding ascii -Value $signer
     # `ssh-keygen -Y verify` reads the signed message from stdin, and the signature
     # covers checksums.txt byte for byte. PowerShell must not produce those bytes:

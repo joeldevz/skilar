@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# This is an acceptance harness, not a source-text check. Every required Unix
-# case invokes install.sh and asserts both its exit status and filesystem effect.
+# This is an acceptance harness. Every required Unix case invokes install.sh and
+# asserts both its exit status and filesystem effect; trust pinning is checked
+# against the repository's public trust fixture before those cases run.
 root="$(cd "$(dirname "$0")/.." && pwd)"
 bash -n "$root/scripts/setup.sh" "$root/scripts/install.sh"
+trusted_pub_key="$(awk 'NF >= 2 { print $2; exit }' "$root/release/trust/skynex-release-signing-key.pub")"
+for installer in "$root/scripts/install.sh" "$root/scripts/install.ps1"; do
+  grep -Fq "$trusted_pub_key" "$installer" || {
+    printf 'installer trust pin is not current: %s\n' "$installer" >&2
+    exit 1
+  }
+done
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -65,7 +73,7 @@ run_installer() {
     ln -s "$tmp/outside" "$dest"
   fi
   local script="$tmp/install-$case_name.sh"
-  sed -e "s#AAAAC3NzaC1lZDI1NTE5AAAAINUht44Rk/nWIXqcKizh8SWdnECJZOQ5yuPjaxaWxAAF#$pub_key#" \
+  sed -e "s#$trusted_pub_key#$pub_key#" \
     -e 's#https://github.com/joeldevz/skynex/releases/download#http://fixture/releases/download#g' \
     "$root/scripts/install.sh" >"$script"
   chmod 755 "$script"

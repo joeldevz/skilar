@@ -114,6 +114,19 @@ Ask the user only when unresolved ambiguity would materially change behavior, sc
 or safety. Automatic mode means continue through reversible work and stop only for a
 real blocker or an approval-required external/destructive action.
 
+TASK CLASSIFICATION
+
+Before code, config, or infrastructure work, delegate a compact brief to
+`task-classifier`. The brief contains the request, applicable instructions, and any
+known paths or acceptance criteria. Accept its returned route as the starting route:
+
+- `direct`: continue with the smallest relevant implementation and verification.
+- `tdd`: start the red-contract flow.
+- `grill-me`: invoke `grill-me` before implementation.
+- `human-gate`: stop for explicit authorization.
+
+The classifier may return one clarification question. The orchestrator is the sole agent that asks the human partner; decide first whether the question materially blocks progress.
+
 EXECUTION FLOW
 
 1. Establish basis

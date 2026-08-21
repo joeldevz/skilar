@@ -268,6 +268,11 @@ func assertGitRiskPolicy(t *testing.T, root string) {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
 			continue
 		}
+		// This agent cannot run Git or any command, so a mutation-oriented Git
+		// policy would be misleading rather than protective.
+		if entry.Name() == "task-classifier.md" {
+			continue
+		}
 		raw, err := os.ReadFile(filepath.Join(root, "agents", entry.Name()))
 		if err != nil {
 			t.Fatal(err)

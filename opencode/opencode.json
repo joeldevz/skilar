@@ -49,10 +49,27 @@
         "write": true,
         "glob": true,
         "grep": true,
+        "task": true,
         "neurox_context": true,
         "neurox_recall": true
       },
       "model": "openai/gpt-5.6-terra"
+    },
+    "task-classifier": {
+      "description": "Read-only request classifier for the standalone orchestrator.",
+      "mode": "subagent",
+      "model": "openai/gpt-5.6-luna",
+      "prompt": "{file:./agents/task-classifier.md}",
+      "tools": {
+        "read": true,
+        "glob": true,
+        "grep": true,
+        "neurox_recall": true,
+        "bash": false,
+        "edit": false,
+        "write": false,
+        "task": false
+      }
     },
     "coder": {
       "description": "Use for one bounded coding task. TDD is mandatory: prove the focused test red, make the minimal change, and hand off only with relevant tests green.",

@@ -17,6 +17,33 @@ Every review must label evidence provenance and keep these categories separate:
 - `author-claimed`: statements from the PR title, body, commits, or author that were not independently verified.
 - `hypothesis/unverified`: plausible analysis not yet demonstrated; never present it as confirmed.
 
+## Durable memory routing
+
+When a durable finding is verified, the read-only orchestrator must immediately
+route a concise persistence request to `infrastructure-engineer`. That agent is
+the sole writer and must save only the following categories:
+
+| Event / category                                  | observation_type | topic_key                              | Minimum evidence |
+|---------------------------------------------------|------------------|----------------------------------------|------------------|
+| Error solution: root cause and durable fix         | bugfix           | solution/{module}/{error-class}       | root cause, solution, regression proof, limits/non-applicability |
+| Scope decision or explicit non-goal                 | decision          | scope/{feature}/{decision}             | decision, rationale, in-scope/out-of-scope boundary |
+| Dependency compatibility or deprecation finding    | discovery         | dependency/{name}/{version-range}      | affected version/range, evidence, upgrade/avoidance guidance |
+| Explicitly accepted risk                            | decision          | risk/{area}/{risk}                      | risk, acceptance rationale, mitigation/follow-up; never invent an approver |
+| Recurrent blocker and recovery                       | gotcha            | blocker/{root-cause-class}             | recurrence signal, root cause, documented recovery steps |
+
+Also route durable requirements, architecture decisions, codebase discoveries, and
+phase state using `preference`, `decision`, `discovery`, or `config` with the
+existing `pref/`, `arch/`, `codebase/`, and `orchestrator/` topic patterns. Do not
+expand retention to every validation or delivery event.
+
+The request must provide `What / Why / Where / Evidence / Learned / Limits or
+follow-up`, observation type, tags, and topic key. Default all listed observations
+to `namespace="{project}"`. Promote only a
+sanitized, concise, reusable pattern to global memory when it is genuinely
+cross-project; never place repository-specific or private data in global memory.
+Never save secrets, tokens, personal/private data, raw prompts, large logs/dumps,
+or trivial changes.
+
 CI attribution is fail-closed. Do not call a failure `pre-existing`, unrelated to the PR, or present on main without a baseline comparison using the same command or check against the PR's base SHA (or equivalent evidence from that exact base). Comparing with an arbitrary newer main is insufficient. If the base cannot be tested or observed, say that the failure appears outside the diff but was not verified against the base; do not downgrade its merge impact silently.
 
 After primary verification, provenance labeling, baseline analysis, contradiction resolution, and a drafted verdict, report confirmed findings as facts and keep likely or hypothesis/unverified items explicitly labeled as such. Do not persist them to Neurox; route a durable memory request to infrastructure-engineer only when that is genuinely needed.

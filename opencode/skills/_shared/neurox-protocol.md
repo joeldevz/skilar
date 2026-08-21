@@ -33,24 +33,31 @@ license: Complete terms in LICENSE.txt
    → Si no hay resultado: 2-3 búsquedas más con variantes antes de rendirse
 ```
 
-## Cuándo guardar (triggers obligatorios)
+## Mandatory durable-save triggers
 
-| Evento                                      | observation_type        | kind         |
-| ------------------------------------------- | ----------------------- | ------------ |
-| Decisión de arquitectura o diseño           | `decision`              | `semantic`   |
-| Bug fix completado (con causa raíz)         | `bugfix`                | `procedural` |
-| Patrón o convención descubierta             | `pattern` / `discovery` | `semantic`   |
-| Usuario corrige el enfoque o da preferencia | `preference`            | `procedural` |
-| Config de entorno o tool aprendida          | `config`                | `semantic`   |
-| Trampa o gotcha encontrada                  | `gotcha`                | `procedural` |
+Save immediately when verified, durable knowledge fits one of these categories:
+
+| Category | observation_type | topic_key pattern | Required evidence |
+| --- | --- | --- | --- |
+| Error solution | `bugfix` | `solution/{module}/{error-class}` | root cause, durable solution, regression proof, limits/non-applicability |
+| Scope decision or explicit non-goal | `decision` | `scope/{feature}/{decision}` | decision, rationale, in/out boundary |
+| Dependency compatibility or deprecation | `discovery` | `dependency/{name}/{version-range}` | affected range, evidence, upgrade/avoidance guidance |
+| Explicitly accepted risk | `decision` | `risk/{area}/{risk}` | risk, acceptance rationale, mitigation/follow-up; never invent an approver |
+| Recurrent blocker | `gotcha` | `blocker/{root-cause-class}` | recurrence signal, root cause, recovery steps |
+
+Existing durable architecture decisions, patterns, preferences, configuration,
+and codebase discoveries remain valid triggers. Do not save every validation or
+delivery event.
 
 ## Formato de contenido al guardar
 
 ```
-What: [qué se descubrió o decidió]
-Why: [por qué importa]
-Where: [archivos o módulos relevantes]
-Learned: [qué aprender de esto para el futuro]
+What: [what was discovered or decided]
+Why: [why it matters]
+Where: [relevant files or modules]
+Evidence: [verification, reference, or recurrence signal]
+Learned: [durable guidance for the future]
+Limits or follow-up: [non-applicable conditions, mitigation, or next action]
 ```
 
 ## Integración obligatoria en Skills
@@ -59,21 +66,27 @@ Learned: [qué aprender de esto para el futuro]
 
 1. **Al iniciar**: `neurox_recall(query="{tema de la skill}")` — buscar contexto previo
 2. **Cross-namespace**: `neurox_recall(query="{tema}")` sin namespace — inteligencia de otros proyectos
-3. **Al descubrir algo**: `neurox_save(...)` inmediatamente — no esperar al final
+3. **Al descubrir algo**: persist it immediately when the agent has Neurox write
+   permission; otherwise route the durable save request to the authorized writer
+   — do not wait until the end
 4. **Al terminar**: si hubo descubrimientos, guardarlos antes de entregar resultado
 
 Si una skill NO tiene acceso a Neurox tools, debe documentar en su output qué
 información valdría la pena guardar para que el orquestador lo haga.
 
-## Reglas críticas
+## Critical safety and noise rules
 
-- NUNCA guardar cambios triviales (typos, formato)
-- NUNCA guardar info ya en git history
-- Usar `topic_key` para temas que evolucionan — mismo `topic_key` = upsert, no duplicado
-- Namespace = nombre del directorio del proyecto (ej: `api-core`, `neurox`, `skills`)
-- Para memoria cross-project o preferencias personales: omitir namespace o usar `"default"`
-- No inferir identidad del usuario desde git history — usar `neurox_recall` con query explícito
-- Búsqueda cross-namespace (sin filtro) es OBLIGATORIA antes de tareas de producto — puede haber contexto valioso en otros proyectos
+- Never save trivial changes (typos, formatting), raw prompts, large logs/dumps,
+  secrets/tokens, or personal/private data.
+- Never save information that is only a routine validation or delivery event.
+- Use `topic_key` for evolving topics; the same key upserts rather than duplicates.
+- Default all project-specific observations to the project namespace.
+- Promote only a sanitized, concise, reusable pattern to global memory when it is
+  genuinely cross-project; never promote repository-specific/private data.
+- Never infer identity or an approver from git history; accepted-risk records must
+  state rationale and mitigation without inventing an approver.
+- Current evidence wins over memory. Cross-namespace recall remains mandatory
+  before product tasks, but recall does not make a finding global.
 
 ## Namespace convention
 

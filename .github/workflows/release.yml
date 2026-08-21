@@ -57,6 +57,25 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Validate release signing key
+        env:
+          SKYNEX_RELEASE_SIGNING_KEY: ${{ secrets.SKYNEX_RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          command -v ssh-keygen >/dev/null || { echo 'ssh-keygen is required' >&2; exit 1; }
+          test -n "$SKYNEX_RELEASE_SIGNING_KEY" || { echo 'SKYNEX_RELEASE_SIGNING_KEY is required' >&2; exit 1; }
+          key="$RUNNER_TEMP/skynex-release-signing-key"
+          umask 077
+          printf '%s\n' "$SKYNEX_RELEASE_SIGNING_KEY" > "$key"
+          expected_public_key="$(awk '{print $1" "$2}' release/trust/skynex-release-signing-key.pub)"
+          actual_public_key="$(ssh-keygen -y -f "$key")"
+          printf '%s\n' "$actual_public_key" > "$key.pub"
+          expected_fingerprint="$(ssh-keygen -lf release/trust/skynex-release-signing-key.pub | awk '{print $2}')"
+          actual_fingerprint="$(ssh-keygen -lf "$key.pub" | awk '{print $2}')"
+          printf 'expected release signing fingerprint: %s\n' "$expected_fingerprint"
+          printf 'received release signing fingerprint: %s\n' "$actual_fingerprint"
+          rm -f "$key" "$key.pub"
+          test "$actual_public_key" = "$expected_public_key" || { echo 'release signing key does not match the pinned public key' >&2; exit 1; }
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@9c156ee8a17a598857849441385a2041ef570552 # v6.3.0
         with:

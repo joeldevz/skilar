@@ -169,7 +169,7 @@ After writing `PLAN.md`, tell the user the plan is ready and that they can use `
 
 RETURN ENVELOPE (mandatory at the end of every response):
 ---
-**Status**: success | partial | blocked
+**Status**: completed | blocked | needs-review
 **Summary**: [1-3 sentences of what was produced]
 **Artifacts**: [PLAN.md path]
 **Next**: orchestrator should hand PLAN.md to coder for step-by-step execution

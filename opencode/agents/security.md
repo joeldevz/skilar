@@ -66,7 +66,7 @@ FOR EACH FINDING, report:
 
 RETURN ENVELOPE (mandatory):
 ---
-**Status**: success | partial | blocked
+**Status**: completed | blocked | needs-review
 **Summary**: [X files reviewed, Y findings (Z critical, W high, V medium, U low)]
 **security_findings**:
   | Severity | File | Description | Suggested Fix |

@@ -1,4 +1,4 @@
-# Return Envelope — Contrato estándar de retorno
+# Return Envelope — Canonical return contract
 
 Todo sub-agente DEBE terminar su respuesta con este bloque estructurado. El orchestrator lo usa para sintetizar resultados y detectar fallos silenciosos.
 
@@ -6,7 +6,7 @@ Todo sub-agente DEBE terminar su respuesta con este bloque estructurado. El orch
 
 | Campo | Tipo | Descripción |
 |-------|------|-------------|
-| `status` | `success \| partial \| blocked` | Resultado general de la tarea |
+| `status` | `completed \| blocked \| needs-review` | Resultado general de la tarea |
 | `executive_summary` | string (1-3 frases) | Qué se hizo y resultado clave |
 | `artifacts` | lista | Archivos creados/modificados, o keys de Neurox guardados |
 | `next_recommended` | string | Siguiente acción recomendada, o `"none"` |
@@ -19,7 +19,7 @@ Usar siempre al final de la respuesta:
 
 ```
 ---
-**Status**: success | partial | blocked
+**Status**: completed | blocked | needs-review
 **Summary**: [1-3 frases de qué se hizo]
 **Artifacts**: [lista de archivos o keys de Neurox]
 **Next**: [acción recomendada o "none"]
@@ -29,7 +29,7 @@ Usar siempre al final de la respuesta:
 
 ## Reglas
 
-- `partial`: el agente completó parte del trabajo pero encontró un bloqueador menor. Describe qué falta en `risks`.
+- `needs-review`: el agente produjo trabajo utilizable, pero requiere follow-up. Describe qué falta en `risks`.
 - `blocked`: el agente no puede continuar sin intervención. El orchestrator debe pausar y reportar al usuario.
 - `skill_resolution: injected`: el orchestrator inyectó compact rules en el prompt. Es el camino ideal.
 - `skill_resolution: fallback-registry`: el agente no recibió rules inyectadas y tuvo que buscarlas en `.skynex/skill-registry.md` o Neurox.

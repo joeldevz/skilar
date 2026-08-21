@@ -96,20 +96,7 @@ Reference: `opencode/skills/tdd-discipline/SKILL.md` y QW3 inyectado en coder.
 
 ## 5. Return envelope
 
-Todo sub-agente devuelve al orchestrator un envelope con campos mínimos:
-
-```yaml
-status: success | blocked | needs-review
-slice_id: <id>
-mode: hitl | afk
-zone: smart | warning | dumb
-tokens_used: <número>
-verification: { build, tests, types, lint, manual_check, evidence_quality }
-artifacts: [<paths modificados>]
-risks: [<observaciones honestas>]
-skill_resolution: ok | fallback-registry | none
-executive_summary: <1-2 frases>
-```
+The canonical return envelope, including authoritative field definitions and allowed status values, is defined in `opencode/skills/_shared/return-envelope.md`. All agents and skills must follow that document; do not duplicate its field specification here.
 
 ---
 

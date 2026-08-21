@@ -38,7 +38,7 @@ constraints:
   smart_zone: 100K hard cap
   retries: max 2
 expected_output:
-  status: success | blocked | needs-review
+  status: completed | blocked | needs-review
   artifacts: <files to be modified>
   envelope_fields: [<required fields>]
 ```

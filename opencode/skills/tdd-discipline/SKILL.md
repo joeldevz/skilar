@@ -1,6 +1,6 @@
 ---
 name: tdd-discipline
-description: Use when the user opts into TDD or the task requires writing/modifying tests. Tests derive from the plan's Given/When/Then requirements. Optional for trivial bugfixes/docs.
+description: Use when the user opts into TDD or the task requires writing or modifying tests.
 ---
 
 # TDD Discipline — Iron Law + Cycle Evidence
@@ -88,7 +88,7 @@ These are detectable smell signs. Reject in code review:
 
 ## Integration with the verifier
 
-This skill runs the cycle (red → green → refactor). The `verifier` agent runs the evidence checks (build, test runner output, types, lint) after each step. Both must be satisfied before `status: success`.
+This skill runs the cycle (red → green → refactor). The `verifier` agent runs the evidence checks (build, test runner output, types, lint) after each step. Both must be satisfied before `status: completed`.
 
 ## Cultural rules
 

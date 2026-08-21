@@ -67,7 +67,7 @@ FOR EACH FINDING within a file, report:
 
 RETURN ENVELOPE (mandatory):
 ---
-**Status**: success | partial | blocked
+**Status**: completed | blocked | needs-review
 **Summary**: [X test files reviewed, Y SOUND, Z WEAK, W MISLEADING]
 **test_review_summary**:
   | File | Verdict | Key Issues |

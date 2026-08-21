@@ -79,7 +79,7 @@ SEVERITY:
 
 RETURN ENVELOPE (mandatory — end your response with this):
 ---
-**Status**: success | blocked | needs-review
+**Status**: completed | blocked | needs-review
 **Dimension**: R0 | R1 | R2 | R3 | R4
 **Summary**: [N files reviewed, M findings (B blocking, S should-fix, N nice-to-have)]
 **findings**:
@@ -90,7 +90,7 @@ RETURN ENVELOPE (mandatory — end your response with this):
 **rule_suggestions**: [proposed bullets for .skynex/review-rules.md, or 'None']
 **Artifacts**: [] (judge creates no files)
 **Risks**: ['could not read N files' or 'None']
-**skill_resolution**: ok | fallback-registry | none
+**skill_resolution**: injected | fallback-registry | none
 ---
 
 If NO issues in your dimension:

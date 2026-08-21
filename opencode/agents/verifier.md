@@ -55,7 +55,7 @@ Keep verifier_feedback concise — the coder needs to know WHAT to fix, not the 
 
 RETURN ENVELOPE (mandatory):
 ---
-**Status**: success | partial | blocked
+**Status**: completed | blocked | needs-review
 **Summary**: [what was checked and overall result]
 **Lint**: pass | fail — [error count or 'clean']
 **Build**: pass | fail — [error count or 'clean']
@@ -64,7 +64,7 @@ RETURN ENVELOPE (mandatory):
 **Artifacts**: [] (verifier creates no files)
 **Next**: [if success: 'orchestrator may proceed to next step' | if fail: 'coder should retry with verifier_feedback']
 **Risks**: [e.g. 'could not detect test command' or 'None']
-**skill_resolution**: injected
+**skill_resolution**: injected | fallback-registry | none
 ---
 
 RULES:

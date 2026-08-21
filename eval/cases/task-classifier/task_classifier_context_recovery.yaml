@@ -1,0 +1,90 @@
+schema_version: 1
+id: task_classifier_context_recovery
+suite: task-classifier
+requirement_ids: [TC-BEHAVIOR-002]
+type: behavior
+critical: true
+agent:
+  name: task-classifier
+  model: openai/gpt-5.6-terra
+fixture:
+  source: skynex-orchestrator/coordination
+  initial_git: true
+  expected_digest: sha256:0473cd1d2357ff6b75b8c5ba73280a55540ebea53cb6683b335c59a6f593687b
+  git_seed:
+    tracked: []
+    staged: []
+    untracked: []
+    ignored: []
+setup:
+  commands: []
+input: >-
+  Classify this bounded repository-maintenance request. Read the relevant existing
+  configuration and agent prompt, then make one targeted read-only Neurox recall for
+  prior routing context because that context could materially change the route. Do
+  not implement or edit anything; return the compact classification only.
+turns: []
+completion:
+  max_turns: 4
+  timeout: 4m
+  unexpected_question: fail
+oracle:
+  commands: []
+  expected_changes: []
+  forbidden_changes: [candidate.txt]
+  expected_files:
+    - path: candidate.txt
+      content: |
+        frozen-candidate-v1
+  require_clean_process_tree: true
+behavior_checks:
+  - id: classifier_bounded_discovery
+    type: tool_called_min
+    hard: true
+    tool: Read
+    value: 1
+    max: 3
+    requirement_ids: [TC-BEHAVIOR-002]
+    evidence_ids: [behavior]
+  - id: classifier_conditional_recall
+    type: tool_called_min
+    hard: true
+    tool: neurox_recall
+    value: 1
+    max: 1
+    requirement_ids: [TC-BEHAVIOR-002]
+    evidence_ids: [behavior]
+  - id: classifier_no_workflow
+    type: tool_not_called
+    hard: true
+    tool: skynex_workflow
+    requirement_ids: [TC-BEHAVIOR-002]
+    evidence_ids: [behavior]
+security:
+  execution_mode: trusted-local
+  network: host-unisolated
+  package_scripts: false
+  allowed_executables: [go]
+  allowed_write_roots: [fixture]
+  retain_trace: sanitized-always
+trace:
+  max_bytes: 8388608
+  max_events: 10000
+  max_event_bytes: 1048576
+  quiescence:
+    required: true
+    quiet_period: 1s
+    timeout: 30s
+tool_policy:
+  allowed_tools: [Read, neurox_recall]
+  forbidden_tools: [Edit, Bash, skynex_workflow, git_commit, git_push, github_pr]
+  fake_mcps: []
+runs:
+  count: 1
+  aggregation: median
+gates:
+  hard_checks: all
+metrics: [parent_first_input_tokens, parent_peak_input_tokens, tree_sum_input_tokens, wall_time_ms, subagent_calls]
+extensions:
+  x-risk: MEDIUM
+  x-visibility: public

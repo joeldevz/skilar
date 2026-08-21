@@ -46,6 +46,149 @@ func TestApplyRestoresExistingAndRemovesMissing(t *testing.T) {
 	}
 }
 
+func TestRollbackRestoresMultipleStateRootsAfterMutation(t *testing.T) {
+	root := t.TempDir()
+	state := filepath.Join(root, "state")
+	claude := filepath.Join(root, "claude")
+	sentinel := errors.New("sentinel failure")
+	files := map[string]string{
+		"skills.config.json":    "config-before",
+		"skills.lock.json":      "lock-before",
+		"skills.ownership.json": "ownership-before",
+	}
+	if err := os.MkdirAll(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, contents := range files {
+		if err := os.WriteFile(filepath.Join(state, name), []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	err := Apply(&Plan{destinations: Destinations{ClaudeDir: claude, StateDir: state}}, func() error {
+		for name := range files {
+			if err := os.WriteFile(filepath.Join(state, name), []byte("mutated"), 0o600); err != nil {
+				return err
+			}
+		}
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("rollback result = %v, want sentinel failure", err)
+	}
+	if strings.Contains(err.Error(), "refusing rollback of replaced root") {
+		t.Errorf("rollback reported its own replaced root: %v", err)
+	}
+	for name, want := range files {
+		got, readErr := os.ReadFile(filepath.Join(state, name))
+		if readErr != nil || !bytes.Equal(got, []byte(want)) {
+			t.Errorf("%s = %q, %v; want original bytes %q", name, got, readErr, want)
+		}
+	}
+}
+
+func TestRollbackRejectsAtomicReplacementAfterRestoringRegularFileRoot(t *testing.T) {
+	root := t.TempDir()
+	state := filepath.Join(root, "state")
+	config := filepath.Join(state, "skills.config.json")
+	sentinel := errors.New("mutation sentinel")
+	if err := os.MkdirAll(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(config, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	hookCalled := false
+	snapshotHooks.AfterRestore = func(path string) error {
+		if path != config {
+			return nil
+		}
+		hookCalled = true
+		tmp := filepath.Join(state, ".attacker-replacement")
+		if err := os.WriteFile(tmp, []byte("attacker replacement"), 0o600); err != nil {
+			return err
+		}
+		return os.Rename(tmp, path)
+	}
+	t.Cleanup(func() { snapshotHooks.AfterRestore = nil })
+
+	err := Apply(&Plan{destinations: Destinations{StateDir: state}}, func() error {
+		if err := os.WriteFile(config, []byte("mutated"), 0o600); err != nil {
+			return err
+		}
+		return sentinel
+	})
+	if !hookCalled {
+		t.Fatal("after-restore replacement hook was not called for the canonical file root")
+	}
+	if err == nil || !strings.Contains(err.Error(), "replaced root") {
+		t.Fatalf("rollback result = %v, want replaced-root integrity error", err)
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("rollback result = %v, want primary sentinel discoverable", err)
+	}
+	got, readErr := os.ReadFile(config)
+	if readErr != nil || string(got) != "attacker replacement" {
+		t.Fatalf("attacker replacement = %q, %v; rollback must not overwrite or delete it", got, readErr)
+	}
+}
+
+func TestRollbackRejectsReplacementBeforePostRenamePathOperation(t *testing.T) {
+	root := t.TempDir()
+	state := filepath.Join(root, "state")
+	config := filepath.Join(state, "skills.config.json")
+	sentinel := errors.New("mutation sentinel")
+	if err := os.MkdirAll(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(config, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	hookCalled := false
+	const attackerBytes = "attacker replacement"
+	snapshotHooks.AfterRestoreRename = func(path string) error {
+		if path != config {
+			return nil
+		}
+		hookCalled = true
+		tmp := filepath.Join(state, ".attacker-replacement")
+		if err := os.WriteFile(tmp, []byte(attackerBytes), 0o644); err != nil {
+			return err
+		}
+		return os.Rename(tmp, path)
+	}
+	t.Cleanup(func() { snapshotHooks.AfterRestoreRename = nil })
+
+	err := Apply(&Plan{destinations: Destinations{StateDir: state}}, func() error {
+		if err := os.WriteFile(config, []byte("mutated"), 0o600); err != nil {
+			return err
+		}
+		return sentinel
+	})
+	if !hookCalled {
+		t.Fatal("after-rename replacement hook was not called for the canonical file root")
+	}
+	if err == nil || !strings.Contains(err.Error(), "replaced root") {
+		t.Fatalf("rollback result = %v, want replaced-root integrity error", err)
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("rollback result = %v, want primary sentinel discoverable", err)
+	}
+	got, readErr := os.ReadFile(config)
+	if readErr != nil || string(got) != attackerBytes {
+		t.Fatalf("attacker replacement = %q, %v; rollback must preserve attacker content", got, readErr)
+	}
+	info, statErr := os.Stat(config)
+	if statErr != nil {
+		t.Fatal(statErr)
+	}
+	if mode := info.Mode().Perm(); mode != 0o644 {
+		t.Fatalf("attacker replacement mode = %o, want 644; post-rename chmod must not affect attacker", mode)
+	}
+}
+
 func TestApplyRejectsSymlinkAncestorBeforeCallback(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "target")

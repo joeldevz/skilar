@@ -1,12 +1,150 @@
 package skillsync
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
+	"strings"
 	"testing"
 )
+
+func TestParseManifestIsReusableCanonicalValidation(t *testing.T) {
+	files := []File{{Path: "zeta/skill.md", SHA256: hashBytes([]byte("zeta"))}, {Path: "alpha.md", SHA256: hashBytes([]byte("alpha"))}}
+	m := Manifest{Version: ManifestVersion, Source: "opencode/skills", SourceKind: "bundle", BundleVersion: "latest", BundleCommit: "test", Package: "skills", Target: "opencode", GeneratedAt: "2026-08-21T00:00:00Z", Files: files}
+	m.TreeSHA256 = canonicalManifestTreeHash(m)
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseManifest(b)
+	if err != nil {
+		t.Fatalf("canonical manifest parser rejected valid metadata: manifest=%+v err=%v", parsed, err)
+	}
+	if parsed.Version != m.Version || parsed.Source != m.Source || parsed.SourceKind != m.SourceKind || parsed.BundleVersion != m.BundleVersion || parsed.BundleCommit != m.BundleCommit || parsed.TreeSHA256 != m.TreeSHA256 || parsed.Package != m.Package || parsed.Target != m.Target || parsed.GeneratedAt != m.GeneratedAt {
+		t.Fatalf("parser did not preserve canonical fields: got=%+v want=%+v", parsed, m)
+	}
+	if !reflect.DeepEqual(parsed.Files, files) || parsed.Files[0].Path != "zeta/skill.md" || parsed.Files[0].SHA256 != files[0].SHA256 || parsed.Files[1].Path != "alpha.md" || parsed.Files[1].SHA256 != files[1].SHA256 {
+		t.Fatalf("parser did not preserve complete file entries/hashes: got=%+v want=%+v", parsed.Files, files)
+	}
+	if _, err := ParseManifest([]byte(`{"version":1,"files":[]}`)); err == nil {
+		t.Fatal("minimal manifest accepted")
+	}
+}
+
+func TestParseManifestCanonicalizesTreeHashIndependentOfFileOrder(t *testing.T) {
+	first := []File{{Path: "z.md", SHA256: hashBytes([]byte("z"))}, {Path: "a.md", SHA256: hashBytes([]byte("a"))}}
+	second := append([]File(nil), first...)
+	sort.Slice(second, func(i, j int) bool { return second[i].Path < second[j].Path })
+	base := Manifest{Version: ManifestVersion, Source: "opencode/skills", SourceKind: "bundle", BundleVersion: "v1", BundleCommit: "commit", Package: "skills", Target: "opencode"}
+	left, right := base, base
+	left.Files, right.Files = first, second
+	const canonicalBytes = "source\x00opencode/skills\nsourceKind\x00bundle\nbundleVersion\x00v1\nbundleCommit\x00commit\npackage\x00skills\ntarget\x00opencode\na.md\x00ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb\nz.md\x00594e519ae499312b29433b7dd8a97ff068defcba9755b6d5d00e84c524d67b06\n"
+	const canonicalHash = "0bbd4989584faa7cc0afc6d780ab3c4b940b80e0de0d8bb408f6e05e9c8f7821"
+	if got := string(canonicalManifestTreeBytes(left)); got != canonicalBytes {
+		t.Fatalf("unexpected canonical tree bytes: %q", got)
+	}
+	if got := canonicalManifestTreeHash(left); got != canonicalHash {
+		t.Fatalf("unexpected canonical tree hash: %s", got)
+	}
+	left.TreeSHA256, right.TreeSHA256 = canonicalHash, canonicalHash
+	for name, manifest := range map[string]Manifest{"unsorted": left, "sorted": right} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseManifest(mustJSON(t, manifest)); err != nil {
+				t.Fatalf("valid manifest rejected: %v", err)
+			}
+		})
+	}
+}
+
+func TestParseManifestRejectsInvalidCanonicalCases(t *testing.T) {
+	valid := Manifest{Version: ManifestVersion, Source: "opencode/skills", SourceKind: "bundle", BundleVersion: "v1", BundleCommit: "commit", Package: "skills", Target: "opencode", Files: []File{{Path: "a.md", SHA256: hashBytes([]byte("a"))}}}
+	valid.TreeSHA256 = canonicalManifestTreeHash(valid)
+	cases := []struct {
+		name   string
+		mutate func(map[string]any)
+		want   string
+	}{
+		{"unsupported version", func(m map[string]any) { m["version"] = 99 }, "version"},
+		{"missing metadata", func(m map[string]any) { delete(m, "source"); m["treeSHA256"] = canonicalManifestTreeHashFromMap(m) }, "source"},
+		{"wrong entry type", func(m map[string]any) { m["files"] = []any{"a.md"} }, "entry"},
+		{"duplicate path", func(m map[string]any) {
+			m["files"] = []any{map[string]any{"path": "a.md", "sha256": valid.Files[0].SHA256}, map[string]any{"path": "a.md", "sha256": valid.Files[0].SHA256}}
+			m["treeSHA256"] = canonicalManifestTreeHashFromMap(m)
+		}, "duplicate"},
+		{"hostile path", func(m map[string]any) {
+			m["files"] = []any{map[string]any{"path": "../a.md", "sha256": valid.Files[0].SHA256}}
+			m["treeSHA256"] = canonicalManifestTreeHashFromMap(m)
+		}, "path"},
+		{"invalid hash", func(m map[string]any) { m["files"] = []any{map[string]any{"path": "a.md", "sha256": "not-a-hash"}} }, "hash"},
+		{"wrong target", func(m map[string]any) { m["target"] = "other"; m["treeSHA256"] = canonicalManifestTreeHashFromMap(m) }, "target"},
+		{"wrong package", func(m map[string]any) { m["package"] = "other"; m["treeSHA256"] = canonicalManifestTreeHashFromMap(m) }, "package"},
+		{"tree mismatch", func(m map[string]any) {
+			m["treeSHA256"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		}, "tree"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := manifestMap(valid)
+			tc.mutate(m)
+			if _, err := ParseManifest(mustJSON(t, m)); err == nil {
+				t.Fatalf("invalid manifest accepted: %s", tc.name)
+			} else if !strings.Contains(strings.ToLower(err.Error()), tc.want) {
+				t.Fatalf("%s returned wrong validation error: %v (want %q)", tc.name, err, tc.want)
+			}
+		})
+	}
+}
+
+func canonicalManifestTreeBytes(m Manifest) []byte {
+	var b strings.Builder
+	fmt.Fprintf(&b, "source\x00%s\nsourceKind\x00%s\nbundleVersion\x00%s\nbundleCommit\x00%s\npackage\x00%s\ntarget\x00%s\n", m.Source, m.SourceKind, m.BundleVersion, m.BundleCommit, m.Package, m.Target)
+	files := append([]File(nil), m.Files...)
+	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+	for _, f := range files {
+		fmt.Fprintf(&b, "%s\x00%s\n", f.Path, f.SHA256)
+	}
+	return []byte(b.String())
+}
+
+func canonicalManifestTreeHashFromMap(m map[string]any) string {
+	b, _ := json.Marshal(m)
+	var parsed Manifest
+	_ = json.Unmarshal(b, &parsed)
+	return hashBytes(canonicalManifestTreeBytes(parsed))
+}
+
+func canonicalManifestTreeHash(m Manifest) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "source\x00%s\nsourceKind\x00%s\nbundleVersion\x00%s\nbundleCommit\x00%s\npackage\x00%s\ntarget\x00%s\n", m.Source, m.SourceKind, m.BundleVersion, m.BundleCommit, m.Package, m.Target)
+	files := append([]File(nil), m.Files...)
+	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+	for _, f := range files {
+		fmt.Fprintf(h, "%s\x00%s\n", f.Path, f.SHA256)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func manifestMap(m Manifest) map[string]any {
+	b, _ := json.Marshal(m)
+	var out map[string]any
+	_ = json.Unmarshal(b, &out)
+	return out
+}
+
+func mustJSON(t *testing.T, value any) []byte {
+	t.Helper()
+	b, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
 
 func makeBundle(t *testing.T, files map[string]string) string {
 	t.Helper()

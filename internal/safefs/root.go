@@ -7,6 +7,7 @@ package safefs
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -198,6 +199,10 @@ func sameIdentity(a, b os.FileInfo) bool {
 	return os.SameFile(a, b) && a.Mode().Type() == b.Mode().Type() && singleLink(a) == singleLink(b)
 }
 
+func sameFileIdentity(a, b os.FileInfo) bool {
+	return os.SameFile(a, b) && a.Mode().Type() == b.Mode().Type()
+}
+
 func Remove(root *os.Root, name string) error {
 	name, err := Relative(name)
 	if err != nil {
@@ -207,6 +212,118 @@ func Remove(root *os.Root, name string) error {
 		return err
 	}
 	return nil
+}
+
+// StageVerified atomically renames one inspected, single-link regular file to
+// a cryptographically random private quarantine directory. The callback is
+// invoked after capture and before the rename, for race-injection and
+// transaction seams.
+func StageVerified(root *os.Root, name string, stageDir string, digest string, before func(string) error) (string, error) {
+	name, err := Relative(name)
+	if err != nil {
+		return "", err
+	}
+	if stageDir != "." {
+		stageDir, err = Relative(stageDir)
+		if err != nil {
+			return "", err
+		}
+	}
+	if stageDir == "" {
+		stageDir = "."
+	}
+	beforeInfo, err := root.Lstat(name)
+	if err != nil {
+		return "", err
+	}
+	if !beforeInfo.Mode().IsRegular() || beforeInfo.Mode()&os.ModeSymlink != 0 || !singleLink(beforeInfo) {
+		return "", fmt.Errorf("refusing non-regular or hard-linked file %q", name)
+	}
+	f, err := root.Open(name)
+	if err != nil {
+		return "", err
+	}
+	fdInfo, statErr := f.Stat()
+	data, readErr := io.ReadAll(io.LimitReader(f, 64<<20+1))
+	closeErr := f.Close()
+	if statErr != nil {
+		return "", statErr
+	}
+	if readErr != nil {
+		return "", readErr
+	}
+	if closeErr != nil {
+		return "", closeErr
+	}
+	if int64(len(data)) > 64<<20 {
+		return "", fmt.Errorf("file %q exceeds maximum size of %d bytes", name, 64<<20)
+	}
+	if !sameIdentity(beforeInfo, fdInfo) || !singleLink(fdInfo) {
+		return "", fmt.Errorf("file changed while staging %q", name)
+	}
+	if digest != "" {
+		sum := sha256.Sum256(data)
+		if hex.EncodeToString(sum[:]) != digest {
+			return "", fmt.Errorf("file digest mismatch %q", name)
+		}
+	}
+	if before != nil {
+		if err := before(name); err != nil {
+			return "", err
+		}
+	}
+	afterCapture, err := root.Lstat(name)
+	if err != nil || !sameIdentity(beforeInfo, afterCapture) {
+		return "", fmt.Errorf("file changed before staging %q", name)
+	}
+	quarantine, err := uninstallStageName(root, stageDir)
+	if err != nil {
+		return "", err
+	}
+	if err := root.Mkdir(quarantine, 0o700); err != nil {
+		return "", err
+	}
+	stage := filepath.ToSlash(filepath.Join(quarantine, "item"))
+	if _, err := root.Lstat(stage); !errors.Is(err, fs.ErrNotExist) {
+		if err == nil {
+			return "", fmt.Errorf("staging target already exists")
+		}
+		return "", err
+	}
+	if err := root.Rename(name, stage); err != nil {
+		return "", err
+	}
+	stagedInfo, err := root.Lstat(stage)
+	if err != nil || !sameIdentity(beforeInfo, stagedInfo) {
+		if err == nil {
+			// Link is deliberately no-clobber: an occupied source preserves both
+			// the replacement and this quarantined recovery artifact.
+			if linkErr := root.Link(stage, name); linkErr == nil {
+				if removeErr := root.Remove(stage); removeErr != nil {
+					return stage, errors.Join(fmt.Errorf("staged file identity mismatch %q", name), removeErr)
+				}
+				return stage, fmt.Errorf("staged file identity mismatch %q", name)
+			}
+		}
+		return stage, fmt.Errorf("staged file identity mismatch %q; recovery artifact retained", name)
+	}
+	return stage, nil
+}
+
+func uninstallStageName(root *os.Root, dir string) (string, error) {
+	for i := 0; i < 8; i++ {
+		var token [16]byte
+		if _, err := rand.Read(token[:]); err != nil {
+			return "", err
+		}
+		name := filepath.ToSlash(filepath.Join(dir, ".skynex-uninstall-"+hex.EncodeToString(token[:])))
+		if _, err := root.Lstat(name); errors.Is(err, fs.ErrNotExist) {
+			return name, nil
+		} else if err != nil {
+			return "", err
+		}
+	}
+	return "", errors.New("unable to allocate unused staging name")
 }
 
 // ReadDir reads a directory through the retained root descriptor. It is kept

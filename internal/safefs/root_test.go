@@ -47,6 +47,35 @@ func TestReadFileVerifiedRejectsHardlink(t *testing.T) {
 	}
 }
 
+func TestRemoveDoesNotDeleteReplacementAfterIdentityValidation(t *testing.T) {
+	rootPath := t.TempDir()
+	root, err := Open(rootPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	path := filepath.Join(rootPath, "owned")
+	if err := os.WriteFile(path, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	inspected, err := root.Lstat("owned")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := StageVerified(root, "owned", ".", "", func(string) error {
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+		return os.WriteFile(path, []byte("replacement"), 0o600)
+	}); err == nil {
+		t.Fatal("replacement was staged")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != "replacement" {
+		t.Fatalf("replacement was removed after validation: %q, %v (inspected %v)", got, err, inspected)
+	}
+}
+
 func TestReadFileVerifiedAcceptsExactLimitAndRejectsOversize(t *testing.T) {
 	rootPath := t.TempDir()
 	root, err := Open(rootPath)

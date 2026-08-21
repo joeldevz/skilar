@@ -662,6 +662,24 @@ func treeHash(files []File) string {
 // TreeHash returns the stable SHA-256 for a sorted manifest file list.
 func TreeHash(files []File) string { return treeHash(files) }
 
+// ParseManifest decodes and canonically validates an ownership manifest.
+func ParseManifest(data []byte) (Manifest, error) {
+	var m Manifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		if strings.Contains(err.Error(), "cannot unmarshal array") {
+			return Manifest{}, fmt.Errorf("invalid ownership manifest top-level: %w", err)
+		}
+		if !strings.Contains(err.Error(), "invalid character") && !strings.Contains(err.Error(), "unexpected end") {
+			return Manifest{}, fmt.Errorf("invalid ownership manifest entry: %w", err)
+		}
+		return Manifest{}, fmt.Errorf("malformed ownership manifest: %w", err)
+	}
+	if err := validateManifest(m); err != nil {
+		return Manifest{}, err
+	}
+	return m, nil
+}
+
 func readManifest(path string) (*Manifest, bool, error) {
 	parent, err := safefs.Open(filepath.Dir(path))
 	if errors.Is(err, os.ErrNotExist) {
@@ -691,11 +709,8 @@ func readManifest(path string) (*Manifest, bool, error) {
 	if e != nil {
 		return nil, false, e
 	}
-	var m Manifest
-	if e = json.Unmarshal(b, &m); e != nil {
-		return nil, false, fmt.Errorf("malformed ownership manifest: %w", e)
-	}
-	if e = validateManifest(m); e != nil {
+	m, e := ParseManifest(b)
+	if e != nil {
 		return nil, false, e
 	}
 	return &m, false, nil
@@ -707,6 +722,15 @@ func validateManifest(m Manifest) error {
 	}
 	if m.Source == "" || m.SourceKind == "" || m.BundleVersion == "" || m.Package == "" || m.Target == "" {
 		return errors.New("ownership manifest missing source metadata")
+	}
+	if m.Package != "skills" {
+		return fmt.Errorf("unsupported ownership manifest package %q", m.Package)
+	}
+	if m.Target != "opencode" {
+		return fmt.Errorf("unsupported ownership manifest target %q", m.Target)
+	}
+	if m.Files == nil {
+		return errors.New("invalid ownership manifest files")
 	}
 	if !isHash(m.TreeSHA256) {
 		return errors.New("invalid ownership manifest tree hash")
@@ -790,11 +814,8 @@ func (s *Session) readManifest() (*Manifest, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	var m Manifest
-	if err := json.Unmarshal(b, &m); err != nil {
-		return nil, false, fmt.Errorf("malformed ownership manifest: %w", err)
-	}
-	if err := validateManifest(m); err != nil {
+	m, err := ParseManifest(b)
+	if err != nil {
 		return nil, false, err
 	}
 	return &m, false, nil

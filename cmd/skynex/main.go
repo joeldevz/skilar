@@ -87,6 +87,13 @@ func main() {
 		handleBackup(args)
 		os.Exit(0)
 	}
+	if args.Uninstall {
+		if err := runUninstall(args); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 
 	if args.Help {
 		printUsage()
@@ -272,6 +279,7 @@ type cliArgs struct {
 	Status            bool
 	CleanupDeprecated bool
 	DryRun            bool
+	Uninstall         bool
 	Verbose           bool
 	Force             bool
 	BackupCommand     string
@@ -308,6 +316,8 @@ func parseArgsFrom(osArgs []string) *cliArgs {
 			args.Doctor = true
 		case "install":
 			args.Install = true
+		case "uninstall":
+			args.Uninstall = true
 		case "backup":
 			if i+1 >= len(osArgs) {
 				args.ParseError = "backup requires list or prune"
@@ -1007,6 +1017,7 @@ func printUsage() {
 Commands:
   workflow <command>      Inspect or control managed workflows
   install                 Interactive installer (TUI)
+  uninstall               Remove only unchanged skynex-owned files (--dry-run, --yes, --state-dir)
   backup list              List retained recovery backups
   backup prune             Remove eligible backups (interactive)
   backup prune --yes --keep N  Prune eligible backups for automation

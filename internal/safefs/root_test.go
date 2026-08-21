@@ -1,6 +1,7 @@
 package safefs
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -73,6 +74,64 @@ func TestRemoveDoesNotDeleteReplacementAfterIdentityValidation(t *testing.T) {
 	got, err := os.ReadFile(path)
 	if err != nil || string(got) != "replacement" {
 		t.Fatalf("replacement was removed after validation: %q, %v (inspected %v)", got, err, inspected)
+	}
+}
+
+func TestCopyAtomicInfoRunsAfterRenameAndReturnsRestoredIdentity(t *testing.T) {
+	rootPath := t.TempDir()
+	root, err := Open(rootPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+
+	const restored = "restored bytes"
+	const attacker = "attacker bytes"
+	callbackCalled := false
+	var restoredIdentity os.FileInfo
+	identity, err := CopyAtomicInfo(root, "target", bytes.NewReader([]byte(restored)), 0o600, ".tmp-", func() error {
+		callbackCalled = true
+		path := filepath.Join(rootPath, "target")
+		got, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		if string(got) != restored {
+			t.Fatalf("callback saw %q, want restored bytes", got)
+		}
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			return statErr
+		}
+		if mode := info.Mode().Perm(); mode != 0o600 {
+			t.Fatalf("restored mode = %o, want 600", mode)
+		}
+		restoredIdentity = info
+		tmp := filepath.Join(rootPath, ".attacker")
+		if err := os.WriteFile(tmp, []byte(attacker), 0o644); err != nil {
+			return err
+		}
+		return os.Rename(tmp, path)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !callbackCalled {
+		t.Fatal("after-rename callback was not called")
+	}
+	if restoredIdentity == nil || !os.SameFile(identity, restoredIdentity) {
+		t.Fatal("CopyAtomicInfo returned the attacker identity instead of the restored identity")
+	}
+	got, err := os.ReadFile(filepath.Join(rootPath, "target"))
+	if err != nil || string(got) != attacker {
+		t.Fatalf("final target = %q, %v; want attacker bytes", got, err)
+	}
+	info, err := os.Stat(filepath.Join(rootPath, "target"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := info.Mode().Perm(); mode != 0o644 {
+		t.Fatalf("attacker mode = %o, want 644", mode)
 	}
 }
 

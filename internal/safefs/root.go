@@ -374,17 +374,25 @@ func WriteAtomic(root *os.Root, name string, data []byte, perm os.FileMode, pref
 }
 
 func CopyAtomic(root *os.Root, name string, r io.Reader, perm os.FileMode, prefix string) error {
+	_, err := CopyAtomicInfo(root, name, r, perm, prefix, nil)
+	return err
+}
+
+// CopyAtomicInfo copies r to name by atomically renaming a temporary file and
+// returns the temporary file's identity captured before it is closed and
+// renamed.
+func CopyAtomicInfo(root *os.Root, name string, r io.Reader, perm os.FileMode, prefix string, afterRename func() error) (os.FileInfo, error) {
 	name, err := Relative(name)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	dir := filepath.ToSlash(filepath.Dir(name))
 	if err = root.MkdirAll(dir, 0o700); err != nil {
-		return err
+		return nil, err
 	}
 	tmpName, tmp, err := temp(root, dir, prefix)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer root.Remove(tmpName)
 	if err = tmp.Chmod(perm); err == nil {
@@ -393,13 +401,25 @@ func CopyAtomic(root *os.Root, name string, r io.Reader, perm os.FileMode, prefi
 	if err == nil {
 		err = tmp.Sync()
 	}
+	var identity os.FileInfo
+	if err == nil {
+		identity, err = tmp.Stat()
+	}
 	if closeErr := tmp.Close(); err == nil {
 		err = closeErr
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return root.Rename(tmpName, name)
+	if err := root.Rename(tmpName, name); err != nil {
+		return nil, err
+	}
+	if afterRename != nil {
+		if err := afterRename(); err != nil {
+			return identity, err
+		}
+	}
+	return identity, nil
 }
 
 func temp(root *os.Root, dir, prefix string) (string, *os.File, error) {

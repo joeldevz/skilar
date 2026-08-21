@@ -475,3 +475,100 @@ func TestManifestValidationAndPermissions(t *testing.T) {
 		t.Fatal("future malformed manifest accepted")
 	}
 }
+
+func TestUpgradeProvenanceFromWorkspaceToLatestEmbedded(t *testing.T) {
+	bundle := makeBundle(t, map[string]string{"skill.md": "packaged"})
+	target := t.TempDir()
+	manifestPath := filepath.Join(t.TempDir(), "ownership.json")
+	if err := os.WriteFile(filepath.Join(target, "skill.md"), []byte("local"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files := []File{{Path: "skill.md", SHA256: hashBytes([]byte("packaged"))}}
+	old := Manifest{
+		Version:       ManifestVersion,
+		Source:        "skills",
+		SourceKind:    "bundle",
+		BundleVersion: "workspace",
+		BundleCommit:  "old-commit",
+		Package:       "skills",
+		Target:        "opencode",
+		Files:         files,
+	}
+	old.TreeSHA256 = canonicalManifestTreeHash(old)
+	if err := os.WriteFile(manifestPath, mustJSON(t, old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	report := inspectBundle(t, bundle, target, manifestPath)
+	entry := findEntry(report, "skill.md")
+	if entry.Status != Modified {
+		t.Fatalf("expected modified entry for bound decision: %+v", report.Entries)
+	}
+	metadata := Manifest{Source: "skills", SourceKind: "bundle", BundleVersion: "latest", BundleCommit: "embedded", Package: "skills", Target: "opencode"}
+	decision := map[string]Decision{"skill.md": BindDecision(entry.Path, Replace, entry.LocalSHA256, entry.BundleSHA256, entry.BundleTreeSHA256)}
+	if err := Apply(os.DirFS(bundle), target, manifestPath, report, decision, metadata); err != nil {
+		t.Fatalf("valid workspace ownership upgrade rejected: %v", err)
+	}
+	installed, err := os.ReadFile(filepath.Join(target, "skill.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(installed) != "packaged" {
+		t.Fatalf("bound replace did not install inspected bundle: %q", installed)
+	}
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := ParseManifest(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Source != metadata.Source || got.SourceKind != metadata.SourceKind || got.BundleVersion != metadata.BundleVersion || got.BundleCommit != metadata.BundleCommit || got.Package != metadata.Package || got.Target != metadata.Target {
+		t.Fatalf("manifest did not record upgraded provenance: got=%+v want=%+v", got, metadata)
+	}
+	if !reflect.DeepEqual(got.Files, files) {
+		t.Fatalf("manifest files were not bound to inspected bundle: got=%+v want=%+v", got.Files, files)
+	}
+	wantTree := metadata
+	wantTree.Version = ManifestVersion
+	wantTree.Files = files
+	wantTree.TreeSHA256 = canonicalManifestTreeHash(wantTree)
+	if got.TreeSHA256 != wantTree.TreeSHA256 {
+		t.Fatalf("manifest tree hash was not bound to inspected bundle: got=%s want=%s", got.TreeSHA256, wantTree.TreeSHA256)
+	}
+}
+
+func TestRejectProvenanceStableIdentityMismatch(t *testing.T) {
+	base := Manifest{Version: ManifestVersion, Source: "skills", SourceKind: "bundle", BundleVersion: "workspace", BundleCommit: "old-commit", Package: "skills", Target: "opencode"}
+	cases := []struct {
+		name   string
+		mutate func(*Manifest)
+	}{
+		{"source", func(m *Manifest) { m.Source = "different-source" }},
+		{"source kind", func(m *Manifest) { m.SourceKind = "different-kind" }},
+		{"package", func(m *Manifest) { m.Package = "different-package" }},
+		{"target", func(m *Manifest) { m.Target = "different-target" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			bundle := makeBundle(t, map[string]string{"skill.md": "packaged"})
+			target := t.TempDir()
+			manifestPath := filepath.Join(t.TempDir(), "ownership.json")
+			old := base
+			old.Files = []File{{Path: "skill.md", SHA256: hashBytes([]byte("packaged"))}}
+			old.TreeSHA256 = canonicalManifestTreeHash(old)
+			if err := os.WriteFile(manifestPath, mustJSON(t, old), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			report := inspectBundle(t, bundle, target, manifestPath)
+			metadata := Manifest{Source: "skills", SourceKind: "bundle", BundleVersion: "latest", BundleCommit: "embedded", Package: "skills", Target: "opencode"}
+			tc.mutate(&metadata)
+			if err := Apply(os.DirFS(bundle), target, manifestPath, report, nil, metadata); err == nil {
+				t.Fatalf("%s provenance mismatch was accepted", tc.name)
+			} else if !strings.Contains(err.Error(), "provenance") {
+				t.Fatalf("%s mismatch returned unrelated error: %v", tc.name, err)
+			}
+		})
+	}
+}

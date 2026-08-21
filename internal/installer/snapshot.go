@@ -103,10 +103,12 @@ var ErrSnapshotCapacity = errors.New("snapshot capacity reached")
 
 // Private test seam. Production callers cannot influence snapshot ordering or recovery.
 var snapshotHooks struct {
-	BeforeMutate      func() error
-	BeforeRollback    func() error
-	BeforeRestore     func(string) error
-	BeforePayloadCopy func() error
+	BeforeMutate       func() error
+	BeforeRollback     func() error
+	BeforeRestore      func(string) error
+	AfterRestore       func(string) error
+	AfterRestoreRename func(string) error
+	BeforePayloadCopy  func() error
 }
 
 // Apply snapshots all plan roots, runs mutate, and restores the snapshot on failure.
@@ -680,11 +682,41 @@ func (s *snapshotState) rollback() error {
 			errs = append(errs, err)
 			break
 		}
-		if err := restoreEntry(s, e); err != nil {
+		restoredIdentity, err := restoreEntry(s, e)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if snapshotHooks.AfterRestore != nil {
+			if err := snapshotHooks.AfterRestore(e.Path); err != nil {
+				errs = append(errs, err)
+				break
+			}
+		}
+		if err := refreshRestoredRootIdentity(s, e, restoredIdentity); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func refreshRestoredRootIdentity(s *snapshotState, e snapshotEntry, expected os.FileInfo) error {
+	if e.Kind != "file" {
+		return nil
+	}
+	path, ok := s.rooted[e.Path]
+	if !ok {
+		return nil
+	}
+	identity, err := path.parent.Lstat(path.name)
+	if err != nil {
+		return err
+	}
+	if expected == nil || !identity.Mode().IsRegular() || !os.SameFile(expected, identity) {
+		return fmt.Errorf("snapshot: refusing rollback of replaced root %q", path.name)
+	}
+	path.identity = identity
+	return nil
 }
 
 func validateRetainedRoots(s *snapshotState) error {
@@ -778,10 +810,10 @@ func removeCreatedDir(root *safefs.Root, dir, absolute string, preserved map[str
 	return nil
 }
 
-func restoreEntry(s *snapshotState, e snapshotEntry) error {
+func restoreEntry(s *snapshotState, e snapshotEntry) (os.FileInfo, error) {
 	basePath, base, rel, err := retainedLocation(s, e.Path)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	_ = basePath
 	root := base.parent
@@ -789,7 +821,7 @@ func restoreEntry(s *snapshotState, e snapshotEntry) error {
 	if rel != "." {
 		opened, openErr := root.OpenRoot(name)
 		if openErr != nil {
-			return openErr
+			return nil, openErr
 		}
 		defer opened.Close()
 		root = opened
@@ -797,11 +829,11 @@ func restoreEntry(s *snapshotState, e snapshotEntry) error {
 	}
 	if e.Kind == "dir" {
 		if err := root.MkdirAll(name, 0o700); err != nil {
-			return err
+			return nil, err
 		}
 		opened, err := root.Open(name)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		info, err := opened.Stat()
 		if err == nil && !info.IsDir() {
@@ -811,42 +843,44 @@ func restoreEntry(s *snapshotState, e snapshotEntry) error {
 			err = opened.Chmod(os.FileMode(e.Mode))
 		}
 		_ = opened.Close()
-		return err
+		return nil, err
 	}
 	if e.Kind == "symlink" {
-		return root.Symlink(e.SymlinkTarget, name)
+		return nil, root.Symlink(e.SymlinkTarget, name)
 	}
 	if e.Kind != "file" {
-		return nil
+		return nil, nil
 	}
 	in, err := s.payloadRoot.Open(e.Payload)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer in.Close()
 	if existing, statErr := root.Open(name); statErr == nil {
 		info, infoErr := existing.Stat()
 		_ = existing.Close()
 		if infoErr != nil {
-			return infoErr
+			return nil, infoErr
 		}
 		if info.Mode().IsRegular() {
 			if !safefs.SingleLink(info) {
-				return fmt.Errorf("snapshot: refusing hard-linked restore destination %q", e.Path)
+				return nil, fmt.Errorf("snapshot: refusing hard-linked restore destination %q", e.Path)
 			}
 		}
 	} else if !errors.Is(statErr, os.ErrNotExist) {
-		return statErr
+		return nil, statErr
 	}
-	if err := safefs.CopyAtomic(root, name, in, os.FileMode(e.Mode), ".skynex-restore-"); err != nil {
-		return err
+	var afterRename func() error
+	if snapshotHooks.AfterRestoreRename != nil {
+		afterRename = func() error {
+			return snapshotHooks.AfterRestoreRename(e.Path)
+		}
 	}
-	opened, err := root.Open(name)
+	restoredIdentity, err := safefs.CopyAtomicInfo(root, name, in, os.FileMode(e.Mode), ".skynex-restore-", afterRename)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer opened.Close()
-	return opened.Chmod(os.FileMode(e.Mode))
+	return restoredIdentity, nil
 }
 
 func retainedLocation(s *snapshotState, path string) (string, *rootedPath, string, error) {

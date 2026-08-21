@@ -312,7 +312,7 @@ func (s *Session) Apply(report Report, decisions map[string]Decision, metadata M
 	if current.Manifest != nil && (metadata.Source == "" || metadata.SourceKind == "" || metadata.BundleVersion == "" || metadata.Package == "" || metadata.Target == "") {
 		return errors.New("ownership manifest update requires complete source metadata")
 	}
-	if current.Manifest != nil && (current.Manifest.Source != metadata.Source || current.Manifest.SourceKind != metadata.SourceKind || current.Manifest.BundleVersion != metadata.BundleVersion || current.Manifest.BundleCommit != metadata.BundleCommit || current.Manifest.Package != metadata.Package || current.Manifest.Target != metadata.Target) {
+	if current.Manifest != nil && (current.Manifest.Source != metadata.Source || current.Manifest.SourceKind != metadata.SourceKind || current.Manifest.Package != metadata.Package || current.Manifest.Target != metadata.Target) {
 		return errors.New("ownership manifest provenance does not match current source")
 	}
 	for _, e := range report.Entries {

@@ -100,7 +100,7 @@ while ($true) { $c = $l.GetContext(); if ($c.Request.Url.AbsolutePath -eq '/api/
   if ($LASTEXITCODE -eq 0 -or (Test-Path $missingReadmeDest)) { throw 'Windows installer accepted an archive missing README.md or mutated the destination' }
 
   $extraArchive = Join-Path $tmp 'extra-member.zip'
-  $extra = Join-Path $tmp 'extra.txt'; Set-Content -Encoding utf8 -NoNewline $extra 'unexpected'
+  $extra = Join-Path $tmp 'extra.txt'; Set-Content -Path $extra -Value 'unexpected' -Encoding utf8 -NoNewline
   $zip = [IO.Compression.ZipFile]::Open($extraArchive, [IO.Compression.ZipArchiveMode]::Create)
   try {
     [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $fakeExe, 'skynex.exe') | Out-Null

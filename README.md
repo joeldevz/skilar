@@ -68,7 +68,7 @@ Tres conceptos:
 Para una prueba rápida en Windows, abre PowerShell y ejecuta:
 
 ```powershell
-$p = "$env:TEMP\skynex-install-v2.1.2.ps1"; Invoke-WebRequest "https://github.com/joeldevz/skynex/releases/download/v2.1.2/install.ps1" -OutFile $p; if ((Get-FileHash $p -Algorithm SHA256).Hash -ne "2EA8AE510CD3B5BDE5988A6C94752BB109930B8D12A01EE3D6D49904B1E3C29A") { Remove-Item $p -Force; throw "Invalid installer checksum" }; Unblock-File $p; & $p
+$p = Join-Path ([IO.Path]::GetTempPath()) ("skynex-install-" + [guid]::NewGuid() + ".ps1"); Invoke-WebRequest "https://github.com/joeldevz/skynex/releases/download/v2.1.2/install.ps1" -OutFile $p; if ((Get-FileHash $p -Algorithm SHA256).Hash -ne "2EA8AE510CD3B5BDE5988A6C94752BB109930B8D12A01EE3D6D49904B1E3C29A") { Remove-Item $p -Force; throw "Invalid installer checksum" }; Unblock-File $p; & $p
 ```
 
 > Este comando fija la versión `v2.1.2` y comprueba el SHA-256 del instalador

@@ -65,10 +65,21 @@ Tres conceptos:
 
 ### Windows (PowerShell)
 
+Para una prueba rápida en Windows, abre PowerShell y ejecuta:
+
 ```powershell
-# Download install.ps1 and its signature from a tagged release, verify first,
-# then run the local script.
-./install.ps1
+Invoke-WebRequest "https://github.com/joeldevz/skynex/releases/latest/download/install.ps1" -OutFile "$env:TEMP\skynex-install.ps1"; powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\skynex-install.ps1"
+```
+
+> Este comando es solo para una prueba rápida y no verifica la firma del propio
+> script antes de ejecutarlo. Para una instalación verificada, descarga
+> `install.ps1` y `install.ps1.sig` desde la release y comprueba la firma con
+> `release/trust/skynex-release-signing-key.pub`.
+
+Después verifica la instalación:
+
+```powershell
+& "$env:LOCALAPPDATA\skynex\bin\skynex.exe" version
 ```
 
 ### Homebrew (macOS / Linux, explicit delegated trust)

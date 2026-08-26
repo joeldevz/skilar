@@ -2,7 +2,11 @@ package main
 
 import (
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -153,6 +157,39 @@ func TestRunInstallNonInteractivePreflightErrorPreventsApply(t *testing.T) {
 	}
 }
 
+func TestRunInstallPreDependencyFailureIsFatalAndDoesNotMutate(t *testing.T) {
+	stateDir := t.TempDir()
+	marker := filepath.Join(stateDir, "must-not-be-created")
+	events := []string{}
+	deps := installTestDeps(&events)
+	deps.preflight = func(*models.InstallRequest, *models.Catalog, preflight.Options) []*models.ValidationIssue {
+		events = append(events, "preflight-failed")
+		return []*models.ValidationIssue{{Level: "error", Message: "invalid target"}}
+	}
+	deps.apply = func(*installer.Plan, func() error) error {
+		events = append(events, "MUTATION")
+		return os.WriteFile(marker, []byte("unexpected"), 0o600)
+	}
+	deps.setupDependencies = func(string, bool) error {
+		events = append(events, "DEPENDENCY")
+		return nil
+	}
+	args := &cliArgs{Packages: []string{"pkg"}, Targets: []string{"opencode"},
+		Versions: map[string]string{"pkg": "latest"}, NonInteractive: true, Yes: true, StateDir: stateDir}
+	if err := runInstall(args, deps); err == nil {
+		t.Fatal("pre-dependency failure must be fatal")
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("pre-dependency failure mutated state: stat=%v", err)
+	}
+	if strings.Contains(strings.Join(events, ","), "MUTATION") {
+		t.Fatalf("mutation event observed: %v", events)
+	}
+	if strings.Contains(strings.Join(events, ","), "DEPENDENCY") {
+		t.Fatalf("dependency setup attempted before pre-commit failure: %v", events)
+	}
+}
+
 func TestRunInstallApplyCallbackErrorPropagates(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	events := []string{}
@@ -219,6 +256,126 @@ func TestInstallSummaryStableSuccessNoopNeuroxAndSnapshot(t *testing.T) {
 	}
 	if strings.Contains(noop.String(), "Installation complete") || !strings.Contains(noop.String(), "Nothing changed") || !strings.Contains(noop.String(), "Neurox: preserved") {
 		t.Fatalf("bad no-op summary: %s", noop.String())
+	}
+}
+
+func TestPartialDependencyFailureCommitsOnceRetainsFilesAndReportsDeterministically(t *testing.T) {
+	stateDir, opencodeDir := t.TempDir(), t.TempDir()
+	managed := filepath.Join(opencodeDir, "managed.json")
+	config, state := filepath.Join(stateDir, "skills.config.json"), filepath.Join(stateDir, "skills.lock.json")
+	const managedContents = "managed OpenCode content\n"
+	const configContents = "retained config state\n"
+	const stateContents = "retained lock state\n"
+	events := []string{}
+	deps := installTestDeps(&events)
+	deps.opencodeDir = func() string { return opencodeDir }
+	deps.setupDependencies = func(target string, trust bool) error {
+		events = append(events, "dependency:"+target+":trust="+strconv.FormatBool(trust))
+		return errors.New("dependency manager unavailable")
+	}
+	deps.apply = func(_ *installer.Plan, _ func() error) error {
+		events = append(events, "apply")
+		if err := os.WriteFile(managed, []byte(managedContents), 0o600); err != nil {
+			return err
+		}
+		if err := os.WriteFile(config, []byte(configContents), 0o600); err != nil {
+			return err
+		}
+		if err := os.WriteFile(state, []byte(stateContents), 0o600); err != nil {
+			return err
+		}
+		events = append(events, "committed")
+		return nil
+	}
+	var output strings.Builder
+	deps.output, deps.errorOutput = &output, &output
+	args := &cliArgs{Packages: []string{"pkg"}, Targets: []string{"opencode"}, Versions: map[string]string{"pkg": "latest"}, NonInteractive: true, Yes: true, StateDir: stateDir}
+	if err := runInstall(args, deps); err != nil {
+		t.Fatalf("dependency failure must be nonfatal: %v", err)
+	}
+	if got, _ := os.ReadFile(managed); string(got) != managedContents {
+		t.Fatalf("managed contents = %q", got)
+	}
+	if got, _ := os.ReadFile(config); string(got) != configContents {
+		t.Fatalf("config contents = %q", got)
+	}
+	if got, _ := os.ReadFile(state); string(got) != stateContents {
+		t.Fatalf("state contents = %q", got)
+	}
+	wantEvents := []string{"catalog", "config", "preflight", "apply", "committed", "dependency:opencode:trust=false"}
+	if !reflect.DeepEqual(events, wantEvents) {
+		t.Fatalf("events = %v, want %v", events, wantEvents)
+	}
+	wantOutput := fmt.Sprintf("⚠ Installation partially complete.\nTargets:\n  - opencode -> %s\nIntegrations:\n  - Neurox: preserved\nState files:\n  - %s\n  - %s\nCleanup: not requested\nRetry dependencies with: skynex deps\n", opencodeDir, config, state)
+	if output.String() != wantOutput {
+		t.Fatalf("summary = %q, want %q", output.String(), wantOutput)
+	}
+}
+
+func TestDependencySetupSucceedsAfterCommitWithDeterministicCompletion(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		trust bool
+	}{
+		{name: "default trust is false"},
+		{name: "explicit trust", trust: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			events := []string{}
+			deps := installTestDeps(&events)
+			stateDir, opencodeDir := t.TempDir(), t.TempDir()
+			managed := filepath.Join(opencodeDir, "managed.json")
+			config, state := filepath.Join(stateDir, "skills.config.json"), filepath.Join(stateDir, "skills.lock.json")
+			deps.opencodeDir = func() string { return opencodeDir }
+			deps.apply = func(_ *installer.Plan, _ func() error) error {
+				events = append(events, "apply")
+				if err := os.WriteFile(managed, []byte("managed OpenCode content\n"), 0o600); err != nil {
+					return err
+				}
+				if err := os.WriteFile(config, []byte("retained config state\n"), 0o600); err != nil {
+					return err
+				}
+				if err := os.WriteFile(state, []byte("retained lock state\n"), 0o600); err != nil {
+					return err
+				}
+				events = append(events, "committed")
+				return nil
+			}
+			var calls []string
+			deps.setupDependencies = func(target string, trust bool) error {
+				calls = append(calls, target+":trust="+strconv.FormatBool(trust))
+				events = append(events, "dependency-success")
+				return nil
+			}
+			var output strings.Builder
+			deps.output, deps.errorOutput = &output, &output
+			args := &cliArgs{Packages: []string{"pkg"}, Targets: []string{"opencode"},
+				Versions: map[string]string{"pkg": "latest"}, NonInteractive: true, Yes: true,
+				TrustScripts: tc.trust, StateDir: stateDir}
+			if err := runInstall(args, deps); err != nil {
+				t.Fatalf("successful dependency setup failed: %v", err)
+			}
+			if !reflect.DeepEqual(events, []string{"catalog", "config", "preflight", "apply", "committed", "dependency-success"}) {
+				t.Fatalf("events=%v, want commit then one dependency attempt", events)
+			}
+			if got, _ := os.ReadFile(managed); string(got) != "managed OpenCode content\n" {
+				t.Fatalf("managed contents = %q", got)
+			}
+			if got, _ := os.ReadFile(filepath.Join(stateDir, "skills.config.json")); string(got) != "retained config state\n" {
+				t.Fatalf("config contents = %q", got)
+			}
+			if got, _ := os.ReadFile(state); string(got) != "retained lock state\n" {
+				t.Fatalf("state contents = %q", got)
+			}
+			wantCall := "opencode:trust=" + strconv.FormatBool(tc.trust)
+			if !reflect.DeepEqual(calls, []string{wantCall}) {
+				t.Fatalf("dependency calls=%v, want [%s]", calls, wantCall)
+			}
+			wantOutput := fmt.Sprintf("✓ Installation complete.\nTargets:\n  - opencode -> %s\nIntegrations:\n  - Neurox: preserved\nState files:\n  - %s\n  - %s\nCleanup: not requested\n", opencodeDir, config, state)
+			if output.String() != wantOutput {
+				t.Fatalf("completion output=%q, want %q", output.String(), wantOutput)
+			}
+		})
 	}
 }
 

@@ -1,13 +1,16 @@
 package adapters
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 
+	"github.com/joeldevz/skynex/internal/assets"
 	"github.com/joeldevz/skynex/internal/models"
 	"github.com/joeldevz/skynex/internal/prompts"
 	"github.com/joeldevz/skynex/internal/safefs"
@@ -128,27 +131,8 @@ func InstallOpencodeWithReporterAndOptions(srcDir string, req *models.InstallReq
 	installedPath := filepath.Join(target, "opencode.json")
 	if err := mergeOpencodeConfigForNeurox(installedPath, backupConfig, req != nil && req.NeuroxEnabled, reporter); err != nil {
 		reporter.Warning("MCP merge failed: %v", err)
-	}
-
-	// Install JS dependencies (bun or npm)
-	reporter.Detail("Installing OpenCode dependencies...")
-	identity, err := validateInstallDestinationTreeIdentity(target)
-	if err != nil {
-		return fmt.Errorf("revalidate opencode install destination before dependencies: %w", err)
-	}
-	if identity == nil {
-		return fmt.Errorf("revalidate opencode install destination before dependencies: destination disappeared")
-	}
-	current, statErr := os.Lstat(target)
-	if statErr != nil || !os.SameFile(identity, current) || identity.Mode().Type() != current.Mode().Type() {
-		if statErr == nil {
-			statErr = fmt.Errorf("directory identity changed")
-		}
-		return fmt.Errorf("revalidate opencode install destination before dependencies: %w", statErr)
-	}
-	if err := installJSDepsWithReporter(target, req != nil && req.TrustSetupScripts, reporter); err != nil {
-		reporter.Warning("dependency install failed: %v", err)
-		return fmt.Errorf("OpenCode dependency install failed: %w (managed config/skills rolled back; dependencies may require rerun: cd %s && bun install)", err, target)
+	} else if err := refreshInventoryDigest(target, "opencode.json"); err != nil {
+		return fmt.Errorf("refresh managed inventory: %w", err)
 	}
 
 	// Deprecated entries are informational only. Never delete them implicitly.
@@ -162,6 +146,77 @@ func InstallOpencodeWithReporterAndOptions(srcDir string, req *models.InstallReq
 	}
 
 	reporter.Detail("OpenCode installed at %s", target)
+	return nil
+}
+
+// SetupOpenCodeDependencies installs only the JavaScript dependencies for an
+// already committed, managed OpenCode target.
+func SetupOpenCodeDependencies(dir string, trustScripts bool) error {
+	return installJSDepsWithReporter(dir, trustScripts, discardReporter())
+}
+
+// ValidateManagedOpenCode verifies the minimal canonical inventory marker and
+// every owned file before allowing a dependency retry.
+func ValidateManagedOpenCode(dir string) error {
+	identity, err := validateInstallDestinationTreeIdentity(dir)
+	if err != nil {
+		return err
+	}
+	if identity == nil || !identity.IsDir() {
+		return fmt.Errorf("not a directory")
+	}
+	root, err := safefs.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	manifest, err := safefs.ReadFileVerified(root, inventoryName, maxOwnedFileBytes)
+	if err != nil {
+		return err
+	}
+	var value struct {
+		Version *int              `json:"version"`
+		Files   map[string]string `json:"files"`
+	}
+	if err := json.Unmarshal(manifest, &value); err != nil || (value.Version != nil && *value.Version != 1) || len(value.Files) == 0 {
+		return fmt.Errorf("invalid managed inventory")
+	}
+	if _, ok := value.Files["opencode.json"]; !ok {
+		return fmt.Errorf("managed configuration is missing")
+	}
+	for path, digest := range value.Files {
+		clean, pathErr := safefs.Relative(path)
+		if path == inventoryName || pathErr != nil || clean != path {
+			return fmt.Errorf("invalid managed inventory path")
+		}
+		info, err := root.Lstat(clean)
+		if err != nil || !info.Mode().IsRegular() {
+			return fmt.Errorf("managed file %q is invalid", path)
+		}
+		raw, err := safefs.ReadFileVerified(root, clean, maxOwnedFileBytes)
+		if err != nil || len(raw) == 0 || fileDigest(raw) != digest {
+			return fmt.Errorf("managed file %q is invalid", path)
+		}
+	}
+	// Dependency metadata is authenticated by the bundle, not by the target's
+	// manifest (which an attacker can rewrite along with the files).
+	bundle, err := assets.OpencodeFS()
+	if err != nil {
+		return err
+	}
+	for _, path := range []string{"package.json", "bun.lock", "pnpm-lock.yaml", "package-lock.json"} {
+		expected, readErr := fs.ReadFile(bundle, path)
+		if readErr != nil {
+			if os.IsNotExist(readErr) {
+				continue
+			}
+			return readErr
+		}
+		actual, readErr := safefs.ReadFileVerified(root, path, maxOwnedFileBytes)
+		if readErr != nil || !bytes.Equal(actual, expected) {
+			return fmt.Errorf("managed file %q is not the shipped OpenCode bundle", path)
+		}
+	}
 	return nil
 }
 
@@ -258,17 +313,26 @@ func installJSDepsWithReporter(dir string, trustScripts bool, reporter Reporter)
 		return fmt.Errorf("validate dependency install destination: destination disappeared")
 	}
 	var cmd *exec.Cmd
+	manager := ""
 	if _, err := exec.LookPath("bun"); err == nil {
-		cmd = exec.Command("bun", "install", "--silent", "--ignore-scripts")
+		manager = "bun"
+		cmd = exec.Command("bun", "install", "--frozen-lockfile", "--silent", "--ignore-scripts")
+	} else if _, err := exec.LookPath("pnpm"); err == nil {
+		manager = "pnpm"
+		cmd = exec.Command("pnpm", "install", "--frozen-lockfile", "--silent", "--ignore-scripts")
 	} else if _, err := exec.LookPath("npm"); err == nil {
-		cmd = exec.Command("npm", "install", "--silent", "--ignore-scripts")
+		manager = "npm"
+		cmd = exec.Command("npm", "ci", "--silent", "--ignore-scripts")
 	} else {
-		return fmt.Errorf("neither bun nor npm found")
+		return fmt.Errorf("no supported JavaScript package manager found (bun, pnpm, or npm); install bun, pnpm, or npm and try again")
 	}
 	if beforeInstallCwdOpen != nil {
 		if err := beforeInstallCwdOpen(); err != nil {
 			return fmt.Errorf("prepare dependency install directory: %w", err)
 		}
+	}
+	if err := validateCommittedDependencyMetadata(dir, manager); err != nil {
+		return err
 	}
 	cwd, err := openInstallCwd(dir, identity)
 	if err != nil {

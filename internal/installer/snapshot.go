@@ -375,7 +375,7 @@ func prepareSnapshot(roots []string, stateDir, opencodeDir string) (*snapshotSta
 	return s, nil
 }
 
-func capture(handle *rootedPath, root string, skipSnapshots, skipNodeModules bool, payloadRoot *safefs.Root, limits *snapshotLimits) ([]snapshotEntry, error) {
+func capture(handle *rootedPath, root string, skipSnapshots, skipOpenCodeCodeCache bool, payloadRoot *safefs.Root, limits *snapshotLimits) ([]snapshotEntry, error) {
 	parent, name := handle.parent, handle.name
 	f, err := parent.Open(name)
 	if errors.Is(err, os.ErrNotExist) {
@@ -420,13 +420,13 @@ func capture(handle *rootedPath, root string, skipSnapshots, skipNodeModules boo
 		_ = f.Close()
 		return nil, err
 	}
-	result, walkErr := captureDir(root, dirRoot, payloadRoot, entries, skipSnapshots, skipNodeModules, limits)
+	result, walkErr := captureDir(root, dirRoot, payloadRoot, entries, skipSnapshots, skipOpenCodeCodeCache, limits)
 	_ = dirRoot.Close()
 	_ = f.Close()
 	return result, walkErr
 }
 
-func captureDir(root string, dirRoot, payloadRoot *safefs.Root, entries []snapshotEntry, skipSnapshots, skipNodeModules bool, limits *snapshotLimits) ([]snapshotEntry, error) {
+func captureDir(root string, dirRoot, payloadRoot *safefs.Root, entries []snapshotEntry, skipSnapshots, skipOpenCodeCodeCache bool, limits *snapshotLimits) ([]snapshotEntry, error) {
 	err := fs.WalkDir(dirRoot.FS(), ".", func(path string, de fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -441,7 +441,7 @@ func captureDir(root string, dirRoot, payloadRoot *safefs.Root, entries []snapsh
 			}
 			return nil
 		}
-		if rel == "node_modules" && skipNodeModules {
+		if skipOpenCodeCodeCache && skipOpenCodeCodeCachePath(rel) {
 			if de.IsDir() {
 				return filepath.SkipDir
 			}
@@ -488,6 +488,11 @@ func captureDir(root string, dirRoot, payloadRoot *safefs.Root, entries []snapsh
 		return nil
 	})
 	return entries, err
+}
+
+func skipOpenCodeCodeCachePath(rel string) bool {
+	codeCache := filepath.Join("EBWebView", "Default", "Code Cache")
+	return rel == codeCache || strings.HasPrefix(rel, codeCache+string(filepath.Separator))
 }
 
 func fileKind(info os.FileInfo) string {

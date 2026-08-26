@@ -87,6 +87,13 @@ func main() {
 		handleBackup(args)
 		os.Exit(0)
 	}
+	if args.Deps {
+		if err := runDeps(args, dependencyDependencies{output: os.Stdout}); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if args.Uninstall {
 		if err := runUninstall(args); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -280,6 +287,7 @@ type cliArgs struct {
 	CleanupDeprecated bool
 	DryRun            bool
 	Uninstall         bool
+	Deps              bool
 	Verbose           bool
 	Force             bool
 	BackupCommand     string
@@ -316,6 +324,8 @@ func parseArgsFrom(osArgs []string) *cliArgs {
 			args.Doctor = true
 		case "install":
 			args.Install = true
+		case "deps":
+			args.Deps = true
 		case "uninstall":
 			args.Uninstall = true
 		case "backup":
@@ -494,6 +504,28 @@ func parseArgsFrom(osArgs []string) *cliArgs {
 	return args
 }
 
+type dispatchDependencies struct {
+	install func() error
+	update  func() error
+	deps    func() error
+}
+
+func dispatch(args *cliArgs, deps dispatchDependencies) error {
+	if args == nil {
+		return errors.New("arguments are required")
+	}
+	if args.Deps {
+		return deps.deps()
+	}
+	if args.Install {
+		return deps.install()
+	}
+	if args.Update {
+		return deps.update()
+	}
+	return nil
+}
+
 func isFlag(s string) bool {
 	return len(s) > 0 && s[0] == '-'
 }
@@ -559,7 +591,7 @@ func resolveNonInteractive(args *cliArgs, cat *models.Catalog, cfg map[string]in
 		CleanupDeprecated:  args.CleanupDeprecated,
 		TrustSetupScripts:  args.TrustScripts,
 		NeuroxEnabled:      !args.WithoutNeurox,
-		NeuroxSelectionSet: true,
+		NeuroxSelectionSet: args.WithNeurox || args.WithoutNeurox,
 	}
 
 	return req, nil
@@ -1017,6 +1049,7 @@ func printUsage() {
 Commands:
   workflow <command>      Inspect or control managed workflows
   install                 Interactive installer (TUI)
+	deps                    Install OpenCode dependencies for a managed target
   uninstall               Remove only unchanged skynex-owned files (--dry-run, --yes, --state-dir)
   backup list              List retained recovery backups
   backup prune             Remove eligible backups (interactive)

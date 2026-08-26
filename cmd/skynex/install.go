@@ -41,6 +41,7 @@ type installDependencies struct {
 	chooseBackupCapacity func(string, bool) prompts.BackupCapacityChoice
 	exactCurrent         func(string, string) bool
 	exactRequestCurrent  func(string, string, *models.InstallRequest) bool
+	setupDependencies    func(string, bool) error
 }
 
 func formatSnapshotSize(size int64) string {
@@ -76,6 +77,12 @@ func productionInstallDependencies() installDependencies {
 		},
 		exactCurrent:        isExactEmbeddedInstall,
 		exactRequestCurrent: isExactRequestedEmbeddedInstall,
+		setupDependencies: func(target string, trust bool) error {
+			if target == "opencode" {
+				target = paths.OpencodeDir()
+			}
+			return adapters.SetupOpenCodeDependencies(target, trust)
+		},
 	}
 }
 
@@ -277,8 +284,54 @@ func runInstall(args *cliArgs, deps installDependencies) error {
 	}); err != nil {
 		return err
 	}
+	for _, target := range request.Targets {
+		if target == "opencode" {
+			if deps.setupDependencies == nil {
+				break
+			}
+			if err := deps.setupDependencies("opencode", request.TrustSetupScripts); err != nil {
+				return renderPartialInstallSummary(deps.output, request, plan)
+			}
+			break
+		}
+	}
 	afterSnapshots, _ := deps.listSnapshots(stateDir)
 	return renderInstallSummary(deps.output, request, plan, results, issues, newSnapshot(beforeSnapshots, afterSnapshots))
+}
+
+func renderPartialInstallSummary(out io.Writer, request *models.InstallRequest, plan *installer.Plan) error {
+	fmt.Fprintln(out, "⚠ Installation partially complete.")
+	for _, op := range plan.Operations {
+		if op.Kind == installer.InstallTarget {
+			fmt.Fprintf(out, "Targets:\n  - %s -> %s\n", op.Target, op.Destination)
+			break
+		}
+	}
+	neurox := "preserved"
+	if request.NeuroxSelectionSet {
+		if request.NeuroxEnabled {
+			neurox = "enabled"
+		} else {
+			neurox = "disabled"
+		}
+	}
+	fmt.Fprintf(out, "Integrations:\n  - Neurox: %s\n", neurox)
+	var stateFiles []string
+	for _, op := range plan.Operations {
+		if op.Kind == installer.WriteState {
+			stateFiles = append(stateFiles, op.Destination)
+		}
+	}
+	sort.Strings(stateFiles)
+	if len(stateFiles) > 0 {
+		fmt.Fprintln(out, "State files:")
+		for _, path := range stateFiles {
+			fmt.Fprintf(out, "  - %s\n", path)
+		}
+	}
+	fmt.Fprintln(out, "Cleanup: not requested")
+	fmt.Fprintln(out, "Retry dependencies with: skynex deps")
+	return nil
 }
 
 func newSnapshot(before, after []installer.Snapshot) *installer.Snapshot {

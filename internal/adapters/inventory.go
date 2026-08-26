@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 
 	"github.com/joeldevz/skynex/internal/safefs"
+	"gopkg.in/yaml.v3"
 )
 
 type inventory struct {
@@ -19,6 +20,101 @@ type inventory struct {
 
 const inventoryName = ".skynex-manifest.json"
 const maxOwnedFileBytes = 4 << 20
+
+// refreshInventoryDigest records a post-install mutation without replacing
+// the manifest non-atomically.
+func refreshInventoryDigest(target, path string) error {
+	root, err := safefs.Open(target)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	value := loadInventoryFromRoot(root)
+	raw, err := safefs.ReadFileVerified(root, path, maxOwnedFileBytes)
+	if err != nil {
+		return err
+	}
+	value.Files[path] = fileDigest(raw)
+	manifest, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return err
+	}
+	return safefs.WriteAtomic(root, inventoryName, append(manifest, '\n'), 0o600, ".skynex-owned-")
+}
+
+func validateCommittedDependencyMetadata(dir, manager string) error {
+	root, err := safefs.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	packageRaw, err := safefs.ReadFileVerified(root, "package.json", maxOwnedFileBytes)
+	if err != nil {
+		return fmt.Errorf("read package.json: %w", err)
+	}
+	var packageValue struct {
+		Dependencies map[string]string `json:"dependencies"`
+	}
+	if err := json.Unmarshal(packageRaw, &packageValue); err != nil {
+		return fmt.Errorf("invalid package.json: %w", err)
+	}
+	lockName := map[string]string{"bun": "bun.lock", "pnpm": "pnpm-lock.yaml", "npm": "package-lock.json"}[manager]
+	lockRaw, err := safefs.ReadFileVerified(root, lockName, maxOwnedFileBytes)
+	if err != nil {
+		return fmt.Errorf("missing committed %s: %w", lockName, err)
+	}
+	var locked map[string]string
+	switch manager {
+	case "bun":
+		var value struct {
+			Workspaces map[string]struct {
+				Dependencies map[string]string `json:"dependencies"`
+			} `json:"workspaces"`
+		}
+		if err := json.Unmarshal(lockRaw, &value); err != nil {
+			return fmt.Errorf("invalid %s: %w", lockName, err)
+		}
+		locked = value.Workspaces[""].Dependencies
+	case "pnpm":
+		var value struct {
+			Importers map[string]struct {
+				Dependencies map[string]struct {
+					Specifier string `yaml:"specifier"`
+					Version   string `yaml:"version"`
+				} `yaml:"dependencies"`
+			} `yaml:"importers"`
+		}
+		if err := yaml.Unmarshal(lockRaw, &value); err != nil {
+			return fmt.Errorf("invalid %s: %w", lockName, err)
+		}
+		locked = make(map[string]string)
+		for name, dependency := range value.Importers["."].Dependencies {
+			if dependency.Specifier != dependency.Version {
+				return fmt.Errorf("mismatched %s dependency %q", lockName, name)
+			}
+			locked[name] = dependency.Specifier
+		}
+	case "npm":
+		var value struct {
+			Packages map[string]struct {
+				Dependencies map[string]string `json:"dependencies"`
+			} `json:"packages"`
+		}
+		if err := json.Unmarshal(lockRaw, &value); err != nil {
+			return fmt.Errorf("invalid %s: %w", lockName, err)
+		}
+		locked = value.Packages[""].Dependencies
+	}
+	if len(locked) != len(packageValue.Dependencies) {
+		return fmt.Errorf("%s does not match package.json dependencies", lockName)
+	}
+	for name, version := range packageValue.Dependencies {
+		if locked[name] != version {
+			return fmt.Errorf("%s does not match package.json dependency %q", lockName, name)
+		}
+	}
+	return nil
+}
 
 func fileDigest(raw []byte) string { sum := sha256.Sum256(raw); return hex.EncodeToString(sum[:]) }
 

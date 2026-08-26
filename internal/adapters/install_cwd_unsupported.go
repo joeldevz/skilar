@@ -8,7 +8,9 @@ import (
 	"os/exec"
 )
 
-type installCwd struct{}
+type installCwd struct {
+	path string
+}
 
 func openInstallCwd(string, os.FileInfo) (*installCwd, error) {
 	return nil, unsupportedInstallCwdError()

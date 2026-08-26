@@ -65,10 +65,21 @@ Tres conceptos:
 
 ### Windows (PowerShell)
 
+Para una prueba rápida en Windows, abre PowerShell y ejecuta:
+
 ```powershell
-# Download install.ps1 and its signature from a tagged release, verify first,
-# then run the local script.
-./install.ps1
+$p = Join-Path ([IO.Path]::GetTempPath()) ("skynex-install-" + [guid]::NewGuid() + ".ps1"); Invoke-WebRequest "https://github.com/joeldevz/skynex/releases/download/v2.1.2/install.ps1" -OutFile $p; if ((Get-FileHash $p -Algorithm SHA256).Hash -ne "2EA8AE510CD3B5BDE5988A6C94752BB109930B8D12A01EE3D6D49904B1E3C29A") { Remove-Item $p -Force; throw "Invalid installer checksum" }; Unblock-File $p; & $p
+```
+
+> Este comando fija la versión `v2.1.2` y comprueba el SHA-256 del instalador
+> antes de ejecutarlo. Para verificar también su firma, descarga `install.ps1`
+> y `install.ps1.sig` desde la release y usa la clave pública disponible en
+> `release/trust/skynex-release-signing-key.pub`.
+
+Después verifica la instalación:
+
+```powershell
+& "$env:LOCALAPPDATA\skynex\bin\skynex.exe" version
 ```
 
 ### Homebrew (macOS / Linux, explicit delegated trust)

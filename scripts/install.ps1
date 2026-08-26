@@ -74,13 +74,17 @@ function Test-SafeZip {
   $archive = [IO.Compression.ZipFile]::OpenRead($Path)
   try {
     $entries = @($archive.Entries)
-    if ($entries.Count -ne 1) { Stop-WithError "Archive must contain exactly one entry: $BINARY_NAME.exe" }
+    if ($entries.Count -ne 2) { Stop-WithError "Archive must contain exactly two entries: $BINARY_NAME.exe and README.md" }
+    $names = @($entries | ForEach-Object { $_.FullName.Replace('\', '/') })
+    if (-not ($names -contains "$BINARY_NAME.exe") -or -not ($names -contains "README.md")) {
+      Stop-WithError "Archive must contain exactly $BINARY_NAME.exe and README.md"
+    }
     foreach ($entry in $entries) {
       $name = $entry.FullName.Replace('\', '/')
-      if ([IO.Path]::IsPathRooted($name) -or $name -match '(^|/)\.\.?(/|$)' -or $name -ne "$BINARY_NAME.exe") {
+      if ([IO.Path]::IsPathRooted($name) -or $name -match '(^|/)\.\.?(/|$)' -or ($name -ne "$BINARY_NAME.exe" -and $name -ne "README.md")) {
         Stop-WithError "Unsafe archive member: $($entry.FullName)"
       }
-      if ($entry.FullName.EndsWith('/') -or $entry.Length -lt 1) {
+      if ($entry.FullName.EndsWith('/') -or ($entry.ExternalAttributes -band 0x10) -ne 0 -or $entry.Length -lt 1) {
         Stop-WithError "Archive member is not a non-empty regular file"
       }
       $unixType = ($entry.ExternalAttributes -shr 16) -band 0xF000
@@ -270,7 +274,7 @@ function Install-ViaBinary {
     $binaryPath = Join-Path $tmpDir "$BINARY_NAME.exe"
     $archive = [IO.Compression.ZipFile]::OpenRead($archivePath)
     try {
-      $entry = $archive.Entries[0]
+      $entry = $archive.Entries | Where-Object { $_.FullName.Replace('\', '/') -eq "$BINARY_NAME.exe" }
       $input = $entry.Open()
       try {
         $output = [IO.File]::Open($binaryPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)

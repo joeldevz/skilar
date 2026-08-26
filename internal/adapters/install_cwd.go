@@ -24,11 +24,15 @@ func runWithInstallCwd(cwd *installCwd, cmd *exec.Cmd) error {
 	if err := cwd.configure(cmd); err != nil {
 		return err
 	}
-	if err := cmd.Run(); err != nil {
-		cwd.keepAlive()
-		return err
-	}
+	runErr := cmd.Run()
 	cwd.keepAlive()
+	verifyErr := cwd.verify(cwd.path)
+	if runErr != nil {
+		return runErr
+	}
+	if verifyErr != nil {
+		return fmt.Errorf("revalidate dependency install directory after subprocess: %w", verifyErr)
+	}
 	return nil
 }
 

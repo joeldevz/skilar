@@ -19,7 +19,7 @@ usar Homebrew (confianza delegada explícita) o el binario firmado del release.
 |-----------|-------------|----------|
 | `git` | Solo workspace local | Leer el commit de un checkout local |
 | `python3` | No requerido | El instalador y el CLI son Go |
-| `bun` o `npm` | Solo OpenCode | Instalar dependencias de plugins |
+| `bun`, `pnpm` o `npm` | Solo OpenCode | Instalar dependencias de plugins; se prueban en ese orden |
 | `gh` | Opcional | Para usar `/pr` (crear pull requests desde terminal) |
 | `opencode` | Solo si usas OpenCode | CLI de OpenCode instalado |
 | `claude` | Solo si usas Claude Code | CLI de Claude Code instalado |
@@ -52,7 +52,7 @@ skynex install --non-interactive --package skills --target opencode
 ```
 
 Por defecto, el instalador instala dependencias con `--ignore-scripts`: los scripts de ciclo de vida
-de npm/Bun no se ejecutan. `--trust-setup-scripts` es un opt-in explícito que muestra una
+de npm/pnpm/Bun no se ejecutan. `--trust-setup-scripts` es un opt-in explícito que muestra una
 advertencia y permite ejecutar esos scripts; úsalo solo después de revisar las dependencias.
 Los directorios privados creados por el script usan modo `0700` y sus configuraciones/backups
 modo `0600`.
@@ -64,8 +64,12 @@ modo `0600`.
 1. Hace backup de `~/.config/opencode/` si ya existe
 2. Copia todo el contenido de `opencode/` a `~/.config/opencode/`
 3. Restaura tu API key de Context7 del backup si la tenias configurada
-4. Ejecuta `bun install --ignore-scripts` (o `npm install --ignore-scripts` como fallback) para dependencias de plugins
+4. Después de confirmar el commit gestionado, instala dependencias de plugins con el primer gestor disponible, en este orden: `bun`, `pnpm`, `npm`, siempre con `--ignore-scripts`
 5. Resultado: 12 agentes, 8 commands, skills, templates, evals, y MCPs configurados
+
+La configuración gestionada y el estado se conservan aunque falle la instalación de dependencias
+(la instalación queda parcial). Corrige el gestor o la red y reintenta con `skynex deps`; no es
+necesario volver a instalar la configuración.
 
 #### Para Claude Code
 
@@ -88,8 +92,8 @@ modo `0600`.
 # 2. Copiar config de OpenCode
 cp -r opencode/ ~/.config/opencode/
 
-# 3. Instalar dependencias
-cd ~/.config/opencode && bun install
+# 3. Instalar dependencias de la instalación gestionada
+skynex deps
 
 # 4. Configurar Context7 (opcional)
 # Editar ~/.config/opencode/opencode.json y reemplazar SET_IN_LOCAL_CONFIG con tu API key
@@ -254,16 +258,18 @@ ls -dt ~/.claude.backup.* | head -1
 | Context7 no funciona | Verificar API key en `opencode.json`. Sin key, se ignora silenciosamente |
 | Skills no aparecen en Claude | Verificar que `~/.claude/skills/` tiene los directorios. Reiniciar Claude Code |
 | Agentes no aparecen en Claude | Verificar que `~/.claude/agents/` tiene los `.md`. Reiniciar Claude Code |
-| `bun: command not found` | Instalar Bun desde su release/package manager verificado o usar npm |
+| `bun: command not found` | El instalador prueba `pnpm` y después `npm`; instala uno de ellos desde un release/package manager verificado o ejecuta `skynex deps` tras instalarlo |
 | Backup no se creo | El backup solo se crea si el directorio destino ya existia |
 # Transaction safety
 
 Install transactions retain private recovery snapshots under the configured
-state directory. `node_modules` is never quarantined or included in snapshots,
-so dependency managers update it in place. If dependency installation fails,
-managed configuration and skills are rolled back, but dependencies may require
-rerunning the install. At most five snapshots are retained; when that limit is
-reached, recover or remove one explicitly before starting another transaction.
-Deprecated managed entries are reported and preserved. Explicit file cleanup,
-where supported, renames a regular file to a recovery backup and never removes
-directories recursively.
+state directory. Only the OpenCode path `EBWebView/Default/Code Cache` is
+excluded from snapshots; `node_modules` and all other files remain subject to
+the snapshot protection and limits. If dependency installation fails after the
+managed commit, the installation is partial: managed configuration and state
+are preserved. Fix the problem and retry with `skynex deps`; do not rerun the
+full install just for dependencies. At most five snapshots are retained; when
+that limit is reached, recover or remove one explicitly before starting another
+transaction. Deprecated managed entries are reported and preserved. Explicit
+file cleanup, where supported, renames a regular file to a recovery backup and
+never removes directories recursively.

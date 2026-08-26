@@ -358,6 +358,308 @@ func TestApplyPreservesNodeModulesInPlace(t *testing.T) {
 	}
 }
 
+func TestApplyExcludesOnlyOpenCodeCodeCacheFromRollback(t *testing.T) {
+	root := t.TempDir()
+	opencode := filepath.Join(root, "opencode")
+	claude := filepath.Join(root, "claude")
+	state := filepath.Join(root, "state")
+	for _, dir := range []string{
+		filepath.Join(opencode, "EBWebView", "Default", "Code Cache"),
+		filepath.Join(claude, "EBWebView", "Default", "Code Cache"),
+	} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	type fileCase struct {
+		path string
+		want string
+	}
+	protected := []fileCase{
+		{filepath.Join(opencode, "EBWebView", "Default", "Other Cache", "old"), "opencode sibling"},
+		{filepath.Join(opencode, "EBWebView", "Default", "Cache", "old"), "opencode unknown cache"},
+		{filepath.Join(opencode, "node_modules", "old"), "opencode node module"},
+		{filepath.Join(opencode, "config.json"), "opencode config"},
+		{filepath.Join(opencode, "skills", "old"), "opencode skill"},
+		{filepath.Join(opencode, "credentials.json"), "opencode credentials"},
+		{filepath.Join(claude, "EBWebView", "Default", "Code Cache", "old"), "claude code cache"},
+	}
+	for _, file := range append([]fileCase{{filepath.Join(opencode, "EBWebView", "Default", "Code Cache", "old"), "opencode code cache"}}, protected...) {
+		if err := os.MkdirAll(filepath.Dir(file.path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(file.path, []byte(file.want), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	plan := &Plan{
+		Operations: []Operation{
+			{Kind: InstallTarget, Target: "claude", Destination: claude},
+			{Kind: InstallTarget, Target: "opencode", Destination: opencode},
+		},
+		destinations: Destinations{ClaudeDir: claude, OpencodeDir: opencode, StateDir: state},
+	}
+	err := Apply(plan, func() error {
+		if err := os.WriteFile(filepath.Join(opencode, "EBWebView", "Default", "Code Cache", "old"), []byte("regenerated"), 0o600); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(opencode, "EBWebView", "Default", "Code Cache", "new"), []byte("regenerated new"), 0o600); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(claude, "EBWebView", "Default", "Code Cache", "old"), []byte("mutated"), 0o600); err != nil {
+			return err
+		}
+		for _, file := range protected {
+			if err := os.WriteFile(file.path, []byte("mutated"), 0o600); err != nil {
+				return err
+			}
+		}
+		return errors.New("rollback")
+	})
+	if err == nil {
+		t.Fatal("expected rollback")
+	}
+
+	got, readErr := os.ReadFile(filepath.Join(opencode, "EBWebView", "Default", "Code Cache", "old"))
+	if readErr != nil || string(got) != "regenerated" {
+		t.Fatalf("OpenCode code cache was restored: %q, %v", got, readErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(opencode, "EBWebView", "Default", "Code Cache", "new")); statErr != nil {
+		t.Fatalf("regenerated OpenCode code cache entry was removed: %v", statErr)
+	}
+	got, readErr = os.ReadFile(filepath.Join(claude, "EBWebView", "Default", "Code Cache", "old"))
+	if readErr != nil || string(got) != "claude code cache" {
+		t.Fatalf("Claude code cache was not protected: %q, %v", got, readErr)
+	}
+	for _, file := range protected[:6] {
+		got, readErr := os.ReadFile(file.path)
+		if readErr != nil || string(got) != file.want {
+			t.Errorf("protected %s = %q, %v; want %q", file.path, got, readErr, file.want)
+		}
+	}
+}
+
+func TestOpenCodeCodeCacheIsExcludedFromSnapshotLimits(t *testing.T) {
+	root := t.TempDir()
+	opencode := filepath.Join(root, "opencode")
+	cacheFile := filepath.Join(opencode, "EBWebView", "Default", "Code Cache", "oversized")
+	if err := os.MkdirAll(filepath.Dir(cacheFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(cacheFile, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(maxSnapshotRegularBytes + 1); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	_ = file.Close()
+
+	plan := &Plan{
+		Operations:   []Operation{{Kind: InstallTarget, Target: "opencode", Destination: opencode}},
+		destinations: Destinations{OpencodeDir: opencode, StateDir: filepath.Join(root, "state")},
+	}
+	if err := Apply(plan, func() error { return nil }); err != nil {
+		t.Fatalf("regenerable OpenCode code cache consumed snapshot limit: %v", err)
+	}
+}
+
+func TestOpenCodeUnknownCachePathStillConsumesSnapshotLimits(t *testing.T) {
+	root := t.TempDir()
+	opencode := filepath.Join(root, "opencode")
+	filePath := filepath.Join(opencode, "EBWebView", "Default", "Cache", "oversized")
+	if err := os.MkdirAll(filepath.Dir(filePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(maxSnapshotRegularBytes + 1); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	_ = file.Close()
+
+	plan := &Plan{
+		Operations:   []Operation{{Kind: InstallTarget, Target: "opencode", Destination: opencode}},
+		destinations: Destinations{OpencodeDir: opencode, StateDir: filepath.Join(root, "state")},
+	}
+	if err := Apply(plan, func() error { t.Fatal("mutation ran after protected oversized file"); return nil }); err == nil || !strings.Contains(err.Error(), "snapshot limits exceeded") {
+		t.Fatalf("unknown cache path limit result: %v", err)
+	}
+}
+
+func TestOpenCodeProtectedPathsConsumeSnapshotLimits(t *testing.T) {
+	root := t.TempDir()
+	opencode := filepath.Join(root, "opencode")
+	cases := []struct {
+		name     string
+		relative string
+	}{
+		{"node_modules", filepath.Join("node_modules", "oversized")},
+		{"configuration", "config.json"},
+		{"skills", filepath.Join("skills", "oversized")},
+		{"credentials", "credentials.json"},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			filePath := filepath.Join(opencode, test.relative)
+			if err := os.MkdirAll(filepath.Dir(filePath), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := file.Truncate(maxSnapshotRegularBytes + 1); err != nil {
+				_ = file.Close()
+				t.Fatal(err)
+			}
+			if err := file.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			plan := &Plan{
+				Operations:   []Operation{{Kind: InstallTarget, Target: "opencode", Destination: opencode}},
+				destinations: Destinations{OpencodeDir: opencode, StateDir: filepath.Join(root, "state")},
+			}
+			if err := Apply(plan, func() error { t.Fatal("mutation ran after protected oversized file"); return nil }); err == nil || !strings.Contains(err.Error(), "snapshot limits exceeded") {
+				t.Fatalf("protected %s limit result: %v", test.name, err)
+			}
+		})
+	}
+}
+
+func TestClaudeProtectedPathsConsumeSnapshotLimits(t *testing.T) {
+	root := t.TempDir()
+	claude := filepath.Join(root, "claude")
+	cases := []struct {
+		name     string
+		relative string
+	}{
+		{"ordinary file", "oversized"},
+		{"code cache", filepath.Join("EBWebView", "Default", "Code Cache", "oversized")},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			filePath := filepath.Join(claude, test.relative)
+			if err := os.MkdirAll(filepath.Dir(filePath), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := file.Truncate(maxSnapshotRegularBytes + 1); err != nil {
+				_ = file.Close()
+				t.Fatal(err)
+			}
+			if err := file.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			plan := &Plan{
+				Operations:   []Operation{{Kind: InstallTarget, Target: "claude", Destination: claude}},
+				destinations: Destinations{ClaudeDir: claude, StateDir: filepath.Join(root, "state")},
+			}
+			if err := Apply(plan, func() error { t.Fatal("mutation ran after oversized Claude file"); return nil }); err == nil || !strings.Contains(err.Error(), "snapshot limits exceeded") {
+				t.Fatalf("Claude %s limit result: %v", test.name, err)
+			}
+		})
+	}
+}
+
+func TestOpenCodeCodeCacheIsExcludedButProtectedSiblingStillConsumesSnapshotLimits(t *testing.T) {
+	root := t.TempDir()
+	opencode := filepath.Join(root, "opencode")
+	cacheFile := filepath.Join(opencode, "EBWebView", "Default", "Code Cache", "nested", "oversized")
+	siblingFile := filepath.Join(opencode, "EBWebView", "Default", "Other Cache", "oversized")
+	if err := os.MkdirAll(filepath.Dir(cacheFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(cacheFile, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(maxSnapshotRegularBytes + 1); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	plan := &Plan{
+		Operations:   []Operation{{Kind: InstallTarget, Target: "opencode", Destination: opencode}},
+		destinations: Destinations{OpencodeDir: opencode, StateDir: filepath.Join(root, "state")},
+	}
+	if err := os.MkdirAll(filepath.Dir(siblingFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	file, err = os.OpenFile(siblingFile, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(maxSnapshotRegularBytes + 1); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	err = Apply(plan, func() error { called = true; return nil })
+	want := fmt.Sprintf("snapshot: capture %q: snapshot limits exceeded (regular files <= %d, bytes <= %d)", opencode, maxSnapshotRegularFiles, maxSnapshotRegularBytes)
+	if called {
+		t.Fatal("mutation ran after protected oversized sibling")
+	}
+	if err == nil || err.Error() != want {
+		t.Fatalf("protected sibling limit result = %v, want exact error %q", err, want)
+	}
+}
+
+func TestClaudeSelectedDoesNotInspectUnselectedOpenCodePaths(t *testing.T) {
+	root := t.TempDir()
+	claude := filepath.Join(root, "claude")
+	opencode := filepath.Join(root, "opencode")
+	for _, relative := range []string{
+		"ordinary-oversized",
+		filepath.Join("config", "protected-oversized"),
+		filepath.Join("credentials", "protected-oversized"),
+		filepath.Join("skills", "protected-oversized"),
+		filepath.Join("node_modules", "protected-oversized"),
+		filepath.Join("EBWebView", "Default", "Code Cache", "oversized"),
+	} {
+		filePath := filepath.Join(opencode, relative)
+		if err := os.MkdirAll(filepath.Dir(filePath), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := file.Truncate(maxSnapshotRegularBytes + 1); err != nil {
+			_ = file.Close()
+			t.Fatal(err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	plan := &Plan{
+		Operations:   []Operation{{Kind: InstallTarget, Target: "claude", Destination: claude}},
+		destinations: Destinations{ClaudeDir: claude, OpencodeDir: opencode, StateDir: filepath.Join(root, "state")},
+	}
+	if err := Apply(plan, func() error { return nil }); err != nil {
+		t.Fatalf("unselected OpenCode path affected Claude snapshot: %v", err)
+	}
+}
+
 func TestApplyRejectsOverlapAndStateInsideTarget(t *testing.T) {
 	root := t.TempDir()
 	if err := Apply(&Plan{destinations: Destinations{ClaudeDir: filepath.Join(root, "x"), ClaudeConfigFile: filepath.Join(root, "x", "config"), StateDir: filepath.Join(root, "state")}}, func() error { return nil }); err == nil {

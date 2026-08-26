@@ -41,13 +41,24 @@ class FakeSkynex { public static void Main(string[] a) { if (a.Length == 3 && a[
   [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($pad)
   $padStream = [IO.File]::Open($fakeExe, [IO.FileMode]::Append, [IO.FileAccess]::Write)
   try { $padStream.Write($pad, 0, $pad.Length) } finally { $padStream.Dispose() }
+  $readme = Join-Path $tmp 'README.md'
+  Set-Content -Encoding utf8 -NoNewline -Path $readme -Value 'Windows installer fixture'
   $archive = Join-Path $release 'skynex_1.2.3_windows_amd64.zip'
   Add-Type -AssemblyName System.IO.Compression.FileSystem
   $zip = [IO.Compression.ZipFile]::Open($archive, [IO.Compression.ZipArchiveMode]::Create)
-  try { [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, (Join-Path $tmp 'skynex.exe'), 'skynex.exe') | Out-Null } finally { $zip.Dispose() }
-  $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
-  "$hash  skynex_1.2.3_windows_amd64.zip" | Set-Content -Encoding ascii (Join-Path $release 'checksums.txt')
-  & ssh-keygen -q -Y sign -n file -f $key (Join-Path $release 'checksums.txt') | Out-Null
+  try {
+    [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $fakeExe, 'skynex.exe') | Out-Null
+    [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $readme, 'README.md') | Out-Null
+  } finally { $zip.Dispose() }
+  function Publish-Archive {
+    param([string]$Source)
+    if ([IO.Path]::GetFullPath($Source) -ne [IO.Path]::GetFullPath($archive)) { Copy-Item -Force $Source $archive }
+    $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
+    "$hash  skynex_1.2.3_windows_amd64.zip" | Set-Content -Encoding ascii (Join-Path $release 'checksums.txt')
+    Remove-Item -Force (Join-Path $release 'checksums.txt.sig') -ErrorAction SilentlyContinue
+    & ssh-keygen -q -Y sign -n file -f $key (Join-Path $release 'checksums.txt') | Out-Null
+  }
+  Publish-Archive $archive
 
   $server = Join-Path $tmp 'server.ps1'
   @'
@@ -74,7 +85,32 @@ while ($true) { $c = $l.GetContext(); if ($c.Request.Url.AbsolutePath -eq '/api/
   $installer = Join-Path $tmp 'install.ps1'
   New-FixtureInstaller -Path $installer -FixtureSigner
   $dest = Join-Path $tmp 'destination'; & powershell -NoProfile -File $installer -Method binary -InstallDir $dest
+  if ($LASTEXITCODE -ne 0) { throw 'Windows installer failed to install the valid archive' }
   if (-not (Test-Path (Join-Path $dest 'skynex.exe'))) { throw 'Windows installer did not install the fake binary' }
+  if ((Get-FileHash (Join-Path $dest 'skynex.exe') -Algorithm SHA256).Hash -ne (Get-FileHash $fakeExe -Algorithm SHA256).Hash) { throw 'Windows installer changed the binary bytes' }
+  if (Test-Path (Join-Path $dest 'README.md')) { throw 'Windows installer installed README.md' }
+
+  # A release archive is valid only with the two required root members.
+  $missingReadmeArchive = Join-Path $tmp 'missing-readme.zip'
+  $zip = [IO.Compression.ZipFile]::Open($missingReadmeArchive, [IO.Compression.ZipArchiveMode]::Create)
+  try { [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $fakeExe, 'skynex.exe') | Out-Null } finally { $zip.Dispose() }
+  Publish-Archive $missingReadmeArchive
+  $missingReadmeDest = Join-Path $tmp 'missing-readme-destination'
+  & powershell -NoProfile -File $installer -Method binary -InstallDir $missingReadmeDest
+  if ($LASTEXITCODE -eq 0 -or (Test-Path $missingReadmeDest)) { throw 'Windows installer accepted an archive missing README.md or mutated the destination' }
+
+  $extraArchive = Join-Path $tmp 'extra-member.zip'
+  $extra = Join-Path $tmp 'extra.txt'; Set-Content -Encoding utf8 -NoNewline $extra 'unexpected'
+  $zip = [IO.Compression.ZipFile]::Open($extraArchive, [IO.Compression.ZipArchiveMode]::Create)
+  try {
+    [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $fakeExe, 'skynex.exe') | Out-Null
+    [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $readme, 'README.md') | Out-Null
+    [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $extra, 'extra.txt') | Out-Null
+  } finally { $zip.Dispose() }
+  Publish-Archive $extraArchive
+  $extraDest = Join-Path $tmp 'extra-member-destination'
+  & powershell -NoProfile -File $installer -Method binary -InstallDir $extraDest
+  if ($LASTEXITCODE -eq 0 -or (Test-Path $extraDest)) { throw 'Windows installer accepted an archive with an extra member or mutated the destination' }
 
   # The production script must not accept the removed test-only signer overrides.
   $env:SKYNEX_TEST_MODE = '1'; $env:SKYNEX_TEST_ALLOWED_SIGNERS = $allowed
@@ -87,8 +123,8 @@ while ($true) { $c = $l.GetContext(); if ($c.Request.Url.AbsolutePath -eq '/api/
   # Overwrite the armored signature like the Unix suite does: appending to it
   # only adds trailing text after the END marker, which ssh-keygen ignores.
   Set-Content -Encoding ascii -Path (Join-Path $release 'checksums.txt.sig') -Value 'tampered'
-  & powershell -NoProfile -File $installer -Method binary -InstallDir (Join-Path $tmp 'bad')
-  if ($LASTEXITCODE -eq 0) { throw 'tampered Windows signature was accepted' }
+  $badDest = Join-Path $tmp 'bad'; & powershell -NoProfile -File $installer -Method binary -InstallDir $badDest
+  if ($LASTEXITCODE -eq 0 -or (Test-Path $badDest)) { throw 'tampered Windows signature was accepted or changed the destination' }
   Write-Output 'Windows installer runtime acceptance passed'
 } finally {
   if ($serverProc) { Stop-Process -Id $serverProc.Id -Force -ErrorAction SilentlyContinue }

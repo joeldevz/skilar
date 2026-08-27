@@ -31,21 +31,36 @@ func TestOpencodeDir_Unix(t *testing.T) {
 	}
 }
 
-func TestResolveOpencodeDir(t *testing.T) {
-	home := filepath.Join("home", "user")
-	appdata := filepath.Join("legacy", "appdata")
-	want := filepath.Join(home, ".config", "opencode")
+func TestOpencodeDir_IgnoresAPPDATA(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("os.UserHomeDir() error = %v", err)
+	}
+	if !filepath.IsAbs(home) {
+		t.Fatalf("os.UserHomeDir() = %q, want an absolute path", home)
+	}
+	t.Setenv("APPDATA", filepath.Join(t.TempDir(), "legacy-appdata"))
 
-	for _, tc := range []struct {
-		name    string
-		windows bool
-	}{
-		{name: "Windows ignores APPDATA", windows: true},
-		{name: "Unix uses home", windows: false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := resolveOpencodeDir(home, appdata, tc.windows); got != want {
-				t.Fatalf("resolveOpencodeDir(%q, %q, %t) = %q, want %q", home, appdata, tc.windows, got, want)
+	want := filepath.Join(home, ".config", "opencode")
+	if got := OpencodeDir(); got != want {
+		t.Fatalf("OpencodeDir() with APPDATA set = %q, want %q", got, want)
+	}
+}
+
+func TestResolveOpencodeDir(t *testing.T) {
+	absHome := t.TempDir()
+	want := filepath.Join(absHome, ".config", "opencode")
+
+	if got, err := resolveOpencodeDir(absHome); err != nil {
+		t.Fatalf("resolveOpencodeDir(%q) error = %v", absHome, err)
+	} else if got != want {
+		t.Fatalf("resolveOpencodeDir(%q) = %q, want %q", absHome, got, want)
+	}
+
+	for _, home := range []string{"", filepath.Join("home", "user")} {
+		t.Run("reject "+home, func(t *testing.T) {
+			if got, err := resolveOpencodeDir(home); err == nil {
+				t.Fatalf("resolveOpencodeDir(%q) = %q, want an error", home, got)
 			}
 		})
 	}

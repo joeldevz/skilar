@@ -17,15 +17,14 @@ func ClaudeDir() string {
 	return filepath.Join(home, ".claude")
 }
 
-// OpencodeDir returns ~/.config/opencode on Unix, %APPDATA%\opencode on Windows
-func OpencodeDir() string {
-	if runtime.GOOS == "windows" {
-		if appdata := os.Getenv("APPDATA"); appdata != "" {
-			return filepath.Join(appdata, "opencode")
-		}
-	}
-	home, _ := os.UserHomeDir()
+func resolveOpencodeDir(home, _ string, _ bool) string {
 	return filepath.Join(home, ".config", "opencode")
+}
+
+// OpencodeDir returns ~/.config/opencode on every OS
+func OpencodeDir() string {
+	home, _ := os.UserHomeDir()
+	return resolveOpencodeDir(home, "", runtime.GOOS == "windows")
 }
 
 // StateDir returns ~/.config/skynex on Unix, %LOCALAPPDATA%\skynex on Windows

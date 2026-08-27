@@ -30,7 +30,7 @@ func resolveOpencodeDir(home string) (string, error) {
 
 // OpencodeDir returns ~/.config/opencode on every OS
 func OpencodeDir() string {
-	home, err := os.UserHomeDir()
+	home, err := userHomeDir()
 	if err != nil {
 		panic(fmt.Sprintf("resolve opencode directory: home directory: %v", err))
 	}

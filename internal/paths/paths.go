@@ -1,6 +1,7 @@
 package paths
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -17,15 +18,27 @@ func ClaudeDir() string {
 	return filepath.Join(home, ".claude")
 }
 
-// OpencodeDir returns ~/.config/opencode on Unix, %APPDATA%\opencode on Windows
-func OpencodeDir() string {
-	if runtime.GOOS == "windows" {
-		if appdata := os.Getenv("APPDATA"); appdata != "" {
-			return filepath.Join(appdata, "opencode")
-		}
+func resolveOpencodeDir(home string) (string, error) {
+	if home == "" {
+		return "", fmt.Errorf("home directory is empty")
 	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "opencode")
+	if !filepath.IsAbs(home) {
+		return "", fmt.Errorf("home directory %q is not absolute", home)
+	}
+	return filepath.Join(home, ".config", "opencode"), nil
+}
+
+// OpencodeDir returns ~/.config/opencode on every OS
+func OpencodeDir() string {
+	home, err := userHomeDir()
+	if err != nil {
+		panic(fmt.Sprintf("resolve opencode directory: home directory: %v", err))
+	}
+	dir, err := resolveOpencodeDir(home)
+	if err != nil {
+		panic(fmt.Sprintf("resolve opencode directory: %v", err))
+	}
+	return dir
 }
 
 // StateDir returns ~/.config/skynex on Unix, %LOCALAPPDATA%\skynex on Windows

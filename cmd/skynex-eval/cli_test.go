@@ -2089,6 +2089,15 @@ func TestABExecutesFrozenExternalHoldoutAndReportsOnlyAggregateIdentity(t *testi
 	if storageErr == nil || storagePartial.PartialPath == "" || storagePartial.ExitCode != contracts.ExitInfrastructure {
 		t.Fatalf("late storage failure lost partial evidence: result=%+v error=%v", storagePartial, storageErr)
 	}
+	if storagePartial.RunID == "" || storagePartial.CorrelationID == "" || storagePartial.State != "partial" {
+		t.Fatalf("late storage failure lost execution trace metadata: result=%+v", storagePartial)
+	}
+	if len(storagePartial.Steps) != 4 || storagePartial.Steps[0].Name != "setup" || storagePartial.Steps[0].Status != abStepStatusSuccess {
+		t.Fatalf("late storage failure lost step state: steps=%+v", storagePartial.Steps)
+	}
+	if storagePartial.Steps[2].Name != "finalization" || storagePartial.Steps[2].Status != abStepStatusError || storagePartial.Steps[3].Status != abStepStatusSkipped {
+		t.Fatalf("late storage failure did not standardize partial step states: steps=%+v", storagePartial.Steps)
+	}
 	if storageFailureCalls != 8 {
 		t.Fatalf("storage failure occurred after %d fake model calls, want 8", storageFailureCalls)
 	}

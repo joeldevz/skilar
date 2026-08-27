@@ -28,7 +28,11 @@ type abCommandResult struct {
 	ExperimentID  string                   `json:"experiment_id"`
 	Intent        string                   `json:"intent"`
 	Authority     string                   `json:"authority"`
+	RunID         string                   `json:"run_id,omitempty"`
+	CorrelationID string                   `json:"correlation_id,omitempty"`
+	State         string                   `json:"state,omitempty"`
 	Plan          stats.ExperimentPlan     `json:"plan"`
+	Steps         []abStepReport           `json:"steps,omitempty"`
 	ControlPath   string                   `json:"control_artifact,omitempty"`
 	CandidatePath string                   `json:"candidate_artifact,omitempty"`
 	PartialPath   string                   `json:"partial_artifact,omitempty"`
@@ -344,6 +348,7 @@ func commandAB(ctx context.Context, args []string, deps dependencies) (abCommand
 	}
 	controlAggregate := emptyModelAggregate(manifest.Suite, manifest.Harness.Digest, manifestDigest)
 	candidateAggregate := emptyModelAggregate(manifest.Suite, manifest.Harness.Digest, manifestDigest)
+	trace := newABExecutionTrace()
 	started := time.Now().UTC()
 	completedSamples := make(map[abSampleKey]struct{}, len(plan.Blocks)*2)
 	completedRunIDs := make(map[string]struct{}, len(plan.Blocks)*2)
@@ -503,32 +508,40 @@ func commandAB(ctx context.Context, args []string, deps dependencies) (abCommand
 		}
 		return partialPath, nil
 	}
-	finalizeFailure := func(cause error, controlSaved, candidateSaved bool) (abCommandResult, error) {
+	buildPartialResult := func() abCommandResult {
+		return abCommandResult{
+			ExperimentID: manifest.ID, Intent: manifest.Intent, Authority: authorityForIntent(manifest.Intent),
+			RunID: trace.RunID, CorrelationID: trace.CorrelationID, State: "partial", Plan: publishedPlan,
+			Steps: trace.snapshot(), ControlRuns: len(controlAggregate.Result.Samples), CandidateRuns: len(candidateAggregate.Result.Samples),
+			ObservedCost: observedCostPointer(totalCost, costComplete), CostComplete: costComplete,
+			HoldoutDigest: holdoutDigest, HoldoutCases: len(holdoutCases), ExitCode: contracts.ExitSuccess,
+		}
+	}
+	finalizeFailure := func(step string, cause error, controlSaved, candidateSaved bool) (abCommandResult, error) {
+		trace.markError(step, cause)
 		exitCode, kind := classifyCommandError(cause)
 		partialArtifact, saveErr := savePartial(exitCode)
 		if saveErr != nil {
 			return abCommandResult{}, infraf("save_partial_ab", errors.Join(cause, saveErr))
 		}
-		partialResult := abCommandResult{
-			ExperimentID: manifest.ID, Intent: manifest.Intent, Authority: authorityForIntent(manifest.Intent),
-			Plan: publishedPlan, PartialPath: partialArtifact,
-			ControlRuns: len(controlAggregate.Result.Samples), CandidateRuns: len(candidateAggregate.Result.Samples),
-			ObservedCost: observedCostPointer(totalCost, costComplete), CostComplete: costComplete,
-			HoldoutDigest: holdoutDigest, HoldoutCases: len(holdoutCases), ExitCode: exitCode,
-		}
+		partialResult := buildPartialResult()
+		partialResult.PartialPath = partialArtifact
+		partialResult.ExitCode = exitCode
 		if controlSaved {
 			partialResult.ControlPath = controlPath
 		}
 		if candidateSaved {
 			partialResult.CandidatePath = candidatePath
 		}
+		trace.markSkipped("cleanup", "partial artifact retained")
+		partialResult.Steps = trace.snapshot()
 		return partialResult, &commandError{
 			exitCode: exitCode, kind: kind,
 			err:  fmt.Errorf("%w (partial artifact saved to %s)", cause, partialArtifact),
 			data: partialResult,
 		}
 	}
-	rollbackBundleDrift := func(checkpoint abBlockCheckpoint, driftErr error) (abCommandResult, error) {
+	rollbackBundleDrift := func(step string, checkpoint abBlockCheckpoint, driftErr error) (abCommandResult, error) {
 		checkpoint.Restore(
 			&controlAggregate, &candidateAggregate, &completedSamples, &completedRunIDs,
 			&totalCost, &costComplete,
@@ -537,15 +550,12 @@ func commandAB(ctx context.Context, args []string, deps dependencies) (abCommand
 		if manifest.Holdout != nil {
 			publishedDriftErr = privateHoldoutError()
 		}
-		partialArtifact, saveErr := savePartial(contracts.ExitInvalid)
-		if saveErr != nil {
-			return abCommandResult{}, infraf("save_partial_ab", errors.Join(publishedDriftErr, saveErr))
-		}
-		return abCommandResult{}, invalidf("bundle_drift", "%v (partial artifact saved to %s)", publishedDriftErr, partialArtifact)
+		return finalizeFailure(step, invalidf("bundle_drift", "%v", publishedDriftErr), false, false)
 	}
 	if _, err := savePartial(contracts.ExitSuccess); err != nil {
 		return abCommandResult{}, infraf("save_partial_ab", err)
 	}
+	trace.markSuccess("setup")
 
 	for _, block := range plan.Blocks {
 		if abBlockComplete(completedSamples, block) {
@@ -612,7 +622,7 @@ func commandAB(ctx context.Context, args []string, deps dependencies) (abCommand
 				if manifest.Holdout != nil {
 					publishedClosureErr = privateHoldoutError()
 				}
-				return finalizeFailure(invalidf("invalid_toolchain_closure", "effective executable closure drifted before an A/B sample: %v", publishedClosureErr), false, false)
+				return finalizeFailure("setup", invalidf("invalid_toolchain_closure", "effective executable closure drifted before an A/B sample: %v", publishedClosureErr), false, false)
 			}
 			run, runErr := deps.runModel(ctx, spec)
 			closureErr := executableClosure.Revalidate()
@@ -642,8 +652,9 @@ func commandAB(ctx context.Context, args []string, deps dependencies) (abCommand
 			}
 			if runErr != nil {
 				if driftErr := frozen.VerifyUnchanged(); driftErr != nil {
-					return rollbackBundleDrift(blockCheckpoint, driftErr)
+					return rollbackBundleDrift("sampling", blockCheckpoint, driftErr)
 				}
+				trace.markError("sampling", runErr)
 				costComplete = false
 				aggregate.CostEvidenceComplete = false
 				exitCode, kind := classifyCommandError(runErr)
@@ -656,13 +667,10 @@ func commandAB(ctx context.Context, args []string, deps dependencies) (abCommand
 				if saveErr != nil {
 					return abCommandResult{}, infraf("save_partial_ab", errors.Join(publishedRunErr, saveErr))
 				}
-				partialResult := abCommandResult{
-					ExperimentID: manifest.ID, Intent: manifest.Intent, Authority: authorityForIntent(manifest.Intent),
-					Plan: publishedPlan, PartialPath: partialPath,
-					ControlRuns: len(controlAggregate.Result.Samples), CandidateRuns: len(candidateAggregate.Result.Samples),
-					ObservedCost: observedCostPointer(totalCost, costComplete), CostComplete: costComplete,
-					HoldoutDigest: holdoutDigest, HoldoutCases: len(holdoutCases), ExitCode: exitCode,
-				}
+				partialResult := buildPartialResult()
+				partialResult.PartialPath = partialPath
+				partialResult.ExitCode = exitCode
+				partialResult.Steps = trace.snapshot()
 				return partialResult, &commandError{
 					exitCode: exitCode, kind: kind,
 					err:  fmt.Errorf("%w (partial artifact saved to %s)", publishedRunErr, partialPath),
@@ -670,7 +678,7 @@ func commandAB(ctx context.Context, args []string, deps dependencies) (abCommand
 				}
 			}
 			if _, checkpointErr := savePartial(contracts.ExitSuccess); checkpointErr != nil {
-				return finalizeFailure(infraf("save_partial_ab", checkpointErr), false, false)
+				return finalizeFailure("finalization", infraf("save_partial_ab", checkpointErr), false, false)
 			}
 			code := run.CLIExitCode()
 			if code == contracts.ExitBudgetExhausted || code == contracts.ExitInfrastructure || code == contracts.ExitInvalid || code == contracts.ExitAborted {
@@ -679,7 +687,7 @@ func commandAB(ctx context.Context, args []string, deps dependencies) (abCommand
 			}
 		}
 		if driftErr := frozen.VerifyUnchanged(); driftErr != nil {
-			return rollbackBundleDrift(blockCheckpoint, driftErr)
+			return rollbackBundleDrift("sampling", blockCheckpoint, driftErr)
 		}
 		if forcedExit != contracts.ExitSuccess {
 			break
@@ -691,7 +699,7 @@ func commandAB(ctx context.Context, args []string, deps dependencies) (abCommand
 	}
 	if forcedExit == contracts.ExitSuccess {
 		if populationErr := validateCompleteABPopulation(completedSamples, plan); populationErr != nil {
-			return finalizeFailure(invalidf("incomplete_ab_population", "%v", populationErr), false, false)
+			return finalizeFailure("sampling", invalidf("incomplete_ab_population", "%v", populationErr), false, false)
 		}
 	}
 	ended := time.Now().UTC()
@@ -704,14 +712,11 @@ func commandAB(ctx context.Context, args []string, deps dependencies) (abCommand
 		if manifest.Holdout != nil {
 			publishedDriftErr = privateHoldoutError()
 		}
-		partialPath, saveErr := savePartial(contracts.ExitInvalid)
-		if saveErr != nil {
-			return abCommandResult{}, infraf("save_partial_ab", errors.Join(publishedDriftErr, saveErr))
-		}
-		return abCommandResult{}, invalidf("bundle_drift", "%v (partial artifact saved to %s)", publishedDriftErr, partialPath)
+		return finalizeFailure("finalization", invalidf("bundle_drift", "%v", publishedDriftErr), false, false)
 	}
 	result := abCommandResult{
-		ExperimentID: manifest.ID, Intent: manifest.Intent, Authority: authorityForIntent(manifest.Intent), Plan: publishedPlan,
+		ExperimentID: manifest.ID, Intent: manifest.Intent, Authority: authorityForIntent(manifest.Intent),
+		RunID: trace.RunID, CorrelationID: trace.CorrelationID, State: "complete", Plan: publishedPlan, Steps: trace.snapshot(),
 		ControlRuns: len(controlAggregate.Result.Samples), CandidateRuns: len(candidateAggregate.Result.Samples),
 		ObservedCost: observedCostPointer(totalCost, costComplete), CostComplete: costComplete,
 		HoldoutDigest: holdoutDigest, HoldoutCases: len(holdoutCases), ExitCode: forcedExit,
@@ -721,13 +726,18 @@ func commandAB(ctx context.Context, args []string, deps dependencies) (abCommand
 		if err != nil {
 			return abCommandResult{}, infraf("save_partial_ab", err)
 		}
+		trace.markSuccess("sampling")
+		trace.markSuccess("finalization")
+		trace.markSkipped("cleanup", "partial artifact retained")
+		result.State = "partial"
 		result.PartialPath = partialPath
+		result.Steps = trace.snapshot()
 		return result, nil
 	}
 
 	stagingDirectory, err := os.MkdirTemp(filepath.Dir(controlPath), ".skynex-ab-finals-")
 	if err != nil {
-		return finalizeFailure(infraf("stage_ab_outputs", err), false, false)
+		return finalizeFailure("finalization", infraf("stage_ab_outputs", err), false, false)
 	}
 	stagedControl := filepath.Join(stagingDirectory, "control.json")
 	stagedCandidate := filepath.Join(stagingDirectory, "candidate.json")
@@ -739,10 +749,10 @@ func commandAB(ctx context.Context, args []string, deps dependencies) (abCommand
 		_ = os.Remove(stagingDirectory)
 	}()
 	if err := saveABBaseline(stagedControl, "control", manifest.Suite, manifest.Intent, controlAggregate, selected, holdoutCases, holdoutDigest, started); err != nil {
-		return finalizeFailure(err, false, false)
+		return finalizeFailure("finalization", err, false, false)
 	}
 	if err := saveABBaseline(stagedCandidate, "candidate", manifest.Suite, manifest.Intent, candidateAggregate, selected, holdoutCases, holdoutDigest, started); err != nil {
-		return finalizeFailure(err, false, false)
+		return finalizeFailure("finalization", err, false, false)
 	}
 	var comparison comparisonCommandResult
 	comparison, err = commandCompare([]string{
@@ -750,11 +760,11 @@ func commandAB(ctx context.Context, args []string, deps dependencies) (abCommand
 		"--manifest", *manifestPath,
 	})
 	if err != nil {
-		return finalizeFailure(err, false, false)
+		return finalizeFailure("finalization", err, false, false)
 	}
 	comparison.OutputPath = comparisonPath
 	if err := reporter.Save(comparison, stagedComparison); err != nil {
-		return finalizeFailure(err, false, false)
+		return finalizeFailure("finalization", err, false, false)
 	}
 	published := make([]string, 0, 3)
 	for _, output := range []struct{ final, staged string }{
@@ -762,13 +772,13 @@ func commandAB(ctx context.Context, args []string, deps dependencies) (abCommand
 	} {
 		if err := reservations.PublishOrReuse(output.final, output.staged); err != nil {
 			rollbackErr := reservations.RollbackPublished(published...)
-			return finalizeFailure(errors.Join(err, rollbackErr), false, false)
+			return finalizeFailure("finalization", errors.Join(err, rollbackErr), false, false)
 		}
 		published = append(published, output.final)
 	}
 	if err := syncABDirectory(filepath.Dir(controlPath)); err != nil {
 		rollbackErr := reservations.RollbackPublished(published...)
-		return finalizeFailure(errors.Join(err, rollbackErr), false, false)
+		return finalizeFailure("finalization", errors.Join(err, rollbackErr), false, false)
 	}
 	result.ControlPath, result.CandidatePath = controlPath, candidatePath
 	result.Comparison = &comparison
@@ -777,6 +787,9 @@ func commandAB(ctx context.Context, args []string, deps dependencies) (abCommand
 		if removeErr := resumeSession.RemoveAfterSuccess(); removeErr != nil {
 			result.PartialPath = partialPath
 			result.ExitCode = contracts.ExitInfrastructure
+			trace.markError("cleanup", removeErr)
+			result.State = "partial"
+			result.Steps = trace.snapshot()
 			return result, &commandError{
 				exitCode: contracts.ExitInfrastructure, kind: "remove_completed_partial",
 				err: removeErr, data: result,
@@ -785,11 +798,18 @@ func commandAB(ctx context.Context, args []string, deps dependencies) (abCommand
 	} else if removeErr := reservations.RemoveOwned(partialPath); removeErr != nil {
 		result.PartialPath = partialPath
 		result.ExitCode = contracts.ExitInfrastructure
+		trace.markError("cleanup", removeErr)
+		result.State = "partial"
+		result.Steps = trace.snapshot()
 		return result, &commandError{
 			exitCode: contracts.ExitInfrastructure, kind: "remove_completed_partial",
 			err: removeErr, data: result,
 		}
 	}
+	trace.markSuccess("sampling")
+	trace.markSuccess("finalization")
+	trace.markSuccess("cleanup")
+	result.Steps = trace.snapshot()
 	return result, nil
 }
 

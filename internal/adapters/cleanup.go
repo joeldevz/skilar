@@ -363,9 +363,9 @@ func validateInstallDestinationTreeIdentity(root string) (os.FileInfo, error) {
 }
 
 // validateExistingNodeModules walks the dependency tree through a retained
-// descriptor. The only symlinks npm-style installs legitimately create are
-// direct children of node_modules/.bin; every other entry must be a real
-// directory or a single-link regular file.
+// descriptor. Executable links are allowed only in .bin directly under a
+// node_modules at a valid package nesting boundary. Every other entry must be
+// a real directory or a single-link regular file.
 func validateExistingNodeModules(root string) error {
 	nodeModules := filepath.Join(root, "node_modules")
 	info, err := os.Lstat(nodeModules)
@@ -416,11 +416,72 @@ func validateExistingNodeModules(root string) error {
 }
 
 func isNodeModulesBinChild(path string) bool {
-	parts := strings.Split(filepath.ToSlash(path), "/")
-	return len(parts) == 2 && parts[0] == ".bin"
+	_, ok := nodeModulesBinBase(path)
+	return ok
+}
+
+// nodeModulesBinBase recognizes (.bin/name) or repeated
+// (package/node_modules/), including @scope/package, followed by .bin/name.
+// It deliberately does not accept an arbitrary directory containing .bin.
+func nodeModulesBinBase(path string) (string, bool) {
+	clean, err := safefs.Relative(path)
+	if err != nil || clean != path || strings.Contains(path, "\\") {
+		return "", false
+	}
+	parts := strings.Split(path, "/")
+	if len(parts) < 2 || parts[len(parts)-2] != ".bin" {
+		return "", false
+	}
+	validName := func(name string) bool {
+		if name == "" || name == "node_modules" || strings.HasPrefix(name, ".") {
+			return false
+		}
+		for _, c := range name {
+			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.') {
+				return false
+			}
+		}
+		return true
+	}
+	if !validName(parts[len(parts)-1]) {
+		return "", false
+	}
+	for i := 0; i < len(parts)-2; {
+		if strings.HasPrefix(parts[i], "@") {
+			if !validName(strings.TrimPrefix(parts[i], "@")) {
+				return "", false
+			}
+			i++
+		}
+		if i >= len(parts)-2 || !validName(parts[i]) {
+			return "", false
+		}
+		i++
+		if i >= len(parts)-2 || parts[i] != "node_modules" {
+			return "", false
+		}
+		i++
+	}
+	if len(parts) == 2 {
+		return ".", true
+	}
+	return strings.Join(parts[:len(parts)-2], "/"), true
 }
 
 func validateNpmBinLinkRoot(nodeRoot *safefs.Root, path string) error {
+	base, ok := nodeModulesBinBase(path)
+	if !ok {
+		return fmt.Errorf("npm .bin link is not at a package boundary: %s", path)
+	}
+	// Reject symlinked source ancestors as well as symlinked target ancestors.
+	ancestors := strings.Split(path, "/")
+	for i := 1; i < len(ancestors); i++ {
+		component := strings.Join(ancestors[:i], "/")
+		info, err := nodeRoot.Lstat(component)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("npm .bin link ancestor is not a real directory: %s", component)
+		}
+	}
 	target, err := nodeRoot.Readlink(path)
 	if err != nil {
 		return fmt.Errorf("read npm .bin link %s: %w", path, err)
@@ -433,12 +494,16 @@ func validateNpmBinLinkRoot(nodeRoot *safefs.Root, path string) error {
 	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, "../") {
 		return fmt.Errorf("npm .bin link escapes node_modules: %s", path)
 	}
-	if strings.HasPrefix(rel, ".bin/") {
-		return fmt.Errorf("npm .bin link resolves into .bin: %s", path)
+	// A nested executable may only target its own node_modules, not an outer
+	// dependency tree. Rooted Lstat below also enforces canonical containment.
+	if base != "." && !strings.HasPrefix(rel, base+"/") {
+		return fmt.Errorf("npm .bin link escapes containing node_modules: %s", path)
 	}
 	parts := strings.Split(rel, "/")
 	for i, part := range parts {
-		_ = part
+		if part == ".bin" {
+			return fmt.Errorf("npm .bin link resolves into .bin: %s", path)
+		}
 		component := strings.Join(parts[:i+1], "/")
 		info, err := nodeRoot.Lstat(component)
 		if err != nil {

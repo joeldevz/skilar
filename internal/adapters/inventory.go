@@ -9,7 +9,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
+	"github.com/joeldevz/skynex/internal/assets"
 	"github.com/joeldevz/skynex/internal/safefs"
 	"gopkg.in/yaml.v3"
 )
@@ -89,7 +91,9 @@ func validateCommittedDependencyMetadata(dir, manager string) error {
 		}
 		locked = make(map[string]string)
 		for name, dependency := range value.Importers["."].Dependencies {
-			if dependency.Specifier != dependency.Version {
+			// pnpm appends peer-resolution contexts to an exact package version.
+			version, _, _ := strings.Cut(dependency.Version, "(")
+			if dependency.Specifier != version {
 				return fmt.Errorf("mismatched %s dependency %q", lockName, name)
 			}
 			locked[name] = dependency.Specifier
@@ -150,6 +154,10 @@ func installOwnedTreeExcluding(source, target string, excluded map[string]bool, 
 	if reporter == nil {
 		reporter = discardReporter()
 	}
+	skyFiles, err := assets.SkyAgentsShippingFiles(os.DirFS(source))
+	if err != nil {
+		return err
+	}
 	root, err := safefs.OpenOrCreate(target, 0o700)
 	if err != nil {
 		return err
@@ -169,6 +177,12 @@ func installOwnedTreeExcluding(source, target string, excluded map[string]bool, 
 			return nil
 		}
 		relSlash := filepath.ToSlash(rel)
+		if !assets.IncludeSkyAgentsPath(relSlash, d.IsDir(), skyFiles) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 		if excluded[relSlash] {
 			return nil
 		}

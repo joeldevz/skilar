@@ -316,7 +316,9 @@ func installJSDepsWithReporter(dir string, trustScripts bool, reporter Reporter)
 	manager := ""
 	if _, err := exec.LookPath("bun"); err == nil {
 		manager = "bun"
-		cmd = exec.Command("bun", "install", "--frozen-lockfile", "--silent", "--ignore-scripts")
+		// Bun normally hardlinks cache files on Linux/Windows. Private copies
+		// preserve our single-link executable invariant and isolate cache writes.
+		cmd = exec.Command("bun", "install", "--backend=copyfile", "--frozen-lockfile", "--silent", "--ignore-scripts")
 	} else if _, err := exec.LookPath("pnpm"); err == nil {
 		manager = "pnpm"
 		cmd = exec.Command("pnpm", "install", "--frozen-lockfile", "--silent", "--ignore-scripts")

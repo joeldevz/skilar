@@ -52,6 +52,11 @@ func OpenOrCreate(path string, perm os.FileMode) (*os.Root, error) {
 // opened parent while descending.  In particular it never validates a path,
 // closes the parent, and reopens the child through the ambient namespace.
 func openAbsolute(path string, create bool, perm os.FileMode) (*os.Root, error) {
+	return openAbsoluteChecked(path, create, perm, nil)
+}
+
+// beforeOpen is a deterministic regression-test seam; production callers pass nil.
+func openAbsoluteChecked(path string, create bool, perm os.FileMode, beforeOpen func(*os.Root, string)) (*os.Root, error) {
 	volume := filepath.VolumeName(path)
 	rel := strings.TrimPrefix(path, volume)
 	separator := string(filepath.Separator)
@@ -86,12 +91,28 @@ func openAbsolute(path string, create bool, perm os.FileMode) (*os.Root, error) 
 			_ = current.Close()
 			return nil, fmt.Errorf("root component is not a real directory: %q", part)
 		}
+		if beforeOpen != nil {
+			beforeOpen(current, part)
+		}
 		child, openErr := current.OpenRoot(part)
 		if openErr != nil {
 			_ = current.Close()
 			return nil, openErr
 		}
-		_ = current.Close()
+		opened, openedErr := child.Stat(".")
+		after, afterErr := current.Lstat(part)
+		if openedErr != nil || afterErr != nil ||
+			!opened.IsDir() || opened.Mode()&os.ModeSymlink != 0 ||
+			!after.IsDir() || after.Mode()&os.ModeSymlink != 0 ||
+			!os.SameFile(info, opened) || !os.SameFile(info, after) {
+			_ = child.Close()
+			_ = current.Close()
+			return nil, fmt.Errorf("root component changed while opening: %q", part)
+		}
+		if closeErr := current.Close(); closeErr != nil {
+			_ = child.Close()
+			return nil, closeErr
+		}
 		current = child
 	}
 	return current, nil

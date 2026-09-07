@@ -15,6 +15,44 @@ func TestRelativeRejectsTraversalAndAbsoluteNames(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsRootComponentReplacementDuringAcquisition(t *testing.T) {
+	for _, replacement := range []string{"sibling-symlink", "directory"} {
+		t.Run(replacement, func(t *testing.T) {
+			base := t.TempDir()
+			for _, name := range []string{"target", "sibling"} {
+				if err := os.Mkdir(filepath.Join(base, name), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			injected := false
+			root, err := openAbsoluteChecked(filepath.Join(base, "target"), false, 0o700, func(parent *os.Root, name string) {
+				if name != "target" {
+					return
+				}
+				injected = true
+				if err := parent.Rename(name, "original"); err != nil {
+					t.Fatal(err)
+				}
+				var err error
+				if replacement == "sibling-symlink" {
+					err = parent.Symlink("sibling", name)
+				} else {
+					err = parent.Mkdir(name, 0o700)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+			})
+			if root != nil {
+				root.Close()
+			}
+			if !injected || err == nil || root != nil {
+				t.Fatalf("replacement accepted: injected=%v, root=%v, err=%v", injected, root, err)
+			}
+		})
+	}
+}
+
 func TestOpenOrCreateRejectsSymlinkedRoot(t *testing.T) {
 	base := t.TempDir()
 	real := filepath.Join(base, "real")

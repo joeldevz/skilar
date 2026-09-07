@@ -2,10 +2,13 @@ package assets
 
 import (
 	"embed"
+	"encoding/json"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 )
 
 // dataFS contains the embedded assets (populated by go run ./cmd/tools/sync-assets/ or CI).
@@ -13,6 +16,71 @@ import (
 //
 //go:embed data
 var dataFS embed.FS
+
+const SkyAgentsDirectory = "v2/sky-agents"
+
+// SkyAgentsShippingFiles is shared by checkout installs and embedded-asset sync.
+// Only explicit production files are shipped; development dependencies and tests
+// must not leak out of a developer checkout into an installation.
+func SkyAgentsShippingFiles(source fs.FS) (map[string]bool, error) {
+	manifest := SkyAgentsDirectory + "/shipping.json"
+	raw, err := fs.ReadFile(source, manifest)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if _, dirErr := fs.Stat(source, SkyAgentsDirectory); os.IsNotExist(dirErr) {
+				return nil, nil // Older bundles and non-OpenCode trees.
+			}
+		}
+		return nil, fmt.Errorf("read Sky Agents shipping manifest: %w", err)
+	}
+	var value struct {
+		Files []string `json:"files"`
+	}
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil, fmt.Errorf("invalid Sky Agents shipping manifest: %w", err)
+	}
+	files := map[string]bool{manifest: true}
+	for _, path := range value.Files {
+		if !fs.ValidPath(path) || strings.Contains(path, "\\") ||
+			(path != "package.json" && path != "README.md" &&
+				!(strings.HasPrefix(path, "src/") && (strings.HasSuffix(path, ".ts") || strings.HasSuffix(path, ".tsx")))) ||
+			strings.Contains(path, ".test.") || strings.Contains(path, ".spec.") {
+			return nil, fmt.Errorf("invalid Sky Agents shipping path %q", path)
+		}
+		full := SkyAgentsDirectory + "/" + path
+		if files[full] {
+			return nil, fmt.Errorf("duplicate Sky Agents shipping path %q", path)
+		}
+		info, err := fs.Stat(source, full)
+		if err != nil || !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("Sky Agents shipping file is missing or not regular: %s", full)
+		}
+		files[full] = true
+	}
+	for _, required := range []string{"package.json", "src/index.ts", "src/tui.tsx"} {
+		if !files[SkyAgentsDirectory+"/"+required] {
+			return nil, fmt.Errorf("Sky Agents shipping manifest is missing %s", required)
+		}
+	}
+	return files, nil
+}
+
+// IncludeSkyAgentsPath filters only the Sky Agents package, leaving other assets
+// unchanged. Paths use forward slashes, like io/fs.
+func IncludeSkyAgentsPath(path string, directory bool, files map[string]bool) bool {
+	if path == SkyAgentsDirectory || !strings.HasPrefix(path, SkyAgentsDirectory+"/") {
+		return true
+	}
+	if directory {
+		for file := range files {
+			if strings.HasPrefix(file, path+"/") {
+				return true
+			}
+		}
+		return false
+	}
+	return files[path]
+}
 
 // Available reports whether embedded assets are present (data/ was populated with real content).
 func Available() bool {

@@ -1,17 +1,22 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+
+	"github.com/joeldevz/skynex/internal/assets"
 )
 
 // sync-assets copies opencode/, claude-code/ and skills/ into internal/assets/data/
 // so that go:embed can include them in the binary.
 // Run: go run ./cmd/tools/sync-assets/
 func main() {
+	skyOnly := flag.Bool("sky-agents", false, "refresh only Sky Agents and OpenCode dependency metadata")
+	flag.Parse()
 	root, err := findRepoRoot()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -19,13 +24,34 @@ func main() {
 	}
 
 	dataDir := filepath.Join(root, "internal", "assets", "data")
+	if *skyOnly {
+		if err := syncSkyAgents(filepath.Join(root, "opencode"), filepath.Join(dataDir, "opencode")); err != nil {
+			fmt.Fprintf(os.Stderr, "Error syncing Sky Agents: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("Sky Agents and OpenCode dependency assets synced")
+		return
+	}
 
 	sources := []string{"opencode", "claude-code", "skills"}
 	skip := []string{"node_modules", ".git", "__pycache__", ".ruff_cache"}
 
-	// Clean and recreate
-	os.RemoveAll(dataDir)
-	os.MkdirAll(dataDir, 0o755)
+	// Preserve the tracked bootstrap placeholder needed to compile this tool
+	// before generated assets exist in a clean checkout.
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading asset directory: %v\n", err)
+		os.Exit(1)
+	}
+	for _, entry := range entries {
+		if entry.Name() == "README.md" {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(dataDir, entry.Name())); err != nil {
+			fmt.Fprintf(os.Stderr, "Error cleaning assets: %v\n", err)
+			os.Exit(1)
+		}
+	}
 
 	for _, src := range sources {
 		srcPath := filepath.Join(root, src)
@@ -64,6 +90,10 @@ func findRepoRoot() (string, error) {
 }
 
 func copyDir(src, dst string, skip []string) error {
+	skyFiles, err := assets.SkyAgentsShippingFiles(os.DirFS(src))
+	if err != nil {
+		return err
+	}
 	skipSet := make(map[string]bool)
 	for _, s := range skip {
 		skipSet[s] = true
@@ -81,6 +111,12 @@ func copyDir(src, dst string, skip []string) error {
 		}
 
 		rel, _ := filepath.Rel(src, path)
+		if !assets.IncludeSkyAgentsPath(filepath.ToSlash(rel), d.IsDir(), skyFiles) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 		dstPath := filepath.Join(dst, rel)
 
 		if d.IsDir() {

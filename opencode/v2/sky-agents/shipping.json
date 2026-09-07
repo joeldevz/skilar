@@ -1,0 +1,15 @@
+{
+  "files": [
+    "package.json",
+    "README.md",
+    "src/catalog.ts",
+    "src/confirm-profile.tsx",
+    "src/index.ts",
+    "src/manage-profile.ts",
+    "src/profiles.ts",
+    "src/rpc.ts",
+    "src/save-model.ts",
+    "src/storage.ts",
+    "src/tui.tsx"
+  ]
+}

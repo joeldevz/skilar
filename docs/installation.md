@@ -71,6 +71,50 @@ La configuración gestionada y el estado se conservan aunque falle la instalaci�
 (la instalación queda parcial). Corrige el gestor o la red y reintenta con `skynex deps`; no es
 necesario volver a instalar la configuración.
 
+El instalador ejecuta Bun con `--backend=copyfile`: copia los archivos de la caché
+en lugar de crear hardlinks. Así mantiene la validación de ejecutables gestionados
+con un único enlace y evita compartir su contenido con la caché. Es una opción
+por comando, no un cambio de configuración global; puede consumir más disco y
+tiempo. No se desactivan las comprobaciones de seguridad ni se cambia de gestor
+si falla. Un árbol existente con hardlinks inseguros sigue siendo rechazado antes
+de ejecutar dependencias; esta opción no lo repara ni lo elimina automáticamente.
+
+Se permiten enlaces ejecutables `.bin/<nombre>` dentro de `node_modules` y de
+dependencias anidadas con estructura `paquete/node_modules` o
+`@scope/paquete/node_modules`. No se aceptan directorios `.bin` arbitrarios:
+los ancestros deben ser directorios reales, el destino debe permanecer dentro
+del `node_modules` que contiene el enlace, sin atravesar otros enlaces ni apuntar
+a otro `.bin`, y terminar en un archivo regular con un único enlace.
+
+#### Sky Agents incluido (OpenCode V2 beta-19234)
+
+La distribución incluye `v2/sky-agents/` y dos entradas locales portables:
+`plugins/sky-agents/tui.ts` (solo TUI) y `plugins/sky-agents-config/index.ts`
+(solo servidor). Sus imports son relativos al árbol instalado: no necesitan el
+checkout original ni el directorio temporal de extracción. No añadas otra entrada
+Sky Agents en `cli.json` o en la configuración del servidor; separar los directorios
+evita el registro TUI duplicado de esta beta. Si ya tienes wrappers locales no
+gestionados, se conservan por las reglas de propiedad: revísalos antes de migrarlos.
+
+Las dependencias están fijadas en el manifiesto y los tres lockfiles: SDK plugin y
+cliente `0.0.0-beta-19234`, OpenTUI `0.5.10`, Solid `1.9.12` y JSONC parser `3.3.1`.
+Los plugins legacy restantes no se migran con este cambio; no se afirma
+compatibilidad de la API de plugins V1. Se mantiene la instalación con scripts
+desactivados y el reintento de dependencias gestionado.
+
+No se distribuyen archivos de perfil de usuario. Sky Agents crea de forma diferida
+el perfil protegido `~/.config/skynex/profiles/default.json` cuando una operación de
+perfiles lo necesita y todavía no existe. Conserva los perfiles existentes y no
+aplica modelos durante la instalación. El default usa
+`openai/gpt-5.6-sol-fast#high` para el orquestador y
+`openai/gpt-5.6-luna-fast#high` para subagentes; no configura proveedores.
+
+Para publicar estos cambios hay que sincronizar los assets y recompilar/publicar
+Skynex. Un binario ya publicado no incorpora cambios nuevos del checkout.
+`go run ./cmd/tools/sync-assets/ --sky-agents` refresca únicamente este paquete,
+sus wrappers y los manifiestos/lockfiles de OpenCode; el manifiesto de envío excluye
+tests, dependencias de desarrollo locales y archivos de perfil.
+
 #### Para Claude Code
 
 1. Hace backup de `~/.claude/` si ya existe

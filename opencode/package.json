@@ -1,5 +1,10 @@
 {
   "dependencies": {
-    "@opencode-ai/plugin": "1.2.27"
+    "@opencode-ai/client": "0.0.0-beta-19234",
+    "@opencode-ai/plugin": "0.0.0-beta-19234",
+    "@opentui/core": "0.5.10",
+    "@opentui/solid": "0.5.10",
+    "jsonc-parser": "3.3.1",
+    "solid-js": "1.9.12"
   }
 }

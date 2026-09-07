@@ -173,7 +173,7 @@ func TestInstallJSDepsPrefersBunWhenBothPackageManagersAvailable(t *testing.T) {
 	if err := installJSDeps(target); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := os.ReadFile(markers["bun"]); err != nil || string(got) != "selected|install --frozen-lockfile --silent --ignore-scripts" {
+	if got, err := os.ReadFile(markers["bun"]); err != nil || string(got) != "selected|install --backend=copyfile --frozen-lockfile --silent --ignore-scripts" {
 		t.Fatalf("bun was not selected: %q, %v", got, err)
 	}
 	for _, name := range []string{"pnpm", "npm"} {
@@ -223,6 +223,10 @@ func TestInstallJSDepsUsesSafeArgsUnlessScriptsAreTrusted(t *testing.T) {
 	for _, manager := range []string{"bun", "pnpm", "npm"} {
 		installArgs := "install --frozen-lockfile --silent --ignore-scripts"
 		trustedArgs := "install --frozen-lockfile --silent"
+		if manager == "bun" {
+			installArgs = "install --backend=copyfile --frozen-lockfile --silent --ignore-scripts"
+			trustedArgs = "install --backend=copyfile --frozen-lockfile --silent"
+		}
 		if manager == "npm" {
 			installArgs = "ci --silent --ignore-scripts"
 			trustedArgs = "ci --silent"
@@ -356,8 +360,11 @@ func TestValidateManagedOpenCodeRejectsSelfAttestedDependencyMetadata(t *testing
 		}
 		// The target metadata is internally consistent, but differs from the
 		// authenticated metadata shipped in the embedded OpenCode bundle.
-		contents = []byte(strings.ReplaceAll(string(contents), "1.2.27", "9.9.9"))
-		if err := os.WriteFile(filepath.Join(target, path), contents, 0o600); err != nil {
+		tampered := strings.ReplaceAll(string(contents), "0.0.0-beta-19234", "9.9.9")
+		if tampered == string(contents) {
+			t.Fatalf("SDK version tampering did not change %s", path)
+		}
+		if err := os.WriteFile(filepath.Join(target, path), []byte(tampered), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
